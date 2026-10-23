@@ -1,11 +1,3 @@
-/*
- * Snooze Tax periods check — read-only (Claude, 2026-10-23).
- * Paste into the console on Tax MySource > Schedule > Calendar view with the
- * test person's schedule open. It clicks nothing and changes nothing; it
- * prints only fixed words, counts and class names, never page text.
- * Run it twice: once with the menu closed, once after you open the settings
- * menu yourself (leave it open while it runs).
- */
 (() => {
   const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
   const cls = node => `${node.tagName.toLowerCase()}.${[...node.classList].join('.')}`.replace(/\d+/g, '#');
