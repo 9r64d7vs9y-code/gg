@@ -1,19 +1,19 @@
 (() => {
   const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
-  const cls = node => `${node.tagName.toLowerCase()}.${[...node.classList].join('.')}`.replace(/\d+/g, '#');
-  const tidy = t => String(t).replace(/\s+/g, ' ').trim();
-  const settings = [...document.querySelectorAll('button.fc-settings-button')];
+  const cls = node => node ? `${node.tagName.toLowerCase()}${node.id ? '#' + node.id : ''}.${[...node.classList].join('.')}`.replace(/\d+/g, '#') : null;
+  const chain = node => { const out = []; for (let n = node.parentElement; n && n !== document.body && out.length < 8; n = n.parentElement) out.push(cls(n)); return out; };
   const views = [...document.querySelectorAll('.fc-view')].filter(shown);
-  const items = [...document.querySelectorAll('.dropdown-menu a, .dropdown-menu button, .dropdown-menu li, .dropdown-item')].filter(shown);
-  const loading = [...document.querySelectorAll('.loading, div.loading, .blockUI, .modal-backdrop')].filter(shown);
-  const modals = [...document.querySelectorAll('.modal')].filter(shown);
   console.log(JSON.stringify({
-    settingsButtons: settings.map(b => ({ shown: shown(b), labelLength: tidy(b.textContent).length, class: cls(b), open: b.getAttribute('aria-expanded') })),
-    shownViews: views.map(cls),
-    menuItemsShown: items.length,
-    menuItemNoOfPeriods: items.filter(n => tidy(n.textContent) === 'No. of Periods').map(cls),
-    menuItemsLike: items.filter(n => /period/i.test(n.textContent)).map(n => ({ class: cls(n), length: tidy(n.textContent).length })),
-    coversShown: loading.map(cls),
-    windowsShown: modals.map(cls),
+    staffWrappers: [...document.querySelectorAll('.staff-calendar-wrapper')].map(n => ({ shown: shown(n), class: cls(n) })),
+    tabPanes: [...document.querySelectorAll('.tab-pane')].map(n => ({ active: n.classList.contains('active'), shown: shown(n), class: cls(n) })),
+    views: views.map(v => ({
+      class: cls(v),
+      datedCells: v.querySelectorAll('td.fc-day[data-date]').length,
+      datedCellsShown: [...v.querySelectorAll('td.fc-day[data-date]')].filter(shown).length,
+      anyDated: v.querySelectorAll('[data-date]').length,
+      entries: v.querySelectorAll('.fc-event, a.fc-timeline-event, .fc-timeline-event').length,
+      size: `${Math.round(v.getBoundingClientRect().width)}x${Math.round(v.getBoundingClientRect().height)}`,
+      parents: chain(v),
+    })),
   }, null, 1));
 })();
