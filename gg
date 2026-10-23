@@ -1,0 +1,2 @@
+[...document.querySelectorAll('label')].filter(l=>/period/i.test(l.textContent)).map(l=>[l.outerHTML.slice(0,160), (l.closest('div.dynamic-field-column')||l.parentElement).querySelectorAll('select').length])  
+location.pathname
