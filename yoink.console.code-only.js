@@ -2257,6 +2257,12 @@ void (async () => {
     const subtext = option.querySelector('.select2-results__option-subtext');
     return emailsIn(subtext ? subtext.textContent : option.textContent)[0] || null;
   };
+  const selectionLabel = text => String(text || '').replace(/\s+/g, ' ').trim();
+  const labelOfOption = option => {
+    const copy = option.cloneNode(true);
+    copy.querySelectorAll('.select2-results__option-subtext').forEach(node => node.remove());
+    return selectionLabel(copy.textContent.replace(EMAIL_RE, ''));
+  };
   const idOfOption = (option, which = 'email') => {
     try {
       const direct = jQuery(option).data('data');
@@ -2428,16 +2434,22 @@ void (async () => {
       : !selectedEmails().has(emailKey(email)); }
     catch { return false; }
   };
-  const removeSelectedEmail = async (email, optionId, which = 'email', optionIdConfirmed = false, chipIndex = null) => {
+  const removeSelectedEmail = async (email, optionId, which = 'email', optionIdConfirmed = false, chipIndex = null, label = '') => {
     try {
       if (!removalAllowed()) return false;
       if (optionId == null && email) {
-        const matches = select2Data(which).filter((item) =>
+        const selected = select2Data(which);
+        const matches = selected.filter((item) =>
           emailsIn(item.email || item.text || '').some((value) => norm(value) === norm(email)));
         if (matches.length === 1 && matches[0].id != null) optionId = String(matches[0].id);
+        else if (!matches.length && selectionLabel(label)) {
+          const named = selected.filter(item => selectionLabel(item.text) === selectionLabel(label));
+          if (named.length !== 1 || named[0].id == null) return false;
+          optionId = String(named[0].id);
+        }
       }
       if (optionId != null) {
-        if (isGone(optionId, email, which)) return which !== 'id' || optionIdConfirmed === true;
+        if (isGone(optionId, email, which)) return optionIdConfirmed === true;
         const current = selectedIds(which);
         const filtered = current.filter((value) => value !== String(optionId));
         if (filtered.length !== current.length) {
@@ -3493,7 +3505,7 @@ void (async () => {
     return forms.find((value) => splitEmail(value).date) || forms[0] || term;
   };
   const addedIndexes = new WeakMap();
-  const rememberBatchAdd = (batch, term, email, optionId, optionIdConfirmed = false) => {
+  const rememberBatchAdd = (batch, term, email, optionId, optionIdConfirmed = false, label = '') => {
     if (!batch) return;
     let index = addedIndexes.get(batch);
     if (!index || index.list !== batch.addedEmails || index.length > batch.addedEmails.length) {
@@ -3503,6 +3515,7 @@ void (async () => {
     if (!index.terms.has(term)) {
       const entry = { term, email: email || term, optionId: optionId ?? null };
       Object.defineProperty(entry, 'optionIdConfirmed', { value: optionIdConfirmed === true });
+      Object.defineProperty(entry, 'label', { value: label });
       batch.addedEmails.push(entry);
       index.terms.add(term);
     }
@@ -3558,7 +3571,7 @@ void (async () => {
       const owner = continuationOwner(scratch, email, index);
       if (!owner) return;
       rememberBatchEmail(owner, 'selectedEmails', email);
-      if (added.has(email)) rememberBatchAdd(owner, email, added.get(email).email, added.get(email).optionId, added.get(email).optionIdConfirmed);
+      if (added.has(email)) rememberBatchAdd(owner, email, added.get(email).email, added.get(email).optionId, added.get(email).optionIdConfirmed, added.get(email).label);
       if (scratch.pickedEmails?.[email]) {
         owner.pickedEmails ||= {};
         owner.pickedEmails[email] = scratch.pickedEmails[email];
@@ -4975,6 +4988,11 @@ void (async () => {
       let optionIdConfirmed = false;
       const email = emailOfOption(match) || (isId(term) ? null : term);
       const beforeIds = which === 'id' ? new Set(selectedIds('id')) : null;
+      const readValues = () => {
+        try { return [].concat(jQuery(getSelect(which)).val() || []).map(String); }
+        catch { return null; }
+      };
+      const beforeValues = optionId != null ? readValues() : null;
       const currentDropdown = fieldDropdown(which);
       if (!currentDropdown?.contains(match)) { closeSelect(which); return 'error'; }
       const current = lookupSnapshot(currentDropdown, term);
@@ -4987,21 +5005,32 @@ void (async () => {
       const chosen = exact ? { match: exact[0], unclear: exact.length > 1 } : findByEmail(term, currentOptions, current.emailOf);
       if (chosen.unclear) { closeSelect(which); return 'multiple'; }
       if (chosen.match !== match) { closeSelect(which); return 'error'; }
+      const label = optionId == null ? labelOfOption(match) : '';
       jQuery(match).trigger('mouseup');
       if (which === 'id' && optionId != null) {
-        const storedId = await waitFor(() => {
-          const added = selectedIds('id').filter((id) => !beforeIds.has(id));
-          return added.length === 1 ? added[0] : null;
-        }, { timeout: T.chip, interval: T.poll });
-        if (storedId != null) {
-          optionId = storedId; optionIdConfirmed = true;
-          confirmedIdKeys.set(term, String(storedId));
-        }
+        try {
+          const storedId = await waitFor(() => {
+            const added = selectedIds('id').filter((id) => !beforeIds.has(id));
+            return added.length === 1 ? added[0] : null;
+          }, { timeout: T.chip, interval: T.poll });
+          if (storedId != null) {
+            optionId = storedId; optionIdConfirmed = true;
+            confirmedIdKeys.set(term, String(storedId));
+          }
+        } catch {   }
+      }
+      const afterValues = optionId != null ? readValues() : null;
+      if (beforeValues && afterValues) {
+        const before = new Set(beforeValues);
+        const added = [...new Set(afterValues.filter(value => !before.has(value)))];
+        if (added.length === 1) optionId = added[0];
+        if (which !== 'id' && optionId != null && afterValues.includes(String(optionId))) optionIdConfirmed = true;
       }
       closeSelect(which);
       if (email) state.selectedSet.add(emailKey(email));
       const result = { added: true, optionId, email };
       Object.defineProperty(result, 'optionIdConfirmed', { value: optionIdConfirmed });
+      Object.defineProperty(result, 'label', { value: label });
       return result;
     } catch (err) {
       closeSelect(which);
@@ -5021,7 +5050,7 @@ void (async () => {
         if (!removalAllowed()) { failed.push(term); continue; }
         const { email, optionId } = entry;
         setLive(`Removing: ${clip(term, 34)}`);
-        if (await removeSelectedEmail(email, optionId, fieldOf(term), entry.optionIdConfirmed, chipIndex)) {
+        if (await removeSelectedEmail(email, optionId, fieldOf(term), entry.optionIdConfirmed, chipIndex, entry.label)) {
           if (fieldOf(term) === 'id') forgetConfirmedIdKey(optionId);
           removed.push(term); state.selectedSet?.delete(emailKey(email));
         } else { failed.push(term); }
@@ -5175,7 +5204,7 @@ void (async () => {
       }
       if (result && result.added) {
         state.errored.delete(term);
-        rememberBatchEmail(batch, 'selectedEmails', term); rememberBatchAdd(batch, term, result.email, result.optionId, result.optionIdConfirmed);
+        rememberBatchEmail(batch, 'selectedEmails', term); rememberBatchAdd(batch, term, result.email, result.optionId, result.optionIdConfirmed, result.label);
       }
       if (result === 'dup') {
         state.errored.delete(term); rememberBatchEmail(batch, 'selectedEmails', term);
