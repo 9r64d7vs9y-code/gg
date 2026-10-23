@@ -1990,6 +1990,8 @@ void (async () => {
       ...CONSULTING_REPORT_PAGE,
       path: '/Reports/StaffScheduledHoursReport',
       labels: { start: 'Start Week', end: 'End Week', period: 'Report Period', email: 'Name' },
+      columns: { ...CONSULTING_REPORT_PAGE.columns, period: 'REPORT_PERIOD' },
+      column: 'div.dynamic-field-column, div.dynamic-field-container',
       advanced: false, singles: ['period'], all: [],
     },
   };
@@ -3371,6 +3373,54 @@ void (async () => {
       stops[e.shiftKey ? stops.length - 1 : 0].focus();
     }
   });
+  (() => {
+    const margin = 8, header = el('bp-head');
+    header.style.cursor = 'move';
+    let moved = false, press = null;
+    const place = (left, top) => {
+      const rect = panel.getBoundingClientRect();
+      const viewport = document.documentElement;
+      const x = Math.max(margin, Math.min(left, viewport.clientWidth - rect.width - margin));
+      const y = Math.max(margin, Math.min(top, viewport.clientHeight - rect.height - margin));
+      for (const [name, value] of [['left', `${x}px`], ['top', `${y}px`], ['right', 'auto']]) {
+        if (panel.style.getPropertyValue(name) !== value) panel.style.setProperty(name, value);
+      }
+    };
+    const reclamp = () => {
+      if (!moved || !active()) return;
+      const rect = panel.getBoundingClientRect();
+      place(rect.left, rect.top);
+    };
+    const stop = () => { press = null; };
+    const pointer = Boolean(window.PointerEvent);
+    on(header, pointer ? 'pointerdown' : 'mousedown', event => {
+      if (!active() || event.button !== 0 || event.isPrimary === false
+        || event.target.closest('button, input, textarea, select, a[href], [role="button"]')) return;
+      const rect = panel.getBoundingClientRect();
+      press = { x: event.clientX, y: event.clientY, dx: event.clientX - rect.left,
+        dy: event.clientY - rect.top, id: event.pointerId, dragging: false };
+    });
+    on(document, pointer ? 'pointermove' : 'mousemove', event => {
+      if (!press || !active() || (pointer && event.pointerId !== press.id)) return;
+      if (!(event.buttons & 1)) return stop();
+      if (!press.dragging && Math.abs(event.clientX - press.x) + Math.abs(event.clientY - press.y) < 4) return;
+      press.dragging = moved = true;
+      place(event.clientX - press.dx, event.clientY - press.dy);
+      event.preventDefault();
+    }, { capture: true, passive: false });
+    on(document, pointer ? 'pointerup' : 'mouseup', event => {
+      if (!pointer || event.pointerId === press?.id) stop();
+    }, true);
+    if (pointer) on(document, 'pointercancel', stop, true);
+    on(window, 'blur', stop);
+    on(window, 'resize', reclamp);
+    if (window.ResizeObserver) {
+      const observer = new ResizeObserver(reclamp);
+      observer.observe(panel);
+      tool.cleanups.push(() => observer.disconnect());
+    }
+    tool.cleanups.push(stop);
+  })();
   const freshState = () => ({
     input: [], inputSet: new Set(),
     added: [], addedSet: new Set(),
@@ -4102,13 +4152,11 @@ void (async () => {
     });
     const empties = source.empties || [];
     clearDom(picker);
-    picker.appendChild(dom('div', { style: 'display:flex;justify-content:flex-end;margin:0 0 8px;' },
-      buttonNode('bp-column-all', 'Select all', 'gray', 'flex:0 0 auto;padding:6px 8px;font-size:11px;')));
     picker.appendChild(list);
     if (empties.length) picker.appendChild(dom('div', { style: SUBTEXT + `color:${PALETTE.subtle};` },
       `No usable entries in ${empties.map((entry) => `${entry.sheetName} (${entry.rows} rows)`).join(', ')}.`));
     picker.appendChild(dom('div', { id: 'bp-column-count', style: `font-size:11px;line-height:1.4;margin:8px 0 0;font-weight:600;color:${PALETTE.muted};` }));
-    picker.appendChild(dom('div', { style: ROW + 'margin-top:8px;' }, buttonNode('bp-column-confirm', 'Add selected', 'green', BTN_CTRL), buttonNode('bp-column-cancel', 'Cancel', 'gray', BTN_CTRL)));
+    picker.appendChild(dom('div', { style: ROW + 'margin-top:8px;' }, buttonNode('bp-column-confirm', 'Add selected', 'green', BTN_CTRL), buttonNode('bp-column-all', 'Select all', 'gray', BTN_CTRL), buttonNode('bp-column-cancel', 'Cancel', 'gray', BTN_CTRL)));
     show('bp-input', false);
     show('bp-column-picker', true);
     let done = false;
