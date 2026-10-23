@@ -1,2 +1,1 @@
-[...document.querySelectorAll('label')].filter(l=>/period/i.test(l.textContent)).map(l=>[l.outerHTML.slice(0,160), (l.closest('div.dynamic-field-column')||l.parentElement).querySelectorAll('select').length])  
-location.pathname
+(()=>{const l=[...document.querySelectorAll('label')].find(l=>/^Report Period/.test(l.textContent.trim())&&!l.closest('#bp-panel'));const c=l.control;return [c&&c.outerHTML.slice(0,250), c&&c.getClientRects().length, !!(window.jQuery&&c&&jQuery(c).data('select2')), l.closest('div.dynamic-field-column')?'in column':'no column', l.parentElement.outerHTML.slice(0,500)]})()
