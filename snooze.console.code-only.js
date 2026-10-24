@@ -3562,7 +3562,8 @@ const screenReader = (doc, styleOf = computedStyle) => {
   };
 };
 const onScreen = node => screenReader(node.ownerDocument)(node);
-const tilesOnScreen = () => [...document.querySelectorAll('.fc-event')].filter(screenReader(document));
+const isScheduleContent = node => !node.closest('[id^="controlCalendar_"]');
+const tilesOnScreen = () => [...document.querySelectorAll('.fc-event')].filter(isScheduleContent).filter(screenReader(document));
 function calendarView() {
   return calendarViewUsing(computedStyle);
 }
@@ -3581,7 +3582,7 @@ function calendarViewUsing(styleOf) {
   const wrappers = [...document.querySelectorAll('.staff-calendar-wrapper')].filter(exposed);
   if (wrappers.length > 1) throw new PageError('More than one active Professional calendar; Snooze will not guess.');
   const root = wrappers[0] || document;
-  const views = [...root.querySelectorAll(CALENDAR_VIEW)].filter(exposed);
+  const views = [...root.querySelectorAll(CALENDAR_VIEW)].filter(isScheduleContent).filter(exposed);
   if (views.length < 2) return views[0] || null;
   const dated = views.filter(view => [...view.querySelectorAll('td.fc-day[data-date]')].some(exposed));
   if (dated.length === 1) return dated[0];
@@ -4175,7 +4176,7 @@ function currentWeekFindSpots(today) {
   if (!root || names.length !== 1 || !root.contains(names[0])) throw new PageError('Find Assignments has no proved Professional calendar. Nothing was changed; By hand.');
   const monday = mondayOf(today);
   const datedCells = [...view.querySelectorAll('td.fc-day[data-date]')].filter(shown);
-  return [...root.querySelectorAll('.fc-event')].filter(shown).filter(entry => {
+  return [...root.querySelectorAll('.fc-event')].filter(isScheduleContent).filter(shown).filter(entry => {
     const cell = entry.closest('td.fc-day[data-date]');
     if (entry.closest('.fc') !== view.closest('.fc')) return false;
     if (entry.closest('.fc-view') && entry.closest('.fc-view') !== view) return false;
@@ -4201,11 +4202,31 @@ async function proveFindReopenAfter(removed) {
   } finally { await closeEdit(edit); }
   if (!retained) throw new PageError('Find Assignments would lose its current-week client entry or DNS entry after this change. Nothing was changed; By hand.');
 }
+const assignmentRanges = new WeakMap();
+const findAssignmentsRange = edit => assignmentRanges.get(edit) || null;
+function findDateBox(form, edge) {
+  const labels = [`${edge} Date`, `${edge} Week`];
+  const matches = [...form.querySelectorAll('label')].filter(node => labels.some(label => sameText(text(node).replace(/[*?]/g, ''), label)));
+  if (matches.length !== 1) throw new PageError(`The form has ${matches.length || 'no'} fields labelled "${labels[0]}" or "${labels[1]}".`);
+  return fieldByLabel(form, text(matches[0]).replace(/[*?]/g, '').trim());
+}
 async function findAssignments({ start, end = null, future = false, clients = null }) {
   await guardReady();
   if (findContext?.document === document) await waitForPersonIdentity(findContext.identity);
   const identity = personIdentity();
-  return withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => findAssignmentsRecorded({ start, end, future, clients }));
+  return withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), async () => {
+    const tax = isTaxPage();
+    const before = new Set(document.querySelectorAll('#FindAssignmentsModal'));
+    try { return await findAssignmentsRecorded({ start, end, future, clients }); }
+    catch (error) {
+      if (!tax && !stopFlagged(error)) {
+        for (const modal of [...document.querySelectorAll('#FindAssignmentsModal')].filter(node => !before.has(node) && shown(node))) {
+          await cleanupAfter(error, () => closeWindow(modal, 'the Find Assignments window'));
+        }
+      }
+      throw error;
+    }
+  });
 }
 async function findAssignmentsRecorded({ start, end, future, clients }) {
   let stepStarted = Date.now();
@@ -4227,8 +4248,8 @@ async function findAssignmentsRecorded({ start, end, future, clients }) {
   const form = modal.querySelector('#FindMultipleEventsForm_Form') || modal;
   measured('open');
   if (greyed) {
-    const from = termDayOf(fieldByLabel(form, 'Start Date').value.trim());
-    const to = termDayOf(fieldByLabel(form, 'End Date').value.trim());
+    const from = termDayOf(findDateBox(form, 'Start').value.trim());
+    const to = termDayOf(findDateBox(form, 'End').value.trim());
     const selected = [...fieldByLabel(form, 'Clients').selectedOptions].filter(option => option.value);
     if (!from || !to || !sameDay(mondayOf(from), mondayOf(today)) || !sameDay(mondayOf(to), mondayOf(today))
         || compareDays(to, from) < 0 || selected.length !== 1 || !(/^[^:]+:\s*\d+$/.test(text(selected[0])) || dnsFindAnchor(text(selected[0])))) {
@@ -4251,18 +4272,24 @@ async function findAssignmentsRecorded({ start, end, future, clients }) {
   for (const option of pricing.options) option.selected = false;
   pricing.value = '';
   pricing.dispatchEvent(new window.Event('change', { bubbles: true }));
-  const startBox = fieldByLabel(form, 'Start Date');
+  const startBox = findDateBox(form, 'Start');
   await typeInto(startBox, usDate(start));
   const futureBox = fieldByLabel(form, 'Include All Future Assignments');
   await setChecked(futureBox, future);
-  const endBox = fieldByLabel(form, 'End Date');
+  const endBox = findDateBox(form, 'End');
   if (!future) await typeInto(endBox, end ? usDate(end) : '');
   measured('filters');
   await pageReady('after setting Find Assignments filters');
   measured('settle');
-  const controls = [['Start Date', startBox], ['End Date', endBox], ['Include All Future Assignments', futureBox], ['Include All Clients', allClients], ['Pricing ID', pricing]];
+  const from = termDayOf(startBox.value.trim()), to = termDayOf(endBox.value.trim());
+  const startKept = future ? startBox.value.trim() === usDate(start)
+    : from && (sameDay(from, start) || sameDay(from, mondayOf(start)));
+  const endKept = future || (end ? to && compareDays(to, end) >= 0 && sameDay(mondayOf(to), mondayOf(end)) : endBox.value.trim() === '');
+  const controls = [['Include All Future Assignments', futureBox], ['Include All Clients', allClients], ['Pricing ID', pricing]];
+  const dateBoxes = [startBox, endBox];
   if (!form.isConnected || controls.some(([label, node]) => !node.isConnected || !form.contains(node) || fieldByLabel(form, label) !== node)
-      || startBox.value.trim() !== usDate(start) || futureBox.checked !== future || !future && endBox.value.trim() !== (end ? usDate(end) : '')) {
+      || dateBoxes.some(node => !node.isConnected || !form.contains(node)) || findDateBox(form, 'Start') !== startBox || findDateBox(form, 'End') !== endBox
+      || !startKept || futureBox.checked !== future || !endKept) {
     throw new PageError('Find Assignments did not keep the dates Snooze typed. Nothing was read or changed.');
   }
   const chosen = [...fieldByLabel(form, 'Clients').selectedOptions].filter(option => option.value).map(text);
@@ -4287,6 +4314,8 @@ async function findAssignmentsRecorded({ start, end, future, clients }) {
   await waitFor(() => !modal.isConnected || !shown(modal), 'Find Assignments to close');
   await editTableReady(edit);
   measured('table');
+  const weekBoxes = [...form.querySelectorAll('label')].some(node => sameText(text(node).replace(/[*?]/g, ''), 'Start Week'));
+  assignmentRanges.set(edit, { start: from, end: future ? null : to, weekBoxes });
   return edit;
 }
 async function editTableReady(edit) {
@@ -4402,6 +4431,7 @@ __exports.schedulePageFacts = schedulePageFacts;
 __exports.isSchedulePage = isSchedulePage;
 __exports.requireSchedulePage = requireSchedulePage;
 __exports.onScreen = onScreen;
+__exports.isScheduleContent = isScheduleContent;
 __exports.tilesOnScreen = tilesOnScreen;
 __exports.calendarView = calendarView;
 __exports.pageReady = pageReady;
@@ -4422,6 +4452,7 @@ __exports.canAddAssignment = canAddAssignment;
 __exports.scheduleFacts = scheduleFacts;
 __exports.emptySpots = emptySpots;
 __exports.proveFindReopenAfter = proveFindReopenAfter;
+__exports.findAssignmentsRange = findAssignmentsRange;
 __exports.findAssignments = findAssignments;
 __exports.buttonIn = buttonIn;
 __exports.closeEdit = closeEdit;
@@ -4518,6 +4549,7 @@ __exports.createEditability = createEditability;
 "mysource/pageinfo.js": function (__require, __exports, document, window) {
 'use strict';
 const { shown } = __require("./dom.js");
+const { isScheduleContent } = __require("./schedule.js");
 const { PAGE_LIBRARIES, PAGE_SELECTORS } = __require("../core/run-records.js");
 const { notePictureInfo } = __require("../files/note-picture-info.js");
 const infoTry = (read, fallback = 'not found') => { try { return read(); } catch { return fallback; } };
@@ -4539,7 +4571,7 @@ function safePageInfo(version) {
     lines.push(`${name}: ${present}${/^\d+(?:\.\d+)*$/.test(version) ? `; version: ${version}` : ''}`);
   }
   for (const selector of PAGE_SELECTORS) {
-    try { const nodes = [...document.querySelectorAll(selector)]; lines.push(`${selector}: ${nodes.length}; shown: ${nodes.filter(shown).length}`); }
+    try { const nodes = [...document.querySelectorAll(selector)].filter(isScheduleContent); lines.push(`${selector}: ${nodes.length}; shown: ${nodes.filter(shown).length}`); }
     catch { lines.push(`${selector}: could not read`); }
   }
   lines.push(`Note picture tooltip: ${notePictureInfo.selector}; week: ${notePictureInfo.week}`);
@@ -4823,17 +4855,17 @@ __exports.proveDates = proveDates;
 },
 "mysource/write.js": function (__require, __exports, document, window) {
 'use strict';
-const { stageNotes, stageTaxHours } = __require("./note-stage.js");
+const { stageNotes, stageTaxHours, stageRemoval, sameAssignmentRows } = __require("./note-stage.js");
 const { isTaxPage } = __require("./site.js");
 const { timedRun } = __require("../core/run-records.js");
-const { compareDays, sameDay, mondayOf, todayOf, readIsoDay, usDate } = __require("../rules/dates.js");
+const { addDays, compareDays, sameDay, mondayOf, todayOf, readIsoDay, usDate } = __require("../rules/dates.js");
 const { valueKey } = __require("../rules/prepare.js");
 const { entryKind } = __require("../rules/entries.js");
-const { compareCopies, dayOf, ENTRY_FIELDS, scheduleWriteAttempt } = __require("./copy.js");
+const { compareCopies, dayOf, ENTRY_FIELDS, scheduleWriteAttempt, knownAssignmentRows } = __require("./copy.js");
 const { PageError, WAIT, guardReady, chooseInSelect2, click, closeWindow, fieldByLabel, keepFlags, cleanupAfter, modalTransitioning, pause, settled, shown, stopFlagged, text, typeInto, waitFor } = __require("./dom.js");
 const { proveDates, setDates, proveAllowedDates, proveDateSet, setDateSet } = __require("./dates-box.js");
 const { waitForDates, waitForDateSet } = __require("./dates-box.js");
-const { buttonIn, emptySpots, menuItem, findAssignments, readEditTable, closeEdit, personIdentity, waitForPersonIdentity } = __require("./schedule.js");
+const { buttonIn, emptySpots, menuItem, findAssignments, findAssignmentsRange, readEditTable, closeEdit, personIdentity, waitForPersonIdentity } = __require("./schedule.js");
 const { calendarHolds, showDate } = __require("./calendar.js");
 const { rememberPreflightForm, takePreflightForm, preflightFormIdentity } = __require("./preflight-form.js");
 function deleteClickState(confirm) {
@@ -5077,6 +5109,63 @@ async function fillAndAdd(modal, entry, mode, onWrite, onProgress) {
   });
 }
 function deleteAll(...args) { return timedRun("delete", () => deleteAllRecorded(...args)); }
+function splitDeleteWeeks(query) {
+  const parts = [];
+  for (let monday = mondayOf(query.start); compareDays(monday, query.end) <= 0; monday = addDays(monday, 7)) {
+    const friday = addDays(monday, 4), sunday = addDays(monday, 6);
+    const start = compareDays(query.start, monday) > 0 ? query.start : monday;
+    const end = compareDays(query.end, sunday) < 0 ? query.end : sunday;
+    const partial = compareDays(start, monday) > 0 || compareDays(end, friday) < 0;
+    const previous = parts.at(-1);
+    if (!partial && previous && !previous.partial) previous.end = end;
+    else parts.push({ start, end, partial });
+  }
+  return parts;
+}
+async function deleteRange(query, before, { edit = null, read, onWrite = () => {}, validate = async () => {}, protectedRows = [] } = {}) {
+  const inside = (day, range) => day && compareDays(day, range.start) >= 0 && (!range.end || compareDays(day, range.end) <= 0);
+  const clientMatches = row => !query.clients || query.clients.some(client => valueKey(client) === valueKey(row.client));
+  const original = edit || await findAssignments(query);
+  const range = findAssignmentsRange(original);
+  try {
+    if (isTaxPage() || query.future || !query.end || !range?.weekBoxes || !read) throw new PageError('The week delete scope could not be proved. Nothing was deleted.');
+  } catch (error) { await cleanupAfter(error, () => closeEdit(original)); throw error; }
+  const parts = splitDeleteWeeks(query);
+  if (parts.length !== 1) await closeEdit(original);
+  let current = before;
+  for (const [index, part] of parts.entries()) {
+    const partQuery = { ...query, start: part.start, end: part.end };
+    const findQuery = { ...partQuery, end: compareDays(part.end, addDays(mondayOf(part.end), 4)) > 0 ? addDays(mondayOf(part.end), 4) : part.end };
+    const table = parts.length === 1 && index === 0 ? original : await findAssignments(findQuery);
+    const known = knownAssignmentRows(current);
+    let targets;
+    try {
+      const actualRange = findAssignmentsRange(table);
+      if (!actualRange?.weekBoxes || !known.range || compareDays(actualRange.start, known.range.start) < 0
+        || known.range.end && compareDays(actualRange.end, known.range.end) > 0) throw new PageError('The whole week is not covered by the checked schedule read. Nothing was deleted.');
+      const actual = { days: (await readEditTable(table)).map(row => ({ ...row, day: dayOf(row.date) })) };
+      const expected = { days: known.rows.filter(row => inside(row.day, actualRange) && clientMatches(row)) };
+      if (actual.days.some(row => !row.day) || !sameAssignmentRows(expected, actual)) throw new PageError('The whole-week table changed since the checked read. Nothing was deleted.');
+      targets = expected.days.filter(row => inside(row.day, part) && clientMatches(row));
+      if (targets.some(row => protectedRows.some(old => old.id === row.id))) throw new PageError('A kept row is inside the delete range. Nothing was deleted.');
+      if (!part.partial && targets.length !== actual.days.length) throw new PageError('The whole-week table includes rows outside the delete range. Nothing was deleted.');
+      await validate({ days: actual.days.filter(row => inside(row.day, part)), window: { start: part.start, end: part.end } });
+      if (targets.length) {
+        if (part.partial) await saveStagedNotes(await stageRemoval(table, expected, targets), onWrite);
+        else await deleteAll(table, { onWrite });
+      } else await closeEdit(table);
+    } catch (error) {
+      if (table.isConnected && shown(table) && !error.addPressed) await cleanupAfter(error, () => closeEdit(table));
+      throw error;
+    }
+    const after = await read();
+    const ids = new Set(targets.map(row => row.id));
+    const expected = { days: known.rows.filter(row => !ids.has(row.id)) };
+    if (!sameAssignmentRows(expected, { days: knownAssignmentRows(after).rows })) throw new PageError('The week delete could not be proved. Restore this person before continuing.');
+    current = after;
+  }
+  return current;
+}
 function addAssignment(...args) { return timedRun("add", () => addAssignmentRecorded(...args)); }
 async function setAssignmentHours(query, expected, target, hours, { onWrite = () => {}, restoring = false } = {}) {
   const allowed = () => isTaxPage() && compareDays(target.day, mondayOf(todayOf())) >= 0 && (restoring || hours <= target.hours)
@@ -5108,6 +5197,8 @@ async function saveStagedNotes(prepared, onWrite = () => {}) {
 }
 __exports.preflightDates = preflightDates;
 __exports.deleteAll = deleteAll;
+__exports.splitDeleteWeeks = splitDeleteWeeks;
+__exports.deleteRange = deleteRange;
 __exports.addAssignment = addAssignment;
 __exports.setAssignmentHours = setAssignmentHours;
 __exports.refreshNotes = refreshNotes;
@@ -5159,6 +5250,47 @@ const NOTE_STAGE_EXITS = {
   "submitMissing": "A required Submit button is missing or disabled."
 };
 const STAGED_WORDS = [...NOTE_FIELDS.map(([, key]) => key), 'day', 'notes'];
+function sameAssignmentRows(expected, actual) {
+  const byId = new Map(actual.days.map(row => [row.id, row]));
+  return compareCopies(expected, actual).same && byId.size === actual.days.length
+    && new Set(expected.days.map(row => row.id)).size === expected.days.length
+    && expected.days.every(old => old.id && byId.has(old.id) && old.notes === byId.get(old.id).notes
+      && compareCopies({ days: [old] }, { days: [byId.get(old.id)] }).same);
+}
+async function stageRemoval(edit, expected, remove) {
+  const snapshot = async () => ({ days: (await readEditTable(edit)).map(row => ({ ...row, day: dayOf(row.date) })) });
+  let prepared = false, pressed = false, primary = null;
+  const trashFor = id => {
+    const rows = [...edit.querySelectorAll('tbody tr[data-id]')].filter(node => node.getAttribute('data-id') === id);
+    const buttons = rows.length === 1 ? [...rows[0].querySelectorAll('td.action-column button.btn-xs.btn-danger')].filter(shown) : [];
+    if (buttons.length !== 1 || buttons[0].disabled || buttons[0].getAttribute('aria-disabled') === 'true') throw new PageError(NOTE_STAGE_EXITS.trashButtonMissing);
+    return buttons[0];
+  };
+  try {
+    if (!remove.length || new Set(remove.map(row => row.id)).size !== remove.length
+      || !sameAssignmentRows(expected, await snapshot()) || remove.some(row => !expected.days.some(old => old.id === row.id))) throw new PageError('The removal table changed. Nothing was saved.');
+    for (const row of remove) trashFor(row.id);
+    const removed = new Set();
+    for (const row of remove) {
+      pressed = true;
+      await click(trashFor(row.id));
+      await waitFor(() => ![...edit.querySelectorAll('tbody tr[data-id]')].some(node => node.getAttribute('data-id') === row.id), 'the staged row removal', WAIT.window);
+      await settled(edit);
+      removed.add(row.id);
+      if (!sameAssignmentRows({ days: expected.days.filter(old => !removed.has(old.id)) }, await snapshot())) throw new PageError('The staged row removal could not be proved. Nothing was saved.');
+    }
+    const submits = [...edit.querySelectorAll('button')].filter(node => shown(node) && text(node) === 'Submit');
+    if (submits.length !== 1 || submits[0].disabled || submits[0].getAttribute('aria-disabled') === 'true') throw new PageError(NOTE_STAGE_EXITS.submitMissing);
+    prepared = true;
+    return { edit, saveSubmit: submits[0] };
+  } catch (error) { primary = error; if (pressed) error.noReplay = true; throw error; }
+  finally {
+    if (!prepared) {
+      if (primary) await cleanupAfter(primary, () => closeEdit(edit));
+      else await closeEdit(edit);
+    }
+  }
+}
 function describeStaged(retained, staged) {
   const cap = n => Math.min(n, 9), same = compareCopies(retained, staged);
   const old = new Map(retained.days.map(row => [row.id, row]));
@@ -5235,7 +5367,7 @@ async function stageNotes(query, expected, notes, { remove = [], onStage = () =>
   const refuse = (reason, detail) => { onStage('refused', { reason }, detail); return false; };
   const removedIds = new Set(remove.map(row => row.id));
   const retained = { days: expected.days.filter(row => !removedIds.has(row.id)) };
-  if (remove.length && (remove.length > 7 || removedIds.size !== remove.length || remove.some(row => !row.id) || new Set(remove.map(row => usDate(row.day))).size !== remove.length)) return refuse('removeListRefused');
+  if (remove.length && (removedIds.size !== remove.length || remove.some(row => !row.id) || new Set(remove.map(row => usDate(row.day))).size !== remove.length)) return refuse('removeListRefused');
   if (!noteRowsEligible(retained.days)) return refuse('rowsNotEligible');
   const edit = await findAssignments(query);
   let bulk = null, prepared = false, stagedPressed = false;
@@ -5264,7 +5396,7 @@ async function stageNotes(query, expected, notes, { remove = [], onStage = () =>
       const ids = new Set(remove.slice(0, index + 1).map(row => row.id));
       const expectedStep = { days: before.days.filter(row => !ids.has(row.id)) };
       const actual = await snapshot();
-      if (!compareCopies(expectedStep, actual).same || actual.days.length !== expectedStep.days.length || actual.days.some(row => !expectedStep.days.some(old => old.id === row.id))) {
+      if (!sameAssignmentRows(expectedStep, actual)) {
         throw new PageError('The prepared LOA row removal could not be proved. Nothing was saved.');
       }
       onStage('proof', {rows:actual.days.length, days:actual.days.map(row=>usDate(row.day)), totalHours:actual.days.reduce((sum,row)=>sum+row.hours,0)});
@@ -5373,6 +5505,8 @@ async function stageNotes(query, expected, notes, { remove = [], onStage = () =>
   }
 }
 __exports.NOTE_STAGE_EXITS = NOTE_STAGE_EXITS;
+__exports.sameAssignmentRows = sameAssignmentRows;
+__exports.stageRemoval = stageRemoval;
 __exports.describeStaged = describeStaged;
 __exports.isNoteStageRefusal = isNoteStageRefusal;
 __exports.noteRowsEligible = noteRowsEligible;
@@ -5385,10 +5519,12 @@ const { timedRun } = __require("../core/run-records.js");
 const { compareDays, localStamp, dayFromParts, usDate, nextWorkday, isWeekend } = __require("../rules/dates.js");
 const { valueKey } = __require("../rules/prepare.js");
 const { PageError, cleanupAfter } = __require("./dom.js");
-const { closeEdit, findAssignments, readEditTable, readRowNote, personIdentity, checkPersonIdentity } = __require("./schedule.js");
+const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity } = __require("./schedule.js");
 const { retirePreflightForm } = __require("./preflight-form.js");
 let writeSequence = 0, lastWrite = null, pendingAddRead = null;
 const addReads = new WeakMap();
+const findCopies = new WeakMap();
+const knownAssignmentRows = copy => findCopies.get(copy) || { rows: copy.days, range: copy.window };
 function retireAddRead() { pendingAddRead?.stop(); pendingAddRead = null; }
 function scheduleWriteAttempt(kind) {
   retirePreflightForm();
@@ -5439,16 +5575,20 @@ async function copyWindowRecorded(window, { future = false, noteRows = [], reuse
   const sequence = writeSequence;
   const identity = reuseAfterAdd ? personIdentity() : null;
   const edit = await findAssignments({ start: window.start, end: window.end, future });
-  let rows;
+  const queried = findAssignmentsRange(edit) || window;
+  let rows, found, canRefreshNotes;
   try {
     rows = (await readEditTable(edit)).map(row => {
       const day = dayOf(row.date);
       if (!day) throw new PageError(`A row's date "${row.date}" could not be read.`);
-      if (compareDays(day, window.start) < 0 || (!future && compareDays(day, window.end) > 0)) {
+      if (compareDays(day, queried.start) < 0 || (!future && compareDays(day, queried.end) > 0)) {
         throw new PageError(`The page gave a row outside the window (${row.date}); the copy is not trusted.`);
       }
       return { ...row, day };
     });
+    found = rows;
+    canRefreshNotes = !!edit.querySelector('.js-assignment-edit-edit-all');
+    rows = rows.filter(row => future || compareDays(row.day, window.start) >= 0 && compareDays(row.day, window.end) <= 0);
     for (const row of rows) {
       const day = dayOf(row.date);
       if (typeof row.noteText !== 'string' && day && noteRows.some(old => compareDays(old.day, day) === 0 && valueKey(old.client) === valueKey(row.client))) row.noteText = row.notes > 0 ? await readRowNote(edit, row.id) : '';
@@ -5461,6 +5601,7 @@ async function copyWindowRecorded(window, { future = false, noteRows = [], reuse
   const days = rows;
   const end = future ? days.reduce((last, row) => compareDays(row.day, last) > 0 ? row.day : last, window.end) : window.end;
   const copy = { window: { ...window, end }, taken: localStamp(), days };
+  findCopies.set(copy, { rows: found, range: queried, canRefreshNotes });
   if (reuseAfterAdd && !future) rememberAddRead(copy, identity, sequence);
   return copy;
 }
@@ -5528,6 +5669,7 @@ function compareCopiesRecorded(before, after) {
 }
 function copyWindow(...args) { return timedRun("read", () => copyWindowRecorded(...args)); }
 function compareCopies(...args) { return timedRun("check", () => compareCopiesRecorded(...args)); }
+__exports.knownAssignmentRows = knownAssignmentRows;
 __exports.retireAddRead = retireAddRead;
 __exports.scheduleWriteAttempt = scheduleWriteAttempt;
 __exports.reuseVerifiedAddRead = reuseVerifiedAddRead;
@@ -5593,10 +5735,11 @@ const { PageError, withPersonGuard, cleanupAfter, stopFlagged, keepFlags } = __r
 const { addDays, compareDays, sameDay, todayOf, usDate } = __require("../rules/dates.js");
 const { termDayOf } = __require("../rules/shared.js");
 const { compareByDay, RESTORE_FIELDS, pastReportWarning } = __require("../run/backup.js");
-const { closeEdit, findAssignments, readEditTable, readRowNote, personIdentity, checkPersonIdentity, scheduleFacts, pageReady, proveFindReopenAfter } = __require("./schedule.js");
+const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity, scheduleFacts, pageReady, proveFindReopenAfter } = __require("./schedule.js");
 const { createEditability } = __require("./editability.js");
-const { deleteAll, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
-const { copyWindow, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead } = __require("./copy.js");
+const { deleteAll, deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
+const { copyWindow, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows } = __require("./copy.js");
+const { sameAssignmentRows } = __require("./note-stage.js");
 const { valueKey, noteTextKey } = __require("../rules/prepare.js");
 const compare = (backup, after) => {
   const differences = compareByDay(backup.window ? after.days.filter(row => within(row.day, backup.window)) : after.days, backup.days, null, Object.keys(RESTORE_FIELDS));
@@ -5756,14 +5899,24 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
   const recoveryFailures = [];
   let added = 0;
   let runs = 0;
+  let weekBefore = before;
   for (const run of planned) {
     let entry = null;
     try {
       onStep({ step: 'clearing', runs, ofRuns: planned.length });
       const edit = await findAssignments(run.window);
+      const weekBoxes = findAssignmentsRange(edit)?.weekBoxes;
       let now;
       try {
         now = await readEditTable(edit);
+        if (weekBoxes) {
+          const range = findAssignmentsRange(edit), known = knownAssignmentRows(weekBefore);
+          const expected = { days: known.rows.filter(row => within(row.day, range)) };
+          const actual = { days: now.map(row => ({ ...row, day: dayOf(row.date) })) };
+          if (!known.range || compareDays(range.start, known.range.start) < 0 || known.range.end && compareDays(range.end, known.range.end) > 0
+            || actual.days.some(row => !row.day) || !sameAssignmentRows(expected, actual)) throw new PageError('The whole-week Undo table changed. Nothing was deleted.');
+          now = now.filter(row => within(dayOf(row.date), run.window));
+        }
         const wrong = now.filter(row => {
           const day = dayOf(row.date);
           return !day || !within(day, run.window);
@@ -5783,8 +5936,12 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
         throw error;
       }
       if (now.length && !run.additionOnly) {
-        await deleteAll(edit, { onWrite });
-        if ((await copyWindow(run.window)).days.length) throw new PageError('The page still showed entries after the delete.');
+        if (weekBoxes) weekBefore = await deleteRange(run.window, weekBefore, { edit, onWrite, read: () => copyWindow(window),
+          validate: verifyBefore || (async () => {}) });
+        else {
+          await deleteAll(edit, { onWrite });
+          if ((await copyWindow(run.window)).days.length) throw new PageError('The page still showed entries after the delete.');
+        }
       } else await closeEdit(edit);
       let dateForm = !preflightDone ? await preflight(true) : null;
       total = planned.reduce((sum, run) => sum + run.entries.length, 0);
@@ -5821,6 +5978,7 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
         throw new PageError('The page did not show the run as backed up.');
       }
       recordRun({ type: 'restoreComparison', purpose: 'completedRun', proof: proofIds.get(completedRun), ok: true });
+      if (weekBoxes) weekBefore = await copyWindow(window);
       runs += 1;
     } catch (error) {
       const where = entry ? `${usDate(entry.start)} to ${usDate(entry.end)}, ${entry.client}`
@@ -5953,7 +6111,7 @@ __exports.restoreWindow = restoreWindow;
 'use strict';
 const { addDays, compareDays, sameDay, mondayOf, readIsoDay, usDate } = __require("../rules/dates.js");
 const { PageError, WAIT, click, closeWindow, describe, keepFlags, settled, shown, text, typeInto, waitFor } = __require("./dom.js");
-const { calendarView, onScreen, pageReady } = __require("./schedule.js");
+const { calendarView, isScheduleContent, onScreen, pageReady } = __require("./schedule.js");
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
 const readTitleDay = value => {
   const match = String(value).trim().match(/^([A-Za-z]{3})[a-z]*\.? (\d{1,2}), (\d{4})$/);
@@ -5965,7 +6123,7 @@ const titleWithIcon = () => {
   const roots = [view?.closest('.fc'), view?.closest('.staff-calendar-wrapper')].filter(Boolean);
   if (!roots.length) roots.push(document);
   for (const root of roots) {
-    const titles = [...root.querySelectorAll('.fc-center h2')].filter(node => onScreen(node) && node.querySelector('i[class*="calendar"]'));
+    const titles = [...root.querySelectorAll('.fc-center h2')].filter(isScheduleContent).filter(node => onScreen(node) && node.querySelector('i[class*="calendar"]'));
     if (titles.length > 1) throw new PageError('More than one heading in the active calendar; Snooze will not guess.');
     if (titles.length) return titles[0];
   }
@@ -8131,11 +8289,11 @@ const { addDays, compareDays, mondayOf, reportWindow, todayOf, usDate, workingDa
 const { entryKind } = __require("../rules/entries.js");
 const { emailKey, valueKey, rememberPageName, professionalName } = __require("../rules/prepare.js");
 const { PageError, withPersonGuard, stopFlagged, cleanupAfter } = __require("../mysource/dom.js");
-const { openPerson, findAssignments, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, proveFindReopenAfter, canAddAssignment } = __require("../mysource/schedule.js");
+const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, proveFindReopenAfter, canAddAssignment } = __require("../mysource/schedule.js");
 const { calendarHolds, showDate } = __require("../mysource/calendar.js");
 const { leaveRuns, leavePeriod, loaBlocks, dayRanges, inRange, auditLoaInPlace } = __require("../rules/leaves.js");
-const { deleteAll, addAssignment, preflightDates, refreshNotes, setAssignmentHours } = __require("../mysource/write.js");
-const { compareCopies, copyWindow, entriesToAdd, dayOf, ENTRY_FIELDS } = __require("../mysource/copy.js");
+const { deleteAll, deleteRange, addAssignment, preflightDates, refreshNotes, setAssignmentHours } = __require("../mysource/write.js");
+const { compareCopies, copyWindow, entriesToAdd, dayOf, ENTRY_FIELDS, knownAssignmentRows } = __require("../mysource/copy.js");
 const { restoreWindow, restorePlan } = __require("../mysource/restore.js");
 const { LOA_CLIENT, DNS_CLIENT, checkDnsAdded, checkLoaAdded } = __require("../mysource/checks.js");
 const { compareByDay, reportDays, withPagePricing, validatePageDays } = __require("./backup.js");
@@ -8243,7 +8401,8 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
   const requiredDates = [...(plan.action === 'add' ? workingDays(plan.loaStart, plan.loaEnd) : []), ...runs.flatMap(run => run.rows.map(row => row.day)).filter(day => compareDays(day, reportEnd) <= 0)]
     .filter(day => compareDays(day, today) >= 0);
   const retained = copy.days.filter(row => inRange(row.day, plan.loaStart || window.start, plan.loaEnd || window.end));
-  const bulkCandidate = plan.action === 'add' && (!runs.length || smallReduction(copy, plan, runs)) && alreadyAdded(copy, plan.loaStart, plan.loaEnd, LOA_CLIENT)
+  const canRefreshNotes = knownAssignmentRows(futureCopy).canRefreshNotes;
+  const bulkCandidate = plan.action === 'add' && (!runs.length || smallReduction(copy, plan, runs, canRefreshNotes)) && alreadyAdded(copy, plan.loaStart, plan.loaEnd, LOA_CLIENT)
     && noteRowsEligible(retained);
   if (plan.action === 'add') await step(() => proveFindReopenAfter(copy.days.filter(row =>
     inRange(row.day, plan.loaStart, plan.loaEnd) || onRun(runs, row))));
@@ -8279,7 +8438,7 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
     ...(plan.action === 'add' ? { noteChangedDays: copy.days.filter(row => inReport(row) && valueKey(row.client) === valueKey(LOA_CLIENT)
       && inRange(row.day, plan.loaStart, plan.loaEnd)).map(row => row.day) } : {}),
   };
-  return { window, watchedWindow, copy, watched: copy, backup, removing: [...removing.values()], daysCompared, checks, reportEnd, identity, replacedOldNote, runs, kept, dateForm: dateCheck.modal };
+  return { window, watchedWindow, copy, watched: copy, backup, removing: [...removing.values()], daysCompared, checks, reportEnd, identity, replacedOldNote, runs, kept, canRefreshNotes, dateForm: dateCheck.modal };
 }
 async function prepareAuditReadOnly(one, today, step) {
   if (one.personStop) return { stop: reasonLine(one.personStop), reasonCode: one.personStop.code };
@@ -8423,7 +8582,7 @@ async function applyRecorded(one, prepared, { step = fn => fn(), onWrite: writeN
   }
   if (['dns', 'clearClients'].includes(plan.action)) throw new PageError('The prepared Exit steps are missing. Nothing was changed.');
   if (plan.action === 'add') {
-    const reduction = smallReduction(prepared.copy, plan, prepared.runs || []);
+    const reduction = smallReduction(prepared.copy, plan, prepared.runs || [], prepared.canRefreshNotes);
     const eligible = (!(prepared.runs || []).length || reduction) && alreadyAdded(prepared.copy, plan.loaStart, plan.loaEnd, LOA_CLIENT);
     const refreshed = eligible ? await step(() => refreshNotes(reduction?.query || { start: plan.loaStart, end: plan.loaEnd, clients: [LOA_CLIENT] },
       reduction?.expected || { days: prepared.copy.days.filter(row => inRange(row.day, plan.loaStart, plan.loaEnd)) }, plan.notes, { onWrite: writeThrough([...workingDays(plan.loaStart, plan.loaEnd), ...(reduction?.remove || []).map(row => row.day)]), remove: reduction?.remove || [] })) : false;
@@ -8452,11 +8611,12 @@ async function applyRecorded(one, prepared, { step = fn => fn(), onWrite: writeN
   }
   throw new PageError('Unsupported schedule action. Nothing was changed.');
 }
-function smallReduction(copy, plan, runs) {
+function smallReduction(copy, plan, runs, canRefreshNotes = true) {
   if (plan.action !== 'add' || !runs.length || !alreadyAdded(copy, plan.loaStart, plan.loaEnd, LOA_CLIENT)) return null;
   const remove = copy.days.filter(row => onRun(runs, row));
-  if (!remove.length || remove.length > 7 || remove.length !== runs.reduce((n, run) => n + run.rows.length, 0)
+  if (!remove.length || remove.length !== runs.reduce((n, run) => n + run.rows.length, 0)
     || new Set(remove.map(row => usDate(row.day))).size !== remove.length || remove.some(row => !workingDays(row.day, row.day).length)) return null;
+  if (canRefreshNotes === false && remove.length > 7) return null;
   const dates = [plan.loaStart, plan.loaEnd, ...remove.map(row => row.day)].sort(compareDays);
   const query = { start: dates[0], end: dates.at(-1), clients: [LOA_CLIENT] };
   const expected = { days: copy.days.filter(row => inRange(row.day, query.start, query.end) && valueKey(row.client) === valueKey(LOA_CLIENT)) };
@@ -8467,7 +8627,27 @@ const onRun = (runs, row) => valueKey(row.client) === valueKey(LOA_CLIENT) && ru
 const leftOn = (runs, after) => after.days.filter(row => onRun(runs, row));
 async function removeLeaveRun(run, prepared, step, onWrite, before, readOptions) {
   return step(async () => {
-    const edit = await findAssignments({ start: run.start, end: run.end, clients: [LOA_CLIENT] });
+    const query = { start: run.start, end: run.end, clients: [LOA_CLIENT] };
+    const edit = await findAssignments(query);
+    if (findAssignmentsRange(edit)?.weekBoxes) {
+      const wanted = prepared.copy.days.filter(row => inRange(row.day, run.start, run.end) && valueKey(row.client) === valueKey(LOA_CLIENT));
+      if (wanted.length !== run.rows.length) {
+        const error = new PageError(`The LOA ${dayRanges([run.start, run.end])} changed since the backup. Nothing was deleted.`);
+        await cleanupAfter(error, () => closeEdit(edit)); throw error;
+      }
+      return deleteRange(query, before, {
+        edit, onWrite,
+        validate: async actual => {
+          const wanted = prepared.copy.days.filter(row => inRange(row.day, actual.window.start, actual.window.end) && valueKey(row.client) === valueKey(LOA_CLIENT));
+          if (!compareCopies({ days: wanted }, actual).same) throw new PageError(`The LOA ${dayRanges([run.start, run.end])} changed since the backup. Nothing was deleted.`);
+        },
+        read: async () => {
+          const after = await copyWindow(prepared.watchedWindow || prepared.window, readOptions);
+          recordLaterChange(prepared, after);
+          return after;
+        },
+      });
+    }
     let rows;
     try {
       rows = await readEditTable(edit);
@@ -8621,6 +8801,21 @@ async function caseDates(dates, identity, step, options = {}) {
 async function removeExitEntries(query, matches, prepared, before, step, onWrite) {
   return step(async () => {
     const edit = await findAssignments(query);
+    if (!query.future && findAssignmentsRange(edit)?.weekBoxes) {
+      if (auditRangeTouchesKept(prepared, query)) {
+        const error = new PageError('The Exit entries changed since the backup. Nothing was deleted.');
+        await cleanupAfter(error, () => closeEdit(edit)); throw error;
+      }
+      return deleteRange(query, before, { edit, onWrite, protectedRows: prepared.dnsKept || [],
+        validate: async actual => {
+          if (actual.days.some(row => !matches(row) || prepared.dnsKept?.some(old => row.id === old.id))) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.');
+        },
+        read: async () => {
+          const after = await copyWindow(prepared.watchedWindow, { future: true });
+          recordLaterChange(prepared, after); return after;
+        },
+      });
+    }
     let rows;
     try {
       rows = await readEditTable(edit);
@@ -9257,7 +9452,7 @@ async function runLiveTest({ email, week, length = 'year', through, version, tod
   let release = null;
   try {
     release = await page.begin(result.events);
-    Object.assign(result, { design: 'grouped30', expectedSteps: 30, expectedWrites: 37 });
+    Object.assign(result, { design: 'grouped30', expectedSteps: 30, expectedWrites: 36 });
     await runLiveGroups({ page, window, email: String(email).trim(), result, step, known: () => known, confirm, observe, write: onWrite, stage, proof });
     result.cleanup = 'empty'; result.state = 'complete';
   } catch (error) {
@@ -9424,7 +9619,7 @@ const GROUP_TITLES = {
   aSetup: 'Six LOA days with different notes', aRefresh: 'Production note refresh',
   aCancel: 'Bulk Cancel and five-removal Cancel', aReduce: 'Production six-to-one reduction',
   sevenSetup: 'Extend to ten days and read-only Undo preview', sevenCancel: 'Seven-removal Cancel',
-  sevenReduce: 'Production ten-to-three reduction', loaFallback: 'Own ten-day setup and eight-removal fallback',
+  sevenReduce: 'Production ten-to-three reduction', loaFallback: 'Own ten-day setup and eight removals in one save',
   sevenClear: 'Clear reduction entries', bLoa: 'Four-hour LOA and Undo preview',
   bDns: 'Four-hour DNS, filters and protected Undo preview', bDelete: 'Delete DNS; retain LOA',
   bRestore: 'Addition-only Restore and eligible read reuse', exitFallback: 'Early DNS and beyond-end Exit fallback',
@@ -9618,7 +9813,10 @@ async function runLiveGroups({ page, window, email, result, step, known, confirm
   await step('sevenReduce', () => apply(loaPlan(3), { runs: runsAfter(ten[2]) }, 'combined reduction'));
   await step('loaFallback', async () => {
     await add(LOA_CLIENT, ten.slice(3));
-    await apply(loaPlan(2), { runs: runsAfter(ten[1]) }, 'Replace'); proof('fallback');
+    const before = result.writes, eventStart = result.events.length;
+    await apply(loaPlan(2), { runs: runsAfter(ten[1]) }, 'combined reduction');
+    const saves = result.events.slice(eventStart).filter(row => row.type === 'write');
+    if (result.writes - before !== 1 || saves.length !== 1 || saves[0].origin !== 'Edit Assignments Submit') throw new Error('The one-save LOA reduction was not proved.');
   });
   await step('sevenClear', () => clear());
   const empty = known(); let stale;
@@ -9722,12 +9920,12 @@ const { stageNotes } = __require("./note-stage.js");
 const { createLiveGroups } = __require("./live-groups.js");
 const { createLivePictures } = __require("./live-pictures.js");
 const { PageError, setBatchGuard, shown, click, settled, text, waitFor, WAIT } = __require("./dom.js");
-const { openPerson, personIdentity, checkPersonIdentity, requireSchedulePage, scheduleFacts, findAssignments, readEditTable, closeEdit, setupView } = __require("./schedule.js");
+const { openPerson, personIdentity, checkPersonIdentity, requireSchedulePage, scheduleFacts, findAssignments, findAssignmentsRange, readEditTable, closeEdit, setupView } = __require("./schedule.js");
 const { sessionExpired, cancelBatchWindows } = __require("./batch.js");
-const { copyWindow, compareCopies, dayOf, entriesToAdd } = __require("./copy.js");
+const { copyWindow, compareCopies, dayOf, entriesToAdd, knownAssignmentRows } = __require("./copy.js");
 const { createEditability } = __require("./editability.js");
 const { calendarDates, showDate } = __require("./calendar.js");
-const { addAssignment, deleteAll, preflightDates, setAssignmentHours } = __require("./write.js");
+const { addAssignment, deleteAll, preflightDates, setAssignmentHours, splitDeleteWeeks } = __require("./write.js");
 const { restoreWindow } = __require("./restore.js");
 const { addDays, compareDays, mondayOf, todayOf, usDate, workingDays } = __require("../rules/dates.js");
 const { readSite, isTaxPage } = __require("./site.js");
@@ -10203,7 +10401,9 @@ function auditLivePage(today) {
     finally { release = setBatchGuard(check); check(); }
   };
   const addOp = entry => ({ range: entry, after: before => [...before, ...entryRows(entry)] });
-  const deleteOp = (range, client = null) => ({ kind: 'delete', range, client, after: before => before.filter(row => !inside(row.day, range) || client && valueKey(row.client) !== valueKey(client)) });
+  const deleteOp = (range, client = null) => ({ kind: 'delete', range, client,
+    staged: !!knownAssignmentRows(known).range?.weekBoxes && splitDeleteWeeks(range).some(part => part.partial),
+    after: before => before.filter(row => !inside(row.day, range) || client && valueKey(row.client) !== valueKey(client)) });
   const sequence = async (operations, action, write) => {
     await assertKnown(); let index = 0;
     const notice = async () => {
@@ -10217,7 +10417,9 @@ function auditLivePage(today) {
         const edits = [...document.querySelectorAll('#editEventGridModal')].filter(shown);
         if (edits.length !== 1) throw new PageError('The A&A delete table is not unique.');
         const actual = { days: (await readEditTable(edits[0])).map(row => ({ ...row, day: dayOf(row.date) })) };
-        const expected = { days: pending.before.days.filter(row => inside(row.day, operation.range) && (!operation.client || valueKey(row.client) === valueKey(operation.client))) };
+        const queried = operation.staged ? findAssignmentsRange(edits[0]) : operation.range;
+        if (!queried?.start || !queried.end) throw new PageError('The A&A delete range could not be proved.');
+        const expected = { days: (operation.staged ? pending.after : pending.before).days.filter(row => inside(row.day, queried) && (!operation.client || valueKey(row.client) === valueKey(operation.client))) };
         if (!matches(expected, actual)) throw new PageError('The owned A&A delete rows changed before Yes.');
       };
       await proveDelete();
@@ -10331,7 +10533,8 @@ function auditLivePage(today) {
       await assertKnown(); checkKept(known);
       const operations = [];
       for (const range of [first, { start: second.start, end: scope.end }]) {
-        operations.push(deleteOp(range));
+        const parts = knownAssignmentRows(known).range?.weekBoxes ? splitDeleteWeeks(range) : [range];
+        operations.push(...parts.map(part => deleteOp(part)));
         const entries = entriesToAdd({ days: prepared.backup.days.filter(row => inside(row.day, range)) }, { exact: true }).entries;
         operations.push(...entries.map(addOp));
       }
@@ -10370,7 +10573,7 @@ const { apply, recover, previewRestore, removeLeaveRun, BACKUP_KIND } = __requir
 const { restoreWindow } = __require("./restore.js");
 const { copyWindow, compareCopies, dayOf } = __require("./copy.js");
 const { LOA_CLIENT, DNS_CLIENT } = __require("./checks.js");
-const { findAssignments, readEditTable, closeEdit, scheduleFacts, checkPersonIdentity, emptySpots, menuItem, buttonIn, pageReady } = __require("./schedule.js");
+const { findAssignments, readEditTable, closeEdit, scheduleFacts, checkPersonIdentity, emptySpots, menuItem, buttonIn, pageReady, isScheduleContent } = __require("./schedule.js");
 const { PageError, WAIT, shown, text, click, settled, waitFor, closeWindow, typeInto, chooseInSelect2, fieldByLabel } = __require("./dom.js");
 const { showDate } = __require("./calendar.js");
 const { compareDays, usDate, workingDays } = __require("../rules/dates.js");
@@ -10532,7 +10735,7 @@ function createLiveGroups(context) {
     },
     async cancelGoToDate(expected, window) {
       await guard(window); await assertSame(expected, window);
-      const icon = [...document.querySelectorAll('.fc-center h2 i[class*=calendar]')].find(shown);
+      const icon = [...document.querySelectorAll('.fc-center h2 i[class*=calendar]')].filter(isScheduleContent).find(shown);
       if (!icon) throw new PageError('The Go to Date calendar icon is missing.');
       await click(icon);
       const box = await waitFor(() => [...document.querySelectorAll('input.js-dynamic-calendar-jump-date')].find(shown), 'diagnostic Go to Date');
@@ -11719,6 +11922,7 @@ __exports.xlsxBytes = xlsxBytes;
 "files/paint.js": function (__require, __exports, document, window) {
 'use strict';
 const { PageError } = __require("../mysource/dom.js");
+const { isScheduleContent } = __require("../mysource/schedule.js");
 const PICTURE_DEADLINE = 5000;
 const bounded = start => new Promise(resolve => {
   let done = false;
@@ -11741,7 +11945,7 @@ async function paintCalendar({ noteTooltip = null } = {}) {
     return box.width > 0 && box.height > 0 && getComputedStyle(node).visibility !== 'hidden';
   };
   const name = [...document.querySelectorAll('.calendar-name')].find(visible);
-  const weeks = [...document.querySelectorAll('.fc-view')].filter(visible)
+  const weeks = [...document.querySelectorAll('.fc-view')].filter(isScheduleContent).filter(visible)
     .sort((a, b) => b.querySelectorAll('td.fc-day').length - a.querySelectorAll('td.fc-day').length)[0];
   let target = null;
   if (name && weeks) {
@@ -11749,7 +11953,7 @@ async function paintCalendar({ noteTooltip = null } = {}) {
     while (target && !target.contains(weeks)) target = target.parentElement;
     if (target === document.body || target === document.documentElement) target = null;
   }
-  target = target || [...document.querySelectorAll('.js-calendar-wrapper, .staff-calendar-wrapper, #calendar, .fc')].find(visible);
+  target = target || [...document.querySelectorAll('.js-calendar-wrapper, .staff-calendar-wrapper, #calendar, .fc')].filter(isScheduleContent).find(visible);
   if (!target) throw new PageError('No calendar on screen to take a picture of: open the person’s schedule in Custom view.');
   notes.push(name && target.contains(name) ? 'The person\'s name is in the picture' : '✗ The person\'s name was not found next to the calendar: it is not in the picture');
   const calendarArea = target.getBoundingClientRect();
@@ -12145,6 +12349,7 @@ async function paintCalendar({ noteTooltip = null } = {}) {
   };
   const layers = new Map(), deferred = new Set(), states = new Map();
   const collect = (el, context) => {
+    if (!isScheduleContent(el)) return;
     if (el === noteTooltip && !paintingTooltip) return;
     const style = getComputedStyle(el);
     if (hidden(style) || el.id === 'snooze-panel-host') return;
@@ -12161,6 +12366,7 @@ async function paintCalendar({ noteTooltip = null } = {}) {
     for (const child of el.children) collect(child, owner);
   };
   const walk = async (el, clip, alpha, released = false) => {
+    if (!isScheduleContent(el)) return;
     if (el === noteTooltip && !paintingTooltip) return;
     if (deferred.has(el) && !released) { states.set(el, { clip, alpha }); return; }
     const style = getComputedStyle(el);
@@ -12245,6 +12451,7 @@ async function paintCalendar({ noteTooltip = null } = {}) {
     const localLayers = (layers.get(el) || []).sort((a, b) => a.z - b.z);
     const remember = (parent, parentClip, parentAlpha) => {
       for (const child of parent.children) {
+        if (!isScheduleContent(child)) continue;
         const cs = getComputedStyle(child);
         if (hidden(cs)) continue;
         states.set(child, { clip: parentClip, alpha: parentAlpha });
@@ -12292,6 +12499,7 @@ async function paintCalendar({ noteTooltip = null } = {}) {
   if (count.pseudoSkipped) notes.push(`${count.pseudoSkipped} decoration(s) with no size left out`);
   const describe = node => `${node.tagName.toLowerCase()}${[...node.classList].map(c => '.' + c.replace(/\d+/g, '#')).join('')}`;
   const iconLike = [...target.querySelectorAll('i, svg, [class*="fa-"], [class*="icon"], [class*="glyph"]')]
+    .filter(isScheduleContent)
     .filter(node => !node.closest('svg') || node.tagName.toLowerCase() === 'svg')
     .filter(node => { const b = node.getBoundingClientRect(); return b.width > 0 || b.height > 0; });
   const missed = iconLike.filter(node => !painted.has(node) && ![...painted].some(p => node.contains(p)) && !node.textContent.trim());

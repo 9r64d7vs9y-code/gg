@@ -1,4 +1,4 @@
-/* 1.2.0-console.44 */
+/* 1.2.0-console.46 */
 (() => {
 'use strict';
 const __yoinkModules = {
@@ -1937,7 +1937,7 @@ const { cleanEmail, emailDate, plainEmail, findByEmail } = __yoinkLoad('family/e
 const { reportWindow, todayOf, usDate } = __yoinkLoad('family/report-window.js');
 const { COLOURS } = __yoinkLoad('family/look.js');
 void (async () => {
-  const VERSION = '1.2.0-console.44';
+  const VERSION = '1.2.0-console.46';
   const TOOL_KEY = '__yoinkTool';
   if (window[TOOL_KEY]?.active || document.getElementById('bp-panel')) {
     alert('Yoink is already running. Close the existing panel before running it again.');
@@ -2253,9 +2253,9 @@ void (async () => {
       return emails.find((email) => email === term) || emails.find((email) => emailKey(email) === term) || null;
     } catch { return undefined; }
   };
-  const emailOfOption = (option) => {
+  const emailOfOption = (option, text) => {
     const subtext = option.querySelector('.select2-results__option-subtext');
-    return emailsIn(subtext ? subtext.textContent : option.textContent)[0] || null;
+    return emailsIn(subtext ? subtext.textContent : (text ?? option.textContent))[0] || null;
   };
   const selectionLabel = text => String(text || '').replace(/\s+/g, ' ').trim();
   const labelOfOption = option => {
@@ -2279,9 +2279,6 @@ void (async () => {
     }
     return '';
   };
-  const optionMatches = (option, term) => (isId(term)
-    ? idOfOption(option, 'id') === term
-    : emailOfOption(option) === term);
   const closeSelect = (which = 'email') => { try { jQuery(getSelect(which)).select2('close'); } catch {} };
   const click = (selector) => {
     const node = typeof selector === 'function' ? selector() : document.querySelector(selector);
@@ -2292,7 +2289,7 @@ void (async () => {
   };
   const getSearchAgainButton = () => {
     if (reportMode) return reportSearchAgainButtons()[0] || null;
-    const controls = [...document.querySelectorAll('a.js-search-again, button[data-action="search-again"]')];
+    const controls = [...document.querySelectorAll(REPORT_PAGE.searchAgainAction)];
     return controls.find(node => node.getClientRects().length > 0) || controls[0] || null;
   };
   const isApprovedPage = () => (!APPROVED_ORIGIN || location.origin === APPROVED_ORIGIN)
@@ -2848,7 +2845,7 @@ void (async () => {
   };
   const intakeSkipNotice = (terms) => `⚠ ${terms.length} ${terms.length === 1 ? 'value' : 'values'} skipped (${reportMode
     ? 'the report takes one email per value' : 'staff search takes one email or one number per value'}); listed in the CSV.`;
-  const reportEmailSources = (sources, excluded) => {
+  const classifyIntakeSources = (sources, excluded) => {
     const supplied = new Set(sources.flatMap((source) => [...source.emails, ...(source.excluded || [])]));
     const skipOnlyValues = excluded.filter((term) => !lookupTerm(term) && !supplied.has(term));
     return sources.map((source, index) => {
@@ -2982,9 +2979,7 @@ void (async () => {
   on(document, 'dragend', () => clearDropTargets());
   on(document, 'dragleave', (e) => { if (!e.relatedTarget) clearDropTargets(); });
   on(window, 'blur', () => clearDropTargets());
-  const focusableWithin = (root) => root ? [...root.querySelectorAll(
-    'button, input, textarea, select, a[href], [tabindex]'
-  )].filter((node) => !node.disabled && node.getAttribute('tabindex') !== '-1' && node.offsetParent !== null) : [];
+  const focusableWithin = (root, selector = 'button, input, textarea, select, a[href], [tabindex]') => root ? [...root.querySelectorAll(selector)].filter((node) => !node.disabled && node.getAttribute('tabindex') !== '-1' && node.offsetParent !== null) : [];
   let modalSeq = 0, reportBatchStarting = false, reportSettingsOpened = false, inputReading = false;
   const syncSettingsControl = () => {
     const locked = running || reportBatchStarting || Boolean(cancelOpenModal) || Boolean(recoveryMode);
@@ -3209,8 +3204,10 @@ void (async () => {
     const n = el('bp-readiness');
     if (!n) return;
     if (!ready) {
-      n.style.cssText = 'display:block;font-size:12px;border-radius:8px;padding:8px 10px;background:#451f1f;color:#ffb3ae;';
-      n.textContent = `● Not ready — ${failures[0]}`;
+      n.style.cssText = 'display:block;font-size:12px;border-radius:8px;padding:8px 10px;background:#451f1f;color:#ffb3ae;white-space:pre-line;';
+      n.textContent = failures.length === 1
+        ? `● Not ready — ${failures[0]}`
+        : `● Not ready — ${failures.length} problems:\n${failures.map(failure => `• ${failure}`).join('\n')}`;
       return;
     }
     n.style.display = 'none';
@@ -3359,8 +3356,7 @@ void (async () => {
     if (await confirmModal('Close Yoink?', 'Stops the current batch.', 'Close', 'Keep working')) destroy();
   };
   el('bp-x').onclick = confirmClose;
-  const focusablePanelNodes = () => [...panel.querySelectorAll('button, textarea, input, select, [tabindex]')]
-    .filter((node) => !node.disabled && node.getAttribute('tabindex') !== '-1' && node.offsetParent !== null);
+  const focusablePanelNodes = () => focusableWithin(panel, 'button, textarea, input, select, [tabindex]');
   on(document, 'keydown', (e) => {
     if (!active()) return;
     if (e === reportDateEscape) return;
@@ -4215,6 +4211,7 @@ void (async () => {
         }
       }
       if (confirmButton) confirmButton.disabled = !chosen.length;
+      if (allButton) allButton.textContent = boxes.every(box => box.checked) ? 'Clear' : 'Select all';
       boxes.forEach(paint);
       return chosen;
     };
@@ -4232,7 +4229,6 @@ void (async () => {
     if (allButton) allButton.onclick = () => {
       const turnOn = boxes.some((x) => !x.checked);
       boxes.forEach((x) => { x.checked = turnOn; });
-      allButton.textContent = turnOn ? 'Clear' : 'Select all';
       sync();
     };
     sync();
@@ -4577,7 +4573,7 @@ void (async () => {
       }
       const { excluded } = refreshPasteCounts();
       const kept = [], allDropped = [];
-      const eligible = reportEmailSources(sources, excluded);
+      const eligible = classifyIntakeSources(sources, excluded);
       const rejected = rejectedSources(eligible);
       eligible.forEach((source) => {
         const { kept: keep, dropped } = applyExclusions(source.emails, excluded);
@@ -4624,12 +4620,12 @@ void (async () => {
         try {
           const selected = selectedEmails();
           const ids = new Set(empidReady() ? selectedIds('id') : []);
+          const selection = { has: person => isId(person)
+            ? ids.has(person) || ids.has(confirmedIdKeys.get(person)) : selected.has(person) };
           const seen = new Set(state.input.filter(term => finalReason(term) !== 'not reached'));
-          for (const person of people) {
-            const inBox = isId(person) ? ids.has(person) || ids.has(confirmedIdKeys.get(person)) : selected.has(person);
-            if (inBox || state.addedSet.has(person)) already++;
-            if (!inBox && !seen.has(person)) toAdd++;
-          }
+          const counts = batchPeople(people, selection, seen);
+          toAdd = counts.toAdd.length;
+          already = counts.already.length;
         } catch {
           el('bp-confirm-start').disabled = true;
           setStatus('⚠ Could not read the selection → load or paste again.');
@@ -4645,7 +4641,7 @@ void (async () => {
           summary.append(dom('span', { 'data-count': key, style: color ? `color:${color};` : null }, text));
         };
         part('to-add', `${toAdd} to add`, PALETTE.green);
-        if (already) part('already', `${already} already added`, COLOURS.blue);
+        if (already) part('already', `${already} already added`, PALETTE.blue);
         if (skipped) part('skipped', `${skipped} skipped`, PALETTE.muted);
         const seconds = Math.round(toAdd * lookupBudgetEstimate() / 1000);
         const time = seconds < 60 ? `${seconds}s` : `${Math.ceil(seconds / 60)}m`;
@@ -4746,6 +4742,16 @@ void (async () => {
         if (live() && sources) settle(sources);
       }));
   });
+  const batchPeople = (people, selected, seen = new Set()) => {
+    const toAdd = [], alreadyInBox = [], already = [];
+    for (const person of people) {
+      const inBox = selected.has(person);
+      if (inBox) alreadyInBox.push(person);
+      if (inBox || state.addedSet.has(person)) already.push(person);
+      if (!inBox && !seen.has(person)) toAdd.push(person);
+    }
+    return { toAdd, alreadyInBox, already };
+  };
   const prepareBatch = (source, seen) => {
     const ordered = sourceSuppliedOrder(source);
     const rejected = source.emails.filter(term => !lookupTerm(term));
@@ -4759,8 +4765,7 @@ void (async () => {
       else { seen.add(email); fresh.push(email); }
     });
     const allDupes = [...dupes.map(emailKey), ...priorDupes];
-    const toAdd = fresh.filter((email) => !state.selectedSet.has(email));
-    const alreadyInBox = fresh.filter((email) => state.selectedSet.has(email));
+    const { toAdd, alreadyInBox } = batchPeople(fresh, state.selectedSet);
     const pickedEmails = Object.fromEntries(alreadyInBox.map((term) => {
       const email = selectedEmailFor(term);
       if (email === undefined) throw new Error('Selection is unreadable.');
@@ -4777,7 +4782,7 @@ void (async () => {
     return { batch, toAdd, raw, dupes: allDupes, alreadyInBox };
   };
   const confirmBatches = (sources) => {
-    sources = reportEmailSources(sources, []);
+    sources = classifyIntakeSources(sources, []);
     const { batchSeq, pasteSeq } = state;
     let prepared;
     try {
@@ -4839,8 +4844,7 @@ void (async () => {
     const emails = new Map(), ids = new Map();
     const emailOf = row => {
       if (!emails.has(row)) {
-        const subtext = row.querySelector('.select2-results__option-subtext');
-        emails.set(row, emailsIn(subtext ? subtext.textContent : texts.get(row))[0] || null);
+        emails.set(row, emailOfOption(row, texts.get(row)));
       }
       return emails.get(row);
     };
@@ -5425,7 +5429,7 @@ void (async () => {
     show('bp-more', false);
     setStatus(`↩ Removing "${clip(name, 40)}"…`);
     const { failed } = await removeBatchSelections(batch);
-    if (!active() || recoveryMode || sessionLost) return;
+    if (!active()) return;
     if (failed.length) {
       keepUnremovedEntries(batch, failed);
       batch.excludedEmails = [];
@@ -5437,6 +5441,7 @@ void (async () => {
     }
     rebuildStateFromBatches();
     renderCounts();
+    if (recoveryMode || sessionLost) return;
     return true;
   }).then((done) => {
     if (!done || !active()) return;
@@ -5457,7 +5462,7 @@ void (async () => {
       }
     }
     if (!active()) return false;
-    if (!reportMode && document.querySelector('button.js-clear-search')) click('button.js-clear-search', 'Clear Search');
+    if (!reportMode && document.querySelector('button.js-clear-search')) click('button.js-clear-search');
     await wait(T.gap);
     if (!active()) return false;
     clearBox();
