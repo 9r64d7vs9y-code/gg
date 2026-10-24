@@ -3562,7 +3562,12 @@ const screenReader = (doc, styleOf = computedStyle) => {
   };
 };
 const onScreen = node => screenReader(node.ownerDocument)(node);
-const isScheduleContent = node => !node.closest('[id^="controlCalendar_"]');
+const isScheduleContent = node => {
+  const control = node.closest('[id^="controlCalendar_"]');
+  if (!control) return true;
+  if (!control.querySelector(':scope > .fc-toolbar')) return false;
+  return !node.closest('.fc-view-container, .fc-view');
+};
 const tilesOnScreen = () => [...document.querySelectorAll('.fc-event')].filter(isScheduleContent).filter(screenReader(document));
 function calendarView() {
   return calendarViewUsing(computedStyle);
@@ -3582,6 +3587,13 @@ function calendarViewUsing(styleOf) {
   const wrappers = [...document.querySelectorAll('.staff-calendar-wrapper')].filter(exposed);
   if (wrappers.length > 1) throw new PageError('More than one active Professional calendar; Snooze will not guess.');
   const root = wrappers[0] || document;
+  for (const control of root.querySelectorAll('[id^="controlCalendar_"]')) {
+    if (control.querySelector('.fc-event')) throw new PageError('The header calendar copy holds entries; Snooze will not guess.');
+    const copies = control.querySelectorAll('.fc-view-container, .fc-view, td.fc-day');
+    if ([...copies].some(node => exposed(node) && node.getBoundingClientRect().height > 0)) {
+      throw new PageError('The header calendar copy is visible; Snooze will not guess.');
+    }
+  }
   const views = [...root.querySelectorAll(CALENDAR_VIEW)].filter(isScheduleContent).filter(exposed);
   if (views.length < 2) return views[0] || null;
   const dated = views.filter(view => [...view.querySelectorAll('td.fc-day[data-date]')].some(exposed));
@@ -6120,10 +6132,13 @@ const readTitleDay = value => {
 };
 const titleWithIcon = () => {
   const view = calendarView();
-  const roots = [view?.closest('.fc'), view?.closest('.staff-calendar-wrapper')].filter(Boolean);
+  const active = view?.closest('.fc'), wrapper = view?.closest('.staff-calendar-wrapper');
+  const roots = wrapper?.querySelector('[id^="controlCalendar_"] > .fc-toolbar')
+    ? [wrapper] : [active, wrapper].filter(Boolean);
   if (!roots.length) roots.push(document);
   for (const root of roots) {
-    const titles = [...root.querySelectorAll('.fc-center h2')].filter(isScheduleContent).filter(node => onScreen(node) && node.querySelector('i[class*="calendar"]'));
+    const titles = [...root.querySelectorAll('.fc-center h2')].filter(isScheduleContent)
+      .filter(node => onScreen(node) && node.querySelector('i[class*="calendar"]'));
     if (titles.length > 1) throw new PageError('More than one heading in the active calendar; Snooze will not guess.');
     if (titles.length) return titles[0];
   }
@@ -6234,6 +6249,7 @@ async function showDate(day, { cellProof = true } = {}) {
   await pageReady(`after moving the calendar to ${usDate(day)}`);
   return range;
 }
+__exports.titleWithIcon = titleWithIcon;
 __exports.shownRange = shownRange;
 __exports.rangeHolds = rangeHolds;
 __exports.calendarHolds = calendarHolds;
@@ -10573,9 +10589,9 @@ const { apply, recover, previewRestore, removeLeaveRun, BACKUP_KIND } = __requir
 const { restoreWindow } = __require("./restore.js");
 const { copyWindow, compareCopies, dayOf } = __require("./copy.js");
 const { LOA_CLIENT, DNS_CLIENT } = __require("./checks.js");
-const { findAssignments, readEditTable, closeEdit, scheduleFacts, checkPersonIdentity, emptySpots, menuItem, buttonIn, pageReady, isScheduleContent } = __require("./schedule.js");
+const { findAssignments, readEditTable, closeEdit, scheduleFacts, checkPersonIdentity, emptySpots, menuItem, buttonIn, pageReady } = __require("./schedule.js");
 const { PageError, WAIT, shown, text, click, settled, waitFor, closeWindow, typeInto, chooseInSelect2, fieldByLabel } = __require("./dom.js");
-const { showDate } = __require("./calendar.js");
+const { showDate, titleWithIcon } = __require("./calendar.js");
 const { compareDays, usDate, workingDays } = __require("../rules/dates.js");
 const { valueKey } = __require("../rules/prepare.js");
 const { termDayOf } = __require("../rules/shared.js");
@@ -10735,7 +10751,7 @@ function createLiveGroups(context) {
     },
     async cancelGoToDate(expected, window) {
       await guard(window); await assertSame(expected, window);
-      const icon = [...document.querySelectorAll('.fc-center h2 i[class*=calendar]')].filter(isScheduleContent).find(shown);
+      const icon = titleWithIcon()?.querySelector('i[class*=calendar]');
       if (!icon) throw new PageError('The Go to Date calendar icon is missing.');
       await click(icon);
       const box = await waitFor(() => [...document.querySelectorAll('input.js-dynamic-calendar-jump-date')].find(shown), 'diagnostic Go to Date');
