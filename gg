@@ -1,18 +1,21 @@
-// Snooze probe 2, read-only: clicks nothing, saves nothing, sends nothing. Structure and counts only, no names.
+// Snooze probe 3, read-only: clicks nothing, saves nothing, sends nothing. Sizes and styles only, no names.
+// Shows what the new header-copy check sees, and what the 2026-10-18 code would have chosen.
 (() => {
-  const vis = n => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-  const inCtrl = n => !!n.closest('[id^="controlCalendar_"]');
+  const css = n => getComputedStyle(n);
+  const styled = n => { for (let p = n; p && p !== document.body; p = p.parentElement) { const s = css(p); if (p.hidden || s.display === 'none' || s.visibility === 'hidden') return false; } return true; };
+  const size = n => { const r = n.getBoundingClientRect(); return `${Math.round(r.width)}x${Math.round(r.height)}`; };
   const lines = [];
-  [...document.querySelectorAll('.fc-view')].forEach((v, i) => {
-    const r = v.getBoundingClientRect();
-    const cells = [...v.querySelectorAll('td.fc-day[data-date]')];
-    lines.push(`VIEW ${i + 1}: ${v.className.split(/\s+/).filter(c => c.endsWith('-view')).join(' ')} inControlCalendar=${inCtrl(v)} height=${Math.round(r.height)} visible=${vis(v)} dayCells=${cells.length} visibleCells=${cells.filter(vis).length} first=${cells[0]?.dataset.date || '-'} entriesInside=${v.querySelectorAll('.fc-event').length}`);
-  });
-  const ev = [...document.querySelectorAll('.fc-event')];
-  lines.push(`ENTRIES: total=${ev.length} visible=${ev.filter(vis).length} insideControlCalendar=${ev.filter(inCtrl).length}`);
-  const tb = [...document.querySelectorAll('.fc-toolbar')];
-  lines.push(`TOOLBARS: ${tb.length}; inControlCalendar=${tb.filter(inCtrl).length}; visible=${tb.filter(vis).length}`);
   const ctrl = document.querySelector('[id^="controlCalendar_"]');
-  if (ctrl) lines.push(`controlCalendar children: ${[...ctrl.children].map(c => c.tagName.toLowerCase() + '.' + String(c.className).trim().split(/\s+/).slice(0, 2).join('.') + '(h=' + Math.round(c.getBoundingClientRect().height) + ')').join(', ')}`);
+  if (ctrl) {
+    const copies = [...ctrl.querySelectorAll('.fc-view-container, .fc-view, td.fc-day')];
+    const trip = copies.filter(n => styled(n) && n.getBoundingClientRect().height > 0);
+    lines.push(`NEW CHECK: copies=${copies.length} wouldRefuse=${trip.length > 0} (${trip.length} nodes styled-visible with height>0)`);
+    trip.slice(0, 4).forEach(n => lines.push(`  trips: ${n.tagName.toLowerCase()}.${String(n.className).split(/\s+/).slice(0, 2).join('.')} size=${size(n)} overflowParent=${css(n.closest('.fc-view-container') || n).overflow}`));
+    lines.push(`  copy container: size=${size(ctrl.querySelector('.fc-view-container') || ctrl)} overflow=${css(ctrl.querySelector('.fc-view-container') || ctrl).overflow}`);
+  } else lines.push('NO controlCalendar_ ON THIS PAGE');
+  const views = [...document.querySelectorAll('.fc-view')];
+  lines.push(`OLD (10-18) VIEW CHOICE: styled-visible views=${views.filter(styled).length}; with styled-visible dated cells=${views.filter(v => [...v.querySelectorAll('td.fc-day[data-date]')].some(styled)).length} (2 or more = old code refuses)`);
+  const wrapper = document.querySelector('.staff-calendar-wrapper');
+  lines.push(`OLD HEADING: headings with icon in wrapper=${wrapper ? wrapper.querySelectorAll('.fc-center h2 i[class*="calendar"]').length : 'no wrapper'}`);
   console.log(lines.join('\n'));
 })();
