@@ -1,1 +1,19 @@
-(()=>{const l=[...document.querySelectorAll('label')].find(l=>/^Name\b/.test(l.textContent.trim())&&!l.closest('#bp-panel'));const box=l.closest('.dynamic-field-container,.dynamic-field-column')||l.parentElement;const s=box.querySelector('select');return [s&&s.multiple, s&&JSON.stringify(jQuery(s).val()), box.querySelectorAll('.select2-selection__choice').length, box.outerHTML.slice(0,1500)]})()
+// Snooze heading probe, read-only: clicks nothing, saves nothing, sends nothing.
+// Prints only the page's structure and the calendar heading's dates, no names.
+(() => {
+  const vis = n => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const path = n => { const out = []; for (let p = n; p && p !== document.body && out.length < 6; p = p.parentElement)
+    out.push(p.tagName.toLowerCase() + (p.id ? '#' + p.id.replace(/\d+/g, 'N') : '') + (p.className && typeof p.className === 'string' ? '.' + p.className.trim().split(/\s+/).slice(0, 3).join('.') : ''));
+    return out.join(' < '); };
+  const lines = [];
+  const h2s = [...document.querySelectorAll('.fc-center h2, .fc-toolbar h2, .fc-toolbar-title')];
+  lines.push('HEADINGS: ' + h2s.length);
+  h2s.forEach((h, i) => lines.push(`#${i + 1} visible=${vis(h)} inControlCalendar=${!!h.closest('[id^="controlCalendar_"]')} iconInside=${!!h.querySelector('i[class*="calendar"]')} text="${h.textContent.replace(/\s+/g, ' ').trim().slice(0, 40)}"\n   path: ${path(h)}`));
+  const icons = [...document.querySelectorAll('i[class*="calendar"]')].filter(vis);
+  lines.push('VISIBLE CALENDAR ICONS: ' + icons.length);
+  icons.slice(0, 6).forEach((n, i) => lines.push(`icon ${i + 1}: ${n.className} | path: ${path(n)}`));
+  const ctrl = [...document.querySelectorAll('[id^="controlCalendar_"]')];
+  lines.push('controlCalendar_ ELEMENTS: ' + ctrl.length + ' (visible ' + ctrl.filter(vis).length + ')' + (ctrl[0] ? ' first path: ' + path(ctrl[0]) : ''));
+  lines.push('VIEWS: ' + [...document.querySelectorAll('.fc-view')].map(v => v.className.split(/\s+/).find(c => c.endsWith('-view')) + (vis(v) ? '(on)' : '(off)')).join(', '));
+  console.log(lines.join('\n'));
+})();
