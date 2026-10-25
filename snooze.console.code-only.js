@@ -3587,17 +3587,33 @@ function calendarViewUsing(styleOf) {
   const wrappers = [...document.querySelectorAll('.staff-calendar-wrapper')].filter(exposed);
   if (wrappers.length > 1) throw new PageError('More than one active Professional calendar; Snooze will not guess.');
   const root = wrappers[0] || document;
+  const laidOut = document.body.getBoundingClientRect().width > 0;
+  const styleVisibility = new WeakMap();
+  const styled = node => {
+    if (!node || node === document.body) return true;
+    if (styleVisibility.has(node)) return styleVisibility.get(node);
+    const style = styleOf(node);
+    const result = !node.hidden && style.display !== 'none' && style.visibility !== 'hidden'
+      && (!node.classList.contains('tab-pane') || node.classList.contains('active')) && styled(node.parentElement);
+    styleVisibility.set(node, result);
+    return result;
+  };
+  const sizedCell = cell => {
+    if (!styled(cell)) return false;
+    const box = cell.getBoundingClientRect();
+    return box.width > 0 && box.height > 0;
+  };
   for (const control of root.querySelectorAll('[id^="controlCalendar_"]')) {
     if (control.querySelector('.fc-event')) throw new PageError('The header calendar copy holds entries; Snooze will not guess.');
-    const copies = control.querySelectorAll('.fc-view-container, .fc-view, td.fc-day');
-    if ([...copies].some(node => exposed(node) && node.getBoundingClientRect().height > 0)) {
-      throw new PageError('The header calendar copy is visible; Snooze will not guess.');
+    if ([...control.querySelectorAll('td.fc-day[data-date]')].some(sizedCell)) {
+      throw new PageError('The header calendar copy has visible dated cells; Snooze will not guess.');
     }
   }
-  const views = [...root.querySelectorAll(CALENDAR_VIEW)].filter(isScheduleContent).filter(exposed);
-  if (views.length < 2) return views[0] || null;
-  const dated = views.filter(view => [...view.querySelectorAll('td.fc-day[data-date]')].some(exposed));
+  const views = [...root.querySelectorAll(CALENDAR_VIEW)].filter(isScheduleContent).filter(laidOut ? styled : exposed);
+  if (!laidOut && views.length < 2) return views[0] || null;
+  const dated = views.filter(view => [...view.querySelectorAll('td.fc-day[data-date]')].some(laidOut ? sizedCell : exposed));
   if (dated.length === 1) return dated[0];
+  if (laidOut && !dated.length) return null;
   throw new PageError('The active calendar has more than one readable view; Snooze will not guess.');
 }
 const BUSY = 'div.loading, .blockUI.blockOverlay, .loading-overlay';
