@@ -2653,6 +2653,14 @@ const { entryKind } = __require("../rules/entries.js");
 const { levelGroupKey } = __require("../rules/shared.js");
 const { PageError } = __require("../mysource/dom.js");
 const { reportPullTime } = __require("./report-time.js");
+function reportAssignPeriod(report, email) {
+  const entries = report?.entries?.filter(row => row.email === emailKey(email)) || [];
+  const labels = entries.map(row => {
+    const raw = Object.entries(row.fields || {}).find(([key]) => headerKey(key) === headerKey('Assign Period'))?.[1];
+    return ({ weekly: 'Weekly', time: 'Time' })[valueKey(raw)] || 'unknown';
+  });
+  return labels.length && new Set(labels).size === 1 ? labels[0] : 'unknown';
+}
 function requireDayReport(report) {
   if (report?.mode !== 'day') throw Object.assign(new PageError('The Staff Schedule Hours Report was not pulled by Day: pull it by Day. It is the backup (Dre, 2026-10-02).'), { batchWide: true });
 }
@@ -2841,6 +2849,7 @@ function personSlice(report, email, window) {
     resourceManagerEmail: emailKey(all[0]?.resourceManagerEmail || ''),
   };
 }
+__exports.reportAssignPeriod = reportAssignPeriod;
 __exports.requireDayReport = requireDayReport;
 __exports.dateOf = dateOf;
 __exports.readReport = readReport;
@@ -2867,6 +2876,7 @@ const personFieldWords = { id: 'Professional ID', professional: 'Professional', 
 function reasonLine(decision, prepared = null) {
   const { code } = decision;
   switch (code) {
+    case 'cannotRestore': return `Snooze could not put these days back if needed: ${decision.problems.join('; ')}.`;
     case 'subcategoryMismatch': return `Subcategory says ${caseKindWords[decision.subcategory.kind]} (${decision.subcategory.text}); the Description reads as ${caseKindWords[decision.descriptionKind]} → by hand`;
     case 'notLeaveOrExitCase': return `Not Snooze's case: Subcategory 1: "${decision.subcategory.first || '(blank)'}"; Subcategory 2: "${decision.subcategory.second || '(blank)'}" → no action`;
     case 'datesOnOneLine': return `✗ ${decision.detail.label}: two dates on one line → by hand; check the ticket`;
@@ -2928,12 +2938,18 @@ __exports.reasonLine = reasonLine;
 "mysource/dom.js": function (__require, __exports, document, window) {
 'use strict';
 const { valueKey } = __require("../rules/prepare.js");
-const { recordRun, reasonCode, windowName, FIELDS, WINDOWS } = __require("../core/run-records.js");
+const { reasonName, REASON_NAMES } = __require("../core/reason-names.js");
+const { recordRun, reasonCode, windowName, diagnosticWaitName, FIELDS, WINDOWS } = __require("../core/run-records.js");
 class PageError extends Error {
-  constructor(message, { record = true } = {}) {
+  constructor(message, { record = true, reasonName: fixedReason } = {}) {
     super(message);
     this.name = 'PageError';
-    if (record) recordRun({ type: 'error', code: reasonCode(message) });
+    this.reasonName = REASON_NAMES.has(fixedReason) ? fixedReason : reasonName(message);
+    if (record) {
+      const event = { type: 'error', code: reasonCode(message), reasonName: this.reasonName };
+      recordRun(event);
+      if (event.liveStop) this.liveStop = event.liveStop;
+    }
     if (/not found|no .*cell|no .*button|not the .*expects|not.*shown|no .*box|field.*labelled|window.*closed/i.test(message)) recordRun({ type: 'miss', name: windowName(message) || 'Schedule window' });
   }
 }
@@ -3003,8 +3019,10 @@ const guardReady = (timeout = WAIT.timeout) => guarded(() => true, timeout);
 const STOP_FLAGS = ['identityChanged', 'session', 'pageBlocked', 'schedulePage', 'batchWide'];
 const stopFlagged = error => STOP_FLAGS.some(flag => error?.[flag]);
 function keepFlags(from, to) {
+  if (from?.reasonName) to.reasonName = from.reasonName;
+  if (from?.liveStop) to.liveStop = from.liveStop;
   for (const flag of STOP_FLAGS) if (from?.[flag]) to[flag] = from[flag];
-  for (const key of ['identityFacts', 'scheduleFacts', 'person', 'stage', 'operation', 'identityRecorded', 'scheduleRecorded']) {
+  for (const key of ['identityFacts', 'scheduleFacts', 'person', 'stage', 'operation', 'identityRecorded', 'scheduleRecorded', 'reasonName']) {
     if (from?.[key] !== undefined && to[key] === undefined) to[key] = from[key];
   }
   return to;
@@ -3012,7 +3030,10 @@ function keepFlags(from, to) {
 async function cleanupAfter(original, cleanup) {
   try { return await cleanup(); }
   catch (error) {
+    const originalReason = original.reasonName, originalStop = original.liveStop;
     keepFlags(error, original);
+    if (originalReason) original.reasonName = originalReason;
+    if (originalStop) original.liveStop = originalStop;
     (original.cleanupErrors ||= []).push({ name: error.name, message: error.message });
     original.message += ` Cleanup failed: ${error.message}`;
     return null;
@@ -3038,8 +3059,9 @@ function recognizeBulkWindow(modal) {
 }
 function waitFor(check, what, timeout = WAIT.timeout) {
   const waitStarted = Date.now();
-  recordRun({ type: 'waitBegin', name: windowName(what) || 'Schedule window' });
-  const finished = result => recordRun({ type: 'wait', name: windowName(what) || 'Schedule window', seconds: (Date.now() - waitStarted) / 1000, ceiling: timeout / 1000, result, ...(['the delete to finish', 'Add Assignment to save and close', 'Edit Assignments to save and close'].includes(what) ? { saveSeconds: (Date.now() - waitStarted) / 1000 } : {}) });
+  recordRun({ type: 'waitBegin', name: windowName(what) || 'Schedule window', waitName:diagnosticWaitName(what) });
+  const finished = (result, error) => recordRun({ type: 'wait', name: windowName(what) || 'Schedule window', waitName:diagnosticWaitName(what), seconds: (Date.now() - waitStarted) / 1000, ceiling: timeout / 1000, result,
+    ...(error ? {code:reasonCode(error.message),reasonName:error.reasonName || reasonName(error.message)} : {}), ...(['the delete to finish', 'Add Assignment to save and close', 'Edit Assignments to save and close'].includes(what) ? { saveSeconds: (Date.now() - waitStarted) / 1000 } : {}) });
   return new Promise((resolve, reject) => {
     const started = waitStarted;
     let noticed = false, scheduleStarted = null, identityPending = null;
@@ -3083,7 +3105,7 @@ function waitFor(check, what, timeout = WAIT.timeout) {
       setTimeout(tick, WAIT.step);
     };
     tick();
-  }).then(value => { finished('passed'); return value; }, error => { finished(error.late ? 'late' : error.timeout ? 'failed' : 'refused'); throw error; });
+  }).then(value => { finished('passed'); return value; }, error => { finished(error.late ? 'late' : error.timeout ? 'failed' : 'refused', error); throw error; });
 }
 const text = node => (node ? String(node.textContent || '').replace(/\s+/g, ' ').trim() : '');
 const sameText = (a, b) => valueKey(a) === valueKey(b);
@@ -3361,9 +3383,12 @@ __exports.readSite = readSite;
 'use strict';
 const { PageError, WAIT, chooseInSelect2, click, fieldByLabel, setChecked, settled, shown, text, typeInto, waitFor } = __require("./dom.js");
 const { usDate } = __require("../rules/dates.js");
+const { recordRun } = __require("../core/run-records.js");
 async function findTaxAssignments({ start, end, future, clients }) {
   const form = await waitFor(() => [...document.querySelectorAll('#FindMultipleEventsWeeklyForm_Form')].find(shown), 'the Tax weekly Find Assignments form', WAIT.window);
   const modal = await settled(form.closest('.modal'));
+  const labels = [...form.querySelectorAll('label')].map(text);
+  recordRun({ type: 'findBoxes', boxType: labels.includes('Start Week') ? 'Week' : labels.includes('Start Date') ? 'Date' : 'unknown' });
   const control = selector => {
     const nodes = [...form.querySelectorAll(selector)].filter(shown);
     if (nodes.length !== 1) throw new PageError('Tax Find Assignments has ambiguous week controls. Nothing was read or changed.');
@@ -4041,6 +4066,7 @@ async function openPeriods() {
   const input = select ? null : dialog.querySelector('input[type=number], input[type=text]');
   if (!select && !input) throw new PageError('The No. of Periods window has no list or box Snooze knows.');
   const current = String(select ? text(select.selectedOptions?.[0]) || select.value : input.value).trim();
+  if (/^\d+$/.test(current)) recordRun({ type: 'periods', count: Number(current) });
   return { dialog, select, input, current };
 }
 async function waitPeriodsClosed(dialog) {
@@ -4292,14 +4318,14 @@ function findDateBox(form, edge) {
   if (matches.length !== 1) throw new PageError(`The form has ${matches.length || 'no'} fields labelled "${labels[0]}" or "${labels[1]}".`);
   return fieldByLabel(form, text(matches[0]).replace(/[*?]/g, '').trim());
 }
-async function findAssignments({ start, end = null, future = false, clients = null }) {
+async function findAssignments({ start, end = null, future = false, clients = null, weekEndFriday = false }) {
   await guardReady();
   if (findContext?.document === document) await waitForPersonIdentity(findContext.identity);
   const identity = personIdentity();
   return withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), async () => {
     const tax = isTaxPage();
     const before = new Set(document.querySelectorAll('#FindAssignmentsModal'));
-    try { return await findAssignmentsRecorded({ start, end, future, clients }); }
+    try { return await findAssignmentsRecorded({ start, end, future, clients, weekEndFriday }); }
     catch (error) {
       if (!tax && !stopFlagged(error)) {
         for (const modal of [...document.querySelectorAll('#FindAssignmentsModal')].filter(node => !before.has(node) && shown(node))) {
@@ -4310,7 +4336,7 @@ async function findAssignments({ start, end = null, future = false, clients = nu
     }
   });
 }
-async function findAssignmentsRecorded({ start, end, future, clients }) {
+async function findAssignmentsRecorded({ start, end, future, clients, weekEndFriday }) {
   let stepStarted = Date.now();
   const measured = name => { recordRun({ type: 'findStep', name, seconds: (Date.now() - stepStarted) / 1000 }); stepStarted = Date.now(); };
   const { greyed, today } = await findRoute();
@@ -4328,6 +4354,9 @@ async function findAssignmentsRecorded({ start, end, future, clients }) {
   }
   const modal = await settled(await waitFor(() => [...document.querySelectorAll('#FindAssignmentsModal')].find(shown), 'the Find Assignments window', WAIT.window));
   const form = modal.querySelector('#FindMultipleEventsForm_Form') || modal;
+  const weekBoxes = [...form.querySelectorAll('label')].some(node => sameText(text(node).replace(/[*?]/g, ''), 'Start Week'));
+  recordRun({ type: 'findBoxes', boxType: weekBoxes ? 'Week' : 'Date' });
+  if (weekBoxes && weekEndFriday && end && compareDays(end, addDays(mondayOf(end), 4)) > 0) end = addDays(mondayOf(end), 4);
   measured('open');
   if (greyed) {
     const from = termDayOf(findDateBox(form, 'Start').value.trim());
@@ -4396,7 +4425,6 @@ async function findAssignmentsRecorded({ start, end, future, clients }) {
   await waitFor(() => !modal.isConnected || !shown(modal), 'Find Assignments to close');
   await editTableReady(edit);
   measured('table');
-  const weekBoxes = [...form.querySelectorAll('label')].some(node => sameText(text(node).replace(/[*?]/g, ''), 'Start Week'));
   assignmentRanges.set(edit, { start: from, end: future ? null : to, weekBoxes });
   return edit;
 }
@@ -4942,11 +4970,11 @@ __exports.proveDates = proveDates;
 'use strict';
 const { stageNotes, stageTaxHours, stageRemoval, sameAssignmentRows } = __require("./note-stage.js");
 const { isTaxPage } = __require("./site.js");
-const { timedRun } = __require("../core/run-records.js");
+const { timedRun, recordRun } = __require("../core/run-records.js");
 const { addDays, compareDays, sameDay, mondayOf, todayOf, readIsoDay, usDate } = __require("../rules/dates.js");
 const { valueKey } = __require("../rules/prepare.js");
 const { entryKind } = __require("../rules/entries.js");
-const { compareCopies, dayOf, ENTRY_FIELDS, scheduleWriteAttempt, knownAssignmentRows } = __require("./copy.js");
+const { compareCopies, copyWindow, coverAssignmentRange, retainAssignmentEvidence, dayOf, ENTRY_FIELDS, scheduleWriteAttempt, knownAssignmentRows } = __require("./copy.js");
 const { PageError, WAIT, guardReady, chooseInSelect2, click, closeWindow, fieldByLabel, keepFlags, cleanupAfter, modalTransitioning, pause, settled, shown, stopFlagged, text, typeInto, waitFor } = __require("./dom.js");
 const { proveDates, setDates, proveAllowedDates, proveDateSet, setDateSet } = __require("./dates-box.js");
 const { waitForDates, waitForDateSet } = __require("./dates-box.js");
@@ -5213,30 +5241,37 @@ async function deleteRange(query, before, { edit = null, read, onWrite = () => {
   const original = edit || await findAssignments(query);
   const range = findAssignmentsRange(original);
   try {
-    if (isTaxPage() || query.future || !query.end || !range?.weekBoxes || !read) throw new PageError('The week delete scope could not be proved. Nothing was deleted.');
+    if (isTaxPage() || query.future || !query.end || !range || !read) throw new PageError('The week delete scope could not be proved. Nothing was deleted.');
   } catch (error) { await cleanupAfter(error, () => closeEdit(original)); throw error; }
   const parts = splitDeleteWeeks(query);
   if (parts.length !== 1) await closeEdit(original);
   let current = before;
   for (const [index, part] of parts.entries()) {
     const partQuery = { ...query, start: part.start, end: part.end };
-    const findQuery = { ...partQuery, end: compareDays(part.end, addDays(mondayOf(part.end), 4)) > 0 ? addDays(mondayOf(part.end), 4) : part.end };
-    const table = parts.length === 1 && index === 0 ? original : await findAssignments(findQuery);
+    const findQuery = { ...partQuery, weekEndFriday: true };
+    let table = parts.length === 1 && index === 0 ? original : await findAssignments(findQuery);
+    const openedRange = findAssignmentsRange(table), covered = knownAssignmentRows(current).range;
+    if (openedRange?.weekBoxes && covered?.end && (compareDays(openedRange.start, covered.start) < 0 || compareDays(openedRange.end, covered.end) > 0)) {
+      await closeEdit(table);
+      await coverAssignmentRange(current, openedRange);
+      table = await findAssignments(findQuery);
+    }
     const known = knownAssignmentRows(current);
     let targets;
     try {
       const actualRange = findAssignmentsRange(table);
-      if (!actualRange?.weekBoxes || !known.range || compareDays(actualRange.start, known.range.start) < 0
+      if (!actualRange || !known.range || compareDays(actualRange.start, known.range.start) < 0
         || known.range.end && compareDays(actualRange.end, known.range.end) > 0) throw new PageError('The whole week is not covered by the checked schedule read. Nothing was deleted.');
+      if (!actualRange.weekBoxes && (compareDays(actualRange.start, part.start) !== 0 || compareDays(actualRange.end, part.end) !== 0)) throw new PageError('The exact delete dates changed. Nothing was deleted.');
       const actual = { days: (await readEditTable(table)).map(row => ({ ...row, day: dayOf(row.date) })) };
       const expected = { days: known.rows.filter(row => inside(row.day, actualRange) && clientMatches(row)) };
       if (actual.days.some(row => !row.day) || !sameAssignmentRows(expected, actual)) throw new PageError('The whole-week table changed since the checked read. Nothing was deleted.');
       targets = expected.days.filter(row => inside(row.day, part) && clientMatches(row));
       if (targets.some(row => protectedRows.some(old => old.id === row.id))) throw new PageError('A kept row is inside the delete range. Nothing was deleted.');
-      if (!part.partial && targets.length !== actual.days.length) throw new PageError('The whole-week table includes rows outside the delete range. Nothing was deleted.');
+      if ((!actualRange.weekBoxes || !part.partial) && targets.length !== actual.days.length) throw new PageError('The whole-week table includes rows outside the delete range. Nothing was deleted.');
       await validate({ days: actual.days.filter(row => inside(row.day, part)), window: { start: part.start, end: part.end } });
       if (targets.length) {
-        if (part.partial) await saveStagedNotes(await stageRemoval(table, expected, targets), onWrite);
+        if (actualRange.weekBoxes && part.partial) await saveStagedNotes(await stageRemoval(table, expected, targets), onWrite);
         else await deleteAll(table, { onWrite });
       } else await closeEdit(table);
     } catch (error) {
@@ -5246,7 +5281,14 @@ async function deleteRange(query, before, { edit = null, read, onWrite = () => {
     const after = await read();
     const ids = new Set(targets.map(row => row.id));
     const expected = { days: known.rows.filter(row => !ids.has(row.id)) };
+    const coverage = knownAssignmentRows(after).range;
+    if (known.range?.end && (!coverage || compareDays(coverage.start, known.range.start) > 0 || coverage.end && compareDays(coverage.end, known.range.end) < 0)) {
+      const checked = await copyWindow(known.range);
+      if (!sameAssignmentRows(expected, { days: knownAssignmentRows(checked).rows })) throw new PageError('The week delete could not be proved. Restore this person before continuing.');
+      retainAssignmentEvidence(after, checked);
+    }
     if (!sameAssignmentRows(expected, { days: knownAssignmentRows(after).rows })) throw new PageError('The week delete could not be proved. Restore this person before continuing.');
+    if (targets.length) recordRun({ type:'writeProof', ok:true });
     current = after;
   }
   return current;
@@ -5600,7 +5642,7 @@ __exports.stageNotes = stageNotes;
 },
 "mysource/copy.js": function (__require, __exports, document, window) {
 'use strict';
-const { timedRun } = __require("../core/run-records.js");
+const { timedRun, recordRun } = __require("../core/run-records.js");
 const { compareDays, localStamp, dayFromParts, usDate, nextWorkday, isWeekend } = __require("../rules/dates.js");
 const { valueKey } = __require("../rules/prepare.js");
 const { PageError, cleanupAfter } = __require("./dom.js");
@@ -5610,10 +5652,26 @@ let writeSequence = 0, lastWrite = null, pendingAddRead = null;
 const addReads = new WeakMap();
 const findCopies = new WeakMap();
 const knownAssignmentRows = copy => findCopies.get(copy) || { rows: copy.days, range: copy.window };
+function retainAssignmentEvidence(copy, checked) { findCopies.set(copy, knownAssignmentRows(checked)); }
+async function coverAssignmentRange(copy, range) {
+  const known = knownAssignmentRows(copy);
+  if (!known.range || !range?.end || !known.range.end
+    || compareDays(range.start, known.range.start) >= 0 && compareDays(range.end, known.range.end) <= 0) return copy;
+  const window = { start: compareDays(range.start, known.range.start) < 0 ? range.start : known.range.start,
+    end: compareDays(range.end, known.range.end) > 0 ? range.end : known.range.end };
+  const checked = await copyWindow(window), fresh = knownAssignmentRows(checked);
+  const overlap = fresh.rows.filter(row => compareDays(row.day, known.range.start) >= 0 && compareDays(row.day, known.range.end) <= 0);
+  if (!compareCopies({days:known.rows},{days:overlap}).same || overlap.length !== known.rows.length
+    || new Set(overlap.map(row=>row.id)).size !== overlap.length
+    || known.rows.some(old => !overlap.some(row => old.id === row.id && old.notes === row.notes && compareCopies({days:[old]},{days:[row]}).same))) throw new PageError('The whole-week table changed since the checked read. Nothing was deleted.');
+  retainAssignmentEvidence(copy, checked);
+  return copy;
+}
 function retireAddRead() { pendingAddRead?.stop(); pendingAddRead = null; }
 function scheduleWriteAttempt(kind) {
   retirePreflightForm();
   retireAddRead(); writeSequence++; lastWrite = { kind, document };
+  recordRun({ type: 'writeAttempt', action: kind });
 }
 function rememberAddRead(copy, identity, sequence) {
   if (sequence !== writeSequence || lastWrite?.kind !== 'add' || lastWrite.document !== document) return;
@@ -5755,6 +5813,8 @@ function compareCopiesRecorded(before, after) {
 function copyWindow(...args) { return timedRun("read", () => copyWindowRecorded(...args)); }
 function compareCopies(...args) { return timedRun("check", () => compareCopiesRecorded(...args)); }
 __exports.knownAssignmentRows = knownAssignmentRows;
+__exports.retainAssignmentEvidence = retainAssignmentEvidence;
+__exports.coverAssignmentRange = coverAssignmentRange;
 __exports.retireAddRead = retireAddRead;
 __exports.scheduleWriteAttempt = scheduleWriteAttempt;
 __exports.reuseVerifiedAddRead = reuseVerifiedAddRead;
@@ -5823,7 +5883,7 @@ const { compareByDay, RESTORE_FIELDS, pastReportWarning } = __require("../run/ba
 const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity, scheduleFacts, pageReady, proveFindReopenAfter } = __require("./schedule.js");
 const { createEditability } = __require("./editability.js");
 const { deleteAll, deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
-const { copyWindow, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows } = __require("./copy.js");
+const { copyWindow, coverAssignmentRange, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows } = __require("./copy.js");
 const { sameAssignmentRows } = __require("./note-stage.js");
 const { valueKey, noteTextKey } = __require("../rules/prepare.js");
 const compare = (backup, after) => {
@@ -5989,8 +6049,16 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
     let entry = null;
     try {
       onStep({ step: 'clearing', runs, ofRuns: planned.length });
-      const edit = await findAssignments(run.window);
-      const weekBoxes = findAssignmentsRange(edit)?.weekBoxes;
+      let edit = await findAssignments(run.window);
+      let weekBoxes = findAssignmentsRange(edit)?.weekBoxes;
+      const range = findAssignmentsRange(edit), covered = weekBefore && knownAssignmentRows(weekBefore).range;
+      if (weekBoxes && (!weekBefore || covered?.end && (compareDays(range.start, covered.start) < 0 || compareDays(range.end, covered.end) > 0))) {
+        await closeEdit(edit);
+        if (!weekBefore) weekBefore = await copyWindow(window);
+        await coverAssignmentRange(weekBefore, range);
+        edit = await findAssignments(run.window);
+        weekBoxes = findAssignmentsRange(edit)?.weekBoxes;
+      }
       let now;
       try {
         now = await readEditTable(edit);
@@ -6063,7 +6131,7 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
         throw new PageError('The page did not show the run as backed up.');
       }
       recordRun({ type: 'restoreComparison', purpose: 'completedRun', proof: proofIds.get(completedRun), ok: true });
-      if (weekBoxes) weekBefore = await copyWindow(window);
+      weekBefore = weekBoxes ? await copyWindow(window) : null;
       runs += 1;
     } catch (error) {
       const where = entry ? `${usDate(entry.start)} to ${usDate(entry.end)}, ${entry.client}`
@@ -7935,6 +8003,10 @@ function renderBatch(batch, work, box, draw) {
     const list = box.querySelector('.undo-list');
     if (list) list.scrollTop = undoScroll;
   } else {
+    for (const row of listedRows.filter(row => row.state === 'ready' && row.one.reportHint)) {
+      box.append(el('div', { class: 'person-row' }, el('div', { class: 'person-name' }, personName(row.one)),
+        el('div', { class: 'reason' }, row.one.reportHint)));
+    }
     if (batch.timeLimit?.line) box.append(el('div', { class: 'warn time-limit', role: 'status' }, batch.timeLimit.line));
     const name = el('input', { type: 'text', value: work.signOff || '', required: true, 'aria-label': 'Your name for mail sign-off' });
     box.append(el('label', { class: 'sign-off' }, 'Your name for mail sign-off', name));
@@ -8479,6 +8551,10 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
   const termText = String(scheduleFacts().termDate ?? slice.person?.termDate ?? record.person.termDate ?? '').trim();
   const term = termText ? termDayOf(termText) : null;
   if (termText && !term) return { stop: 'The Term Date cannot be read. Nothing was changed; By hand.', reasonCode: 'termDateUnreadable' };
+  const reportTerm = slice.person?.termDate ?? record.person.termDate;
+  if (reportTerm !== undefined && termText !== String(reportTerm ?? '').trim() && term && compareDays(term, plan.loaEnd) < 0) return {
+    stop: reasonLine({ code: 'termBeforeEnd', termDate: term, loaEnd: plan.loaEnd }), reasonCode: 'termBeforeEnd',
+  };
   const permissions = createEditability({ today, term, identity });
   const firstEditable = compareDays(window.start, today) < 0 ? today : window.start;
   const boundaries = [...new Map([window.end, firstEditable].map(day => [usDate(day), day])).values()];
@@ -8892,7 +8968,7 @@ async function removeExitEntries(query, matches, prepared, before, step, onWrite
     const edit = await findAssignments(query);
     if (!query.future && findAssignmentsRange(edit)?.weekBoxes) {
       if (auditRangeTouchesKept(prepared, query)) {
-        const error = new PageError('The Exit entries changed since the backup. Nothing was deleted.');
+        const error = new PageError('The Exit entries changed since the backup. Nothing was deleted.', { reasonName:'keptRowInRange' });
         await cleanupAfter(error, () => closeEdit(edit)); throw error;
       }
       return deleteRange(query, before, { edit, onWrite, protectedRows: prepared.dnsKept || [],
@@ -8910,7 +8986,7 @@ async function removeExitEntries(query, matches, prepared, before, step, onWrite
       rows = await readEditTable(edit);
       const actual = { days: rows.map(row => ({ ...row, day: dayOf(row.date) })) };
       const expected = { days: before.days.filter(matches) };
-      if (auditRangeTouchesKept(prepared, query) || prepared.dnsKept?.some(old => rows.some(row => row.id === old.id))) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.');
+      if (auditRangeTouchesKept(prepared, query) || prepared.dnsKept?.some(old => rows.some(row => row.id === old.id))) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.', { reasonName:'keptRowInRange' });
       if (actual.days.some(row => !row.day || !matches(row)) || !compareCopies(expected, actual).same) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.');
     } catch (error) { await cleanupAfter(error, () => closeEdit(edit)); throw error; }
     if (rows.length) await deleteAll(edit, { onWrite });
@@ -9021,6 +9097,7 @@ async function applyTax(one, prepared, { step = fn => fn(), onWrite = () => {} }
 }
 __exports.BACKUP_KIND = BACKUP_KIND;
 __exports.TERM_DATE_UNDO = TERM_DATE_UNDO;
+__exports.alreadyAdded = alreadyAdded;
 __exports.prepare = prepare;
 __exports.apply = apply;
 __exports.removeLeaveRun = removeLeaveRun;
@@ -9340,6 +9417,7 @@ __exports.mountRestorePanel = mountRestorePanel;
 },
 "run/live-test.js": function (__require, __exports, document, window) {
 'use strict';
+const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { NOTE_STAGE_EXITS, isNoteStageRefusal } = __require("../mysource/note-stage.js");
 const { LIVE_TEST_PARTS, testPart, TAX_LIVE_STEPS, taxLiveReport } = __require("./live-proof.js");
 const { runTaxLiveTest } = __require("./tax-live-test.js");
@@ -9347,7 +9425,7 @@ const { runAuditLiveTest, AUDIT_LIVE_STEPS, auditLiveReport } = __require("./aud
 const { GROUP_TITLES, GROUP_PROOFS, runLiveGroups } = __require("./live-groups.js");
 const { addDays, compareDays, readIsoDay, dayFromParts, todayOf, usDate } = __require("../rules/dates.js");
 const { addressCount } = __require("../rules/prepare.js");
-const { reasonCode, STAGES, WINDOWS, FIELDS } = __require("../core/run-records.js");
+const { reasonCode, recordRun, STAGES, WINDOWS, FIELDS } = __require("../core/run-records.js");
 const LIVE_TEST_PHASES = new Set(['compare', 'calendar', 'menu', 'form', 'Client', 'Billable', 'Utilization Generating', 'dates', 'Hours Per Day', 'Notes', 'Mode', 'prove', 'submit', 'save', 'read', 'clear', 'restore']);
 function liveRefusalReason(step) {
   return (step.state === 'notExercised' || step.notExercised || step.state === 'failed') && isNoteStageRefusal(step.reason) ? step.reason : null;
@@ -9424,15 +9502,16 @@ function liveTimingSummary(events) {
   const sum = rows => rows.every(row => row.seconds !== null) ? Math.round(rows.reduce((sum,row) => sum + row.seconds, 0) * 100) / 100 : null;
   return { waits, saves, waitSeconds: sum(waits), saveSeconds: sum(saves) };
 }
-async function runLiveTest({ email, week, length = 'year', through, version, today = todayOf(), onUpdate = () => {}, mode = 'consulting' }, page) {
-  if (mode === 'audit') return runAuditLiveTest({ email, version, today, onUpdate }, page);
-  if (mode === 'tax') return runTaxLiveTest({ email, version, today, onUpdate }, page);
+async function runLiveTest({ email, week, length = 'year', through, version, today = todayOf(), onUpdate = () => {}, mode = 'consulting', assignPeriod = 'unknown' }, page) {
+  if (mode === 'audit') return runAuditLiveTest({ email, version, today, onUpdate, assignPeriod }, page);
+  if (mode === 'tax') return runTaxLiveTest({ email, version, today, onUpdate, assignPeriod }, page);
   const runStarted = Date.now();
   const window = testPeriod(week, length, today, through);
   if (!String(email || '').trim()) throw new Error('Enter the professional email.');
   if (addressCount(email) > 1) throw new Error('Enter one professional email.');
   const result = { kind: 'Snooze live test 1', version, length, week: { start: usDate(window.start), end: usDate(window.end) },
     state: 'running', cleanup: 'notNeeded', steps: [], writes: 0, events: [], pictures: [], ledger: { attempts: [], partialProofs: [], observed: [], checkpoints: [], planned: [], outstanding: [], staged: 0, confirmedWrites: 0 } };
+  const diagnostic = beginLiveDiagnostics(result, page, assignPeriod);
   let known = null, uncertainWrite = false, current = null;
   const notify = () => onUpdate(result);
   const onWrite = () => { uncertainWrite = true; result.writes++;
@@ -9442,7 +9521,7 @@ async function runLiveTest({ email, week, length = 'year', through, version, tod
     const dates=new Map(); for (const row of copy.days) { const date=usDate(row.day); if (date) dates.set(date,(dates.get(date)||0)+1); }
     result.ledger.observed=[...dates].map(([date,rows])=>({date,rows}));
   };
-  const confirm = copy => { observe(copy); known = copy; uncertainWrite = false;
+  const confirm = copy => { recordRun({type:'writeProof',ok:true,whole:true}); observe(copy); known = copy; uncertainWrite = false;
     result.ledger.confirmedWrites=result.writes; result.ledger.staged=0; result.ledger.planned=[]; result.ledger.outstanding=copy.days.map(row=>({ date:usDate(row.day),rows:1 }));
       for(const attempt of result.ledger.attempts) attempt.result='confirmed';
   };
@@ -9545,17 +9624,18 @@ async function runLiveTest({ email, week, length = 'year', through, version, tod
     await runLiveGroups({ page, window, email: String(email).trim(), result, step, known: () => known, confirm, observe, write: onWrite, stage, proof });
     result.cleanup = 'empty'; result.state = 'complete';
   } catch (error) {
+    diagnostic.fail(error, current?.id); diagnostic.cleanup();
     result.state = 'failed'; result.code = error.identityChanged ? 'identityChanged' : error.session ? 'sessionExpired' : reasonCode(error.message);
     if (!result.writes) result.cleanup = 'notNeeded';
     if (result.writes) result.cleanup = 'unconfirmed';
     if (result.writes && !uncertainWrite && known && !error.identityChanged && !error.session && !error.pageBlocked) {
       try { await step('recovery', ()=>testPart('Cleanup unconfirmed.',clear)); result.cleanup = 'empty'; }
-      catch { result.cleanup = 'unconfirmed'; }
+      catch (cleanupError) { diagnostic.fail(cleanupError,'recovery'); result.cleanup = 'unconfirmed'; }
     }
   } finally {
     try { result.controls = page.observe(); } catch { result.observationUnavailable = true; }
     if (uncertainWrite) result.ledger.outstanding = [...new Set([...result.ledger.outstanding.map(row=>row.date),...result.ledger.planned,...result.ledger.observed.map(row=>row.date)])].map(date=>({date,rows:null}));
-    release?.();
+    release?.(); diagnostic.finish();
     result.timings = { seconds: Math.round((Date.now()-runStarted)/10)/100,
       blocks: Object.fromEntries(['A','B','C'].map(block => {
         const steps = result.steps.filter(step => step.id.startsWith(block.toLowerCase()) && /^.[A-Z]/.test(step.id));
@@ -9594,15 +9674,17 @@ __exports.liveTestReport = liveTestReport;
 },
 "run/tax-live-test.js": function (__require, __exports, document, window) {
 'use strict';
+const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { addressCount } = __require("../rules/prepare.js");
 const { todayOf } = __require("../rules/dates.js");
 const { TAX_LIVE_STEPS, TAX_LIVE_FINDINGS, taxTestPeriod } = __require("./live-proof.js");
-async function runTaxLiveTest({ email, version, today = todayOf(), onUpdate = () => {} }, page) {
+async function runTaxLiveTest({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
   const window = taxTestPeriod(today);
   if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
   const result = { kind: 'Snooze live test 1', mode: 'tax', version, length: 'month', design: 'tax8',
     week: { start: '04/03/2028', end: '04/28/2028' }, state: 'running', cleanup: 'notNeeded', writes: 0,
     steps: Object.keys(TAX_LIVE_STEPS).map(id => ({ id, state: 'notExercised', findings: [] })), events: [], pictures: [] };
+  const diagnostic = beginLiveDiagnostics(result, page, assignPeriod, today);
   const write = () => { result.writes++; };
   const actions = [
     () => page.taxStart(String(email).trim(), window),
@@ -9616,16 +9698,16 @@ async function runTaxLiveTest({ email, version, today = todayOf(), onUpdate = ()
         const value = await actions[index]();
         step.state = value?.notExercised ? 'notExercised' : 'passed';
         step.findings = (value?.findings || []).filter(word => TAX_LIVE_FINDINGS.has(word));
-      } catch (error) { step.state = 'failed'; throw error; }
+      } catch (error) { diagnostic.fail(error, step.id); step.state = 'failed'; throw error; }
       onUpdate(result);
     }
     result.state = 'complete'; result.cleanup = 'empty';
   } catch (error) {
-    result.state = 'failed';
+    result.state = 'failed'; diagnostic.cleanup();
     try { result.cleanup = await page.taxCleanup(write, error); }
-    catch { result.cleanup = 'unconfirmed'; }
+    catch (cleanupError) { diagnostic.fail(cleanupError,'recovery'); result.cleanup = 'unconfirmed'; }
   } finally {
-    page.taxFinish?.(); onUpdate(result);
+    page.taxFinish?.(); diagnostic.finish(); onUpdate(result);
   }
   return result;
 }
@@ -9633,6 +9715,7 @@ __exports.runTaxLiveTest = runTaxLiveTest;
 },
 "run/audit-live-test.js": function (__require, __exports, document, window) {
 'use strict';
+const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { addressCount } = __require("../rules/prepare.js");
 const { compareDays, todayOf, usDate } = __require("../rules/dates.js");
 const AUDIT_LIVE_STEPS = {
@@ -9649,12 +9732,13 @@ function auditTestPeriod(today = todayOf()) {
   if (compareDays(window.start, today) <= 0) throw new Error('The A&A test period must still be in the future.');
   return window;
 }
-async function runAuditLiveTest({ email, version, today = todayOf(), onUpdate = () => {} }, page) {
+async function runAuditLiveTest({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
   const window = auditTestPeriod(today);
   if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
   const result = { kind: 'Snooze live test 1', mode: 'audit', version, design: 'audit7', length: 'twoWeeks',
     week: { start: usDate(window.start), end: usDate(window.end) }, state: 'running', cleanup: 'notNeeded', writes: 0,
     steps: Object.keys(AUDIT_LIVE_STEPS).map(id => ({ id, state: 'notExercised' })), events: [], pictures: [], outstanding: [] };
+  const diagnostic = beginLiveDiagnostics(result, page, assignPeriod);
   const write = () => { result.writes++; };
   const actions = [
     async () => { await page.auditStart(String(email).trim(), window); return page.auditSetup(write); },
@@ -9668,16 +9752,17 @@ async function runAuditLiveTest({ email, version, today = todayOf(), onUpdate = 
     for (let index = 0; index < actions.length; index++) {
       const step = result.steps[index]; step.state = 'running'; page.setStep?.(step.id); onUpdate(result);
       try { Object.assign(step, await actions[index]()); step.state = 'passed'; }
-      catch (error) { step.state = 'failed'; throw error; }
+      catch (error) { diagnostic.fail(error, step.id); step.state = 'failed'; throw error; }
       finally { page.finishStep?.(); onUpdate(result); }
     }
     result.state = 'complete'; result.cleanup = 'empty';
   } catch (error) {
-    result.state = 'failed';
+    if (!result.diagnostic.stop) diagnostic.fail(error, result.steps.find(s=>s.state==='running')?.id || result.steps[0].id);
+    result.state = 'failed'; diagnostic.cleanup();
     try { result.cleanup = await page.auditCleanup(write, error); }
-    catch { result.cleanup = 'unconfirmed'; }
+    catch (cleanupError) { diagnostic.fail(cleanupError,'recovery'); result.cleanup = 'unconfirmed'; }
   } finally {
-    result.outstanding = page.auditOutstanding(result.cleanup); release?.(); onUpdate(result);
+    result.outstanding = page.auditOutstanding(result.cleanup); release?.(); diagnostic.finish(); onUpdate(result);
   }
   return result;
 }
@@ -10009,7 +10094,7 @@ const { stageNotes } = __require("./note-stage.js");
 const { createLiveGroups } = __require("./live-groups.js");
 const { createLivePictures } = __require("./live-pictures.js");
 const { PageError, setBatchGuard, shown, click, settled, text, waitFor, WAIT } = __require("./dom.js");
-const { openPerson, personIdentity, checkPersonIdentity, requireSchedulePage, scheduleFacts, findAssignments, findAssignmentsRange, readEditTable, closeEdit, setupView } = __require("./schedule.js");
+const { calendarView, openPerson, personIdentity, checkPersonIdentity, requireSchedulePage, scheduleFacts, findAssignments, findAssignmentsRange, readEditTable, closeEdit, setupView } = __require("./schedule.js");
 const { sessionExpired, cancelBatchWindows } = __require("./batch.js");
 const { copyWindow, compareCopies, dayOf, entriesToAdd, knownAssignmentRows } = __require("./copy.js");
 const { createEditability } = __require("./editability.js");
@@ -10032,6 +10117,26 @@ const { readNotification } = __require("../servicenow/tickets.js");
 const { capturePerson } = __require("../files/batch-outputs.js");
 const { lastPicture } = __require("../files/capture.js");
 const inside = (day, window) => day && compareDays(day, window.start) >= 0 && compareDays(day, window.end) <= 0;
+function liveDiagnosticState() {
+  const kinds = ['Find Assignments','Edit Assignment','Bulk Edit Assignments','Add Assignment','No. of Periods','Go to Date','View Notes'];
+  let view = 'unknown';
+  try {
+    const node = calendarView();
+    view = node?.matches('.fc-weeklyTimeline-view') ? 'Custom' : node?.matches('.fc-month-view') ? 'Month' : 'unknown';
+  } catch {   }
+  const windows = [...document.querySelectorAll('.modal, [role=dialog]')].map(node => {
+    const title = text(node.querySelector('.modal-title, .bootbox-title, h4, [role=heading]'));
+    return { kind:node.matches('.bootbox-confirm') ? 'Delete confirmation' : kinds.includes(title) ? title : 'Schedule window', visible:shown(node) };
+  });
+  const periodWindows = [...document.querySelectorAll('.modal, [role=dialog]')].filter(node => text(node.querySelector('.modal-title, h4')) === 'No. of Periods' && shown(node));
+  let periods = null;
+  if (periodWindows.length === 1) {
+    const control = periodWindows[0].querySelector('select, input[type=number], input[type=text]');
+    const raw = control?.tagName === 'SELECT' ? text(control.selectedOptions?.[0]) || control.value : control?.value;
+    if (/^\d+$/.test(raw || '')) periods = Number(raw);
+  }
+  return { view, periods, windows, covers:[...document.querySelectorAll('div.loading, .blockUI.blockOverlay, .loading-overlay, .modal-backdrop')].filter(shown) };
+}
 function liveControlState() {
   const events = node => {
     try {
@@ -10041,7 +10146,9 @@ function liveControlState() {
   };
   const windows = [['.bootbox-confirm', 'Delete confirmation'], ['#editEventGridModal', 'Edit Assignment'],
     ['#FindAssignmentsModal', 'Find Assignments'], ['#addShiftEventModal', 'Add Assignment']];
-  return { calendar: calendarDates(), windows: windows.flatMap(([selector, kind]) => [...document.querySelectorAll(selector)].map(modal => ({
+  const active = [...document.querySelectorAll('button.fc-state-active, button.active, button[aria-pressed=true]')].filter(shown);
+  const view = ['Custom','Month','Week','Time'].find(word => active.some(node => text(node) === word)) || 'unknown';
+  return { view, calendar: calendarDates(), windows: windows.flatMap(([selector, kind]) => [...document.querySelectorAll(selector)].map(modal => ({
     kind, visible: shown(modal), fading: modal.classList.contains('fade'), showing: modal.classList.contains('show'),
     handlers: events(modal), rows: modal.querySelectorAll('td.column-start').length,
     buttons: [...modal.querySelectorAll('button')].map(button => {
@@ -10100,6 +10207,7 @@ function liveTestPage({ today = todayOf(), mode = 'consulting' } = {}) {
   const diagnosticPictures = createLivePictures(context);
   return {
     ...createLiveGroups(context),
+    diagnosticState: liveDiagnosticState,
     observe: liveControlState,
     finishStep: finishSave,
     setStep(id) { owningStep = id; },
@@ -10261,6 +10369,7 @@ function taxLivePage(today) {
   const resolve = async (mustBeAfter = false) => {
     const actual = await read();
     if (!pending ? !matches(known, actual) : !matches(pending.after, actual) && (mustBeAfter || !matches(pending.before, actual))) throw new PageError('Tax live save ownership is unconfirmed.');
+    if (pending && matches(pending.after, actual)) recordRun({type:'writeProof',ok:true,whole:true});
     known = actual; pending = null; return actual;
   };
   const sequence = async (states, action, onWrite) => {
@@ -10338,9 +10447,12 @@ function taxLivePage(today) {
       onWrite: async () => { pastAllowed(); await write(); } });
     const actual = await pastRead();
     if (!matches(after, actual)) throw new PageError('Tax Monday hours are unconfirmed.');
+    recordRun({type:'writeProof',ok:true});
     pastPending = null; return actual;
   };
   return {
+    diagnosticState: liveDiagnosticState,
+    observe: liveControlState,
     async taxStart(typedEmail, window) {
       if (scope || !String(typedEmail || '').trim() || addressCount(typedEmail) > 1) throw new PageError('Enter one test professional.');
       if (readSite() !== 'tax') throw new PageError('Tax live test requires Tax MySource.');
@@ -10482,6 +10594,7 @@ function auditLivePage(today) {
   const resolve = async (mustBeAfter = false) => {
     const actual = await read();
     if (!pending ? !matches(known, actual) : !matches(pending.after, actual) && (mustBeAfter || !matches(pending.before, actual))) throw new PageError('A&A save ownership is unconfirmed.');
+    if (pending && matches(pending.after, actual)) recordRun({type:'writeProof',ok:true,whole:true});
     known = actual; pending = null; return actual;
   };
   const withReopen = async action => {
@@ -10491,24 +10604,36 @@ function auditLivePage(today) {
   };
   const addOp = entry => ({ range: entry, after: before => [...before, ...entryRows(entry)] });
   const deleteOp = (range, client = null) => ({ kind: 'delete', range, client,
-    staged: !!knownAssignmentRows(known).range?.weekBoxes && splitDeleteWeeks(range).some(part => part.partial),
     after: before => before.filter(row => !inside(row.day, range) || client && valueKey(row.client) !== valueKey(client)) });
   const sequence = async (operations, action, write) => {
     await assertKnown(); let index = 0;
     const notice = async () => {
-      const operation = operations[index++];
+      const operation = operations[index];
       if (!operation) throw new PageError('Unplanned A&A test write.');
       bounded(operation.range);
       if (pending) { known = pending.after; pending = null; }
-      pending = { before: known, after: { days: operation.after(known.days) } };
+      let deleteRange = operation.range, staged = false, editRange = null;
+      if (operation.kind === 'delete') {
+        const edits = [...document.querySelectorAll('#editEventGridModal')].filter(shown);
+        if (edits.length !== 1) throw new PageError('The A&A delete table is not unique.');
+        editRange = findAssignmentsRange(edits[0]) || operation.range;
+        if (!editRange.start || !editRange.end) throw new PageError('The A&A delete range could not be proved.');
+        deleteRange = { start:compareDays(editRange.start,operation.range.start)>0 ? editRange.start : operation.range.start,
+          end:compareDays(editRange.end,operation.range.end)<0 ? editRange.end : operation.range.end };
+        bounded(deleteRange);
+        staged = !!editRange.weekBoxes && ![...document.querySelectorAll('.bootbox-confirm')].some(shown);
+      }
+      const deletes = row => inside(row.day,deleteRange) && (!operation.client || valueKey(row.client)===valueKey(operation.client));
+      pending = { before: known, after: { days: operation.kind === 'delete' ? known.days.filter(row=>!deletes(row)) : operation.after(known.days) } };
+      if (operation.kind !== 'delete' || !pending.after.days.some(row=>inside(row.day,operation.range) && (!operation.client || valueKey(row.client)===valueKey(operation.client)))) index++;
       const proveDelete = async () => {
         if (operation.kind !== 'delete') return;
         const edits = [...document.querySelectorAll('#editEventGridModal')].filter(shown);
         if (edits.length !== 1) throw new PageError('The A&A delete table is not unique.');
         const actual = { days: (await readEditTable(edits[0])).map(row => ({ ...row, day: dayOf(row.date) })) };
-        const queried = operation.staged ? findAssignmentsRange(edits[0]) : operation.range;
+        const queried = staged ? editRange : deleteRange;
         if (!queried?.start || !queried.end) throw new PageError('The A&A delete range could not be proved.');
-        const expected = { days: (operation.staged ? pending.after : pending.before).days.filter(row => inside(row.day, queried) && (!operation.client || valueKey(row.client) === valueKey(operation.client))) };
+        const expected = { days: (staged ? pending.after : pending.before).days.filter(row => inside(row.day, queried) && (!operation.client || valueKey(row.client) === valueKey(operation.client))) };
         if (!matches(expected, actual)) throw new PageError('The owned A&A delete rows changed before Yes.');
       };
       await proveDelete();
@@ -10542,6 +10667,8 @@ function auditLivePage(today) {
     if (row.length !== 1 || !matches({ days: [kept] }, { days: row })) throw new PageError('Wednesday DNS changed.');
   };
   return {
+    diagnosticState: liveDiagnosticState,
+    observe: liveControlState,
     begin(events) {
       release = setBatchGuard(check);
       const stop = setRunRecorder(event => {
@@ -10622,8 +10749,7 @@ function auditLivePage(today) {
       await assertKnown(); checkKept(known);
       const operations = [];
       for (const range of [first, { start: second.start, end: scope.end }]) {
-        const parts = knownAssignmentRows(known).range?.weekBoxes ? splitDeleteWeeks(range) : [range];
-        operations.push(...parts.map(part => deleteOp(part)));
+        operations.push(deleteOp(range));
         const entries = entriesToAdd({ days: prepared.backup.days.filter(row => inside(row.day, range)) }, { exact: true }).entries;
         operations.push(...entries.map(addOp));
       }
@@ -10653,6 +10779,7 @@ function auditLivePage(today) {
     },
   };
 }
+__exports.liveDiagnosticState = liveDiagnosticState;
 __exports.liveControlState = liveControlState;
 __exports.liveTestPage = liveTestPage;
 },
@@ -11344,6 +11471,8 @@ __exports.runReportScreenButton = runReportScreenButton;
 },
 "screen/live-test-panel.js": function (__require, __exports, document, window) {
 'use strict';
+const { shortLiveReport, liveEventLog } = __require("../run/live-diagnostics.js");
+const { reportAssignPeriod } = __require("../files/report.js");
 const { el, saveFile } = __require("./ui.js");
 const { newBatchPopup } = __require("./batch-panel.js");
 const { batchCover } = __require("../mysource/batch.js");
@@ -11383,9 +11512,12 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     else leave();
   } }, 'Back');
   async function download() {
-    const saving = save('Snooze live test 2028.txt', liveTestReport(result), 'text/plain');
-    if (saving && typeof saving.then === 'function') await saving;
-    if (work.liveTest) work.liveTest.saved = true;
+    const live = work.liveTest;
+    const saving = save('Snooze live test 2028.txt', shortLiveReport(result), 'text/plain');
+    if (!saving?.then && live) live.saved = true;
+    await saving;
+    if (work.liveTest === live && live) live.saved = true;
+    await save('Snooze live test 2028 log.txt', liveEventLog(result), 'text/plain');
   }
   async function start(part = mode) {
     if (active || work.busy || result) return;
@@ -11398,7 +11530,7 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     const release = batchCover(work.host, work.host);
     let timer;
     try {
-      result = await run({ email: email.value.trim(), ...(mode === 'tax' ? { mode: 'tax', length: 'month' } : mode === 'audit' ? { mode: 'audit' } : { length: 'year', through: '2028-10-11' }), version: work.version, extended: true, onUpdate: value => {
+      result = await run({ email: email.value.trim(), ...(mode === 'tax' ? { mode: 'tax', length: 'month' } : mode === 'audit' ? { mode: 'audit' } : { length: 'year', through: '2028-10-11' }), version: work.version, assignPeriod: reportAssignPeriod(work.staffReport, email.value.trim()), extended: true, onUpdate: value => {
         result = value; slow = false; clearTimeout(timer);
         work.liveTest.changed ||= value.writes > 0;
         if (value.steps.at(-1)?.state === 'running') timer = setTimeout(() => { slow = true; draw(); }, 15000);
@@ -11482,16 +11614,21 @@ __exports.reportDifferenceSummary = reportDifferenceSummary;
 "core/run-records.js": function (__require, __exports, document, window) {
 'use strict';
 let recorder = null;
+const observers = new Set();
+function observeRun(receive) { observers.add(receive); return () => observers.delete(receive); }
 function setRunRecorder(receive) {
   const previous = recorder;
   recorder = receive;
   return () => { recorder = previous; };
 }
-function recordRun(event) { recorder?.(event); }
+function recordRun(event) {
+  recorder?.(event);
+  for (const receive of observers) { try { receive(event); } catch {   } }
+}
 function timedRun(stage, fn) {
-  if (!recorder) return fn();
+  if (!recorder && !observers.size) return fn();
   const started = Date.now();
-  const receive = recorder;
+  const receive = recordRun;
   const failed = error => { if (error && typeof error === 'object') error.stage ??= stage; finish(false); throw error; };
   receive?.({ type: 'begin', stage });
   const finish = ok => receive?.({ type: 'step', stage, seconds: (Date.now() - started) / 1000, ok });
@@ -11539,6 +11676,14 @@ function windowName(what) {
   const names = [['Find Assignments', /Find Assignments/], ['Edit Assignment', /Edit Assignment/], ['Add Assignment', /Add Assignment/], ['confirmation window', /Are you sure/], ['No. of Periods', /No\. of Periods/], ['go-to-date', /go-to-date/], ['right-click menu', /right-click menu/], ['View Notes', /View Notes/], ['window search boxes', /window's search boxes/], ['professional search', /professional search|Search for a Professional/]];
   return names.find(([, pattern]) => pattern.test(text))?.[0] || null;
 }
+const WAIT_NAMES = new Set(['deleteSave','addSave','editSave','findClose','rowRemoval','periodsClose', ...WINDOWS]);
+function diagnosticWaitName(what) {
+  const exact = { 'the delete to finish':'deleteSave', 'Add Assignment to save and close':'addSave',
+    'Edit Assignments to save and close':'editSave', 'Find Assignments to close':'findClose',
+    'the staged row removal':'rowRemoval', 'the No. of Periods window to close':'periodsClose' };
+  return exact[what] || windowName(what) || 'Schedule window';
+}
+__exports.observeRun = observeRun;
 __exports.setRunRecorder = setRunRecorder;
 __exports.recordRun = recordRun;
 __exports.timedRun = timedRun;
@@ -11552,6 +11697,202 @@ __exports.PAGE_SELECTORS = PAGE_SELECTORS;
 __exports.FIELDS = FIELDS;
 __exports.reasonCode = reasonCode;
 __exports.windowName = windowName;
+__exports.WAIT_NAMES = WAIT_NAMES;
+__exports.diagnosticWaitName = diagnosticWaitName;
+},
+"core/reason-names.js": function (__require, __exports, document, window) {
+'use strict';
+const reasons = [
+  ['weekNotCovered', /whole week is not covered|week delete scope/],
+  ['keptRowInRange', /kept row is inside/],
+  ['ownedDeleteTableChanged', /owned .*delete rows changed/],
+  ['tableChanged', /table changed|table differs|Exit entries changed|LOA .*changed since the backup/],
+  ['rowOutsideRange', /outside the (?:delete|restore|window)|whole-week table includes rows outside/],
+  ['trashMissing', /row trash button/],
+  ['rowDidNotLeave', /staged row removal|prepared LOA row removal/],
+  ['submitRefused', /save and close|refused it|Submit button|enabled Submit/],
+  ['periodsWindowStuck', /No\. of Periods.*(?:close|finish)|(?:close|finish).*No\. of Periods/],
+  ['periodsUnreadable', /No\. of Periods/],
+  ['findTableSlow', /Edit Assignment table.*(?:within|loading)|Find Assignments.*within/],
+  ['findDatesChanged', /Find Assignments did not keep the dates/],
+  ['findFiltersChanged', /Find Assignments did not keep the requested|Pricing ID is not a readable filter/],
+  ['findAnchorMissing', /Find Assignments has no proved|Find Assignments did not prove its current-week/],
+  ['findFieldsMissing', /fields labelled .*Start (?:Date|Week)|fields labelled .*End (?:Date|Week)/],
+  ['findDatesChanged', /exact delete dates changed/],
+  ['tableClosed', /Edit Assignment window closed before/],
+  ['tablePaged', /table has more than one page/],
+  ['tableMissing', /grid is missing|grid has no proved rows/],
+  ['tableIncomplete', /table shows .* of its .*rows/],
+  ['rowCellMissing', /Row .* has no .* cell/],
+  ['rowUnreadable', /Row .*could not be read|row's date .*could not be read/],
+  ['rowPersonChanged', /Row .*different or empty Professional/],
+  ['rowCountUnreadable', /table row count could not be read/],
+  ['confirmationAlreadyOpen', /Another confirmation window/],
+  ['confirmationAmbiguous', /More than one confirmation window/],
+  ['confirmationChanged', /confirmation windows changed/],
+  ['confirmationWrong', /confirmation does not ask to delete/],
+  ['confirmationYesMissing', /confirmation does not have one visible Yes/],
+  ['deleteDidNotFinish', /delete to finish/],
+  ['deleteMenuMissing', /Delete All in Bulk Actions|No "Bulk Actions" button/],
+  ['deleteUnproved', /delete could not be proved|still showed entries after the delete/],
+  ['identityChanged', /shown person changed|schedule changed since|person.*settle/],
+  ['termDateUnreadable', /Term Date.*(?:cannot|could not|unreadable)|Unreadable Term Date/],
+  ['sessionExpired', /session expired/i],
+  ['testOwnershipChanged', /owned .*changed|ownership is unconfirmed|test schedule changed|delete table is not unique|delete range could not be proved/],
+  ['windowStuck', /to close|would not close|to finish|stage and close/],
+  ['pageCovered', /loading cover|blocked|covered/],
+  ['calendarAmbiguous', /more than one.*(?:calendar|view)|calendar.*more than one|header calendar copy/],
+  ['menuMissing', /No right-click menu|right-click menu has no/],
+  ['menuDisabled', /greyed out in the right-click menu/],
+  ['checkboxUnchanged', /checkbox did not change/],
+  ['fieldMissing', /field.*labelled|No .*button|no .*box|not found|missing/i],
+  ['proofFailed', /could not be proved|not been proved|unconfirmed|not proved/],
+  ['waitExpired', /within \d+ seconds/],
+];
+const REASON_NAMES = new Set([...reasons.map(([name]) => name), 'pageShapeUnreadable', 'unknownFailure', 'assignPeriodMismatch', 'boxTypeChanged']);
+function reasonName(message) {
+  return reasons.find(([, pattern]) => pattern.test(String(message || '')))?.[0] || 'pageShapeUnreadable';
+}
+function errorReason(error) {
+  if (error?.identityChanged) return 'identityChanged';
+  if (error?.session) return 'sessionExpired';
+  return REASON_NAMES.has(error?.reasonName) ? error.reasonName : reasonName(error?.message);
+}
+__exports.REASON_NAMES = REASON_NAMES;
+__exports.reasonName = reasonName;
+__exports.errorReason = errorReason;
+},
+"run/live-diagnostics.js": function (__require, __exports, document, window) {
+'use strict';
+const { observeRun, recordRun, STAGES, WINDOWS, FIELDS, WAIT_NAMES, REASON_CODES, reasonCode } = __require("../core/run-records.js");
+const { REASON_NAMES, errorReason } = __require("../core/reason-names.js");
+const { dayFromParts, mondayOf, weekday, usDate } = __require("../rules/dates.js");
+const steps = new Set('aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
+const word = (value, allowed, fallback = 'unknown') => allowed.has(value) ? value : fallback;
+const count = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+const stages = new Set([...STAGES, 'move calendar']);
+const types = new Set('begin step error miss window field loading waiting slow wait waitBegin delay restoreRead restoreComparison diagnosticRead findStep findBoxes writeAttempt writeProof assignPeriod crossCheck stop cleanup finish periods identity schedulePage visibility dialog personLoaded searchStart'.split(' '));
+const results = new Set(['passed','failed','refused','late','unconfirmed','running']);
+const actions = new Set(['delete','add','submit']);
+const waitNames = new Set([...WAIT_NAMES,...FIELDS,'open','filters','settle','submit','table']);
+const windowKinds = new Set([...WINDOWS,'Go to Date','Delete confirmation']);
+const views = new Set(['Custom','Month','Week','Time']);
+const boxTypes = new Set(['Date','Week']);
+const periods = new Set(['Weekly','Time','unknown']);
+const stepName = value => steps.has(value) ? value : 'unknown';
+const version = value => /^\d+\.\d+\.\d+$/.test(value) ? value : 'unknown';
+const date = (value, span) => typeof value === 'string' && /^\d{2}\/\d{2}\/2028$/.test(value)
+  && (!span || value.slice(6)+value.slice(0,2)+value.slice(3,5) >= span.start.slice(6)+span.start.slice(0,2)+span.start.slice(3,5)
+    && value.slice(6)+value.slice(0,2)+value.slice(3,5) <= span.end.slice(6)+span.end.slice(0,2)+span.end.slice(3,5)) ? value : null;
+const mondayDate = value => {
+  const parts = typeof value === 'string' && value.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  const day = parts && dayFromParts(Number(parts[3]), Number(parts[1]), Number(parts[2]));
+  return day && weekday(day) === 1 ? value : null;
+};
+function pageState(controls, seenPeriods) {
+  return { view: word(controls?.view, views),
+    periods: Number.isSafeInteger(controls?.periods) ? controls.periods : seenPeriods,
+    windows: { open: (controls?.windows || []).filter(w => w.visible === true).length,
+      hidden: (controls?.windows || []).filter(w => w.visible === false).length },
+    windowKinds: (controls?.windows || []).map(w => ({ kind: word(w.kind, windowKinds), visible: w.visible === true })),
+    covers: count(controls?.covers?.length) };
+}
+function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
+  const data = result.diagnostic = { assignPeriod: word(assignPeriod, periods), events: [], stop: null };
+  const runDay = result.mode === 'tax' && dayFromParts(today?.y, today?.m, today?.d);
+  if (runDay) data.taxMonday = usDate(mondayOf(runDay));
+  let stage = 'unknown', seenPeriods = null, boxType = 'unknown', lastAction = 'unknown', forcedStep = null, writes = 0;
+  const snapshot = () => { try { return pageState(page.diagnosticState?.() || page.observe?.(), seenPeriods); } catch { return { unavailable:true }; } };
+  const pending = [];
+  const receive = event => {
+    if (stages.has(event.stage)) { stage = event.stage; if (event.type === 'begin') lastAction = stage; }
+    if (event.type === 'periods' && Number.isSafeInteger(event.count)) seenPeriods = event.count;
+    if (event.type === 'findBoxes') boxType = word(event.boxType, boxTypes);
+    const safe = { time: Date.now(), step: stepName(event.step || forcedStep || result.steps.find(s => s.state === 'running')?.id || result.steps.at(-1)?.id),
+      type: word(event.type, types, 'observation'), stage, wait: WAIT_NAMES.has(event.waitName) ? event.waitName : word(event.name, waitNames),
+      seconds: Number.isFinite(event.seconds) && event.seconds >= 0 ? event.seconds : null,
+      result: word(event.result, results, typeof event.ok === 'boolean' ? event.ok ? 'passed' : 'failed' : 'unconfirmed'),
+      code: word(event.code, REASON_CODES, 'none'), reasonName: word(event.reasonName, REASON_NAMES, 'none'), boxType,
+      assignPeriod: data.assignPeriod };
+    if (event.type === 'error') { safe.page = snapshot(); safe.lastAction = lastAction; event.liveStop = {step:safe.step,stage,lastAction,page:safe.page}; }
+    for (const key of ['rows','selected','count']) if (Number.isSafeInteger(event[key]) && event[key] >= 0) safe[key] = event[key];
+    if (event.type === 'writeAttempt') {
+      lastAction = word(event.action, actions); safe.action = lastAction; safe.write = ++writes;
+      safe.proof = 'unconfirmed'; pending.push(safe);
+    }
+    if (event.type === 'writeProof' && event.ok === true || event.type === 'restoreComparison' && event.ok === true) {
+      const proved = event.whole === true ? pending.splice(0) : pending.splice(-1);
+      safe.writes = proved.map(e => e.write);
+      for (const attempt of proved) attempt.proof = 'passed';
+    }
+    data.events.push(safe);
+    if (event.type === 'findBoxes' && (data.assignPeriod === 'Weekly' && boxType === 'Date' || data.assignPeriod === 'Time' && boxType === 'Week')) {
+      data.events.push({ ...safe, type:'crossCheck', result:'passed', code:'none', reasonName:'assignPeriodMismatch' });
+    }
+  };
+  let observing = false;
+  const release = observeRun(event => {
+    if (observing) return;
+    observing = true;
+    try { receive(event); } finally { observing = false; }
+  });
+  recordRun({ type:'assignPeriod' });
+  return {
+    fail(error, step) {
+      pending.length = 0;
+      const failure = { step: stepName(step), code: error?.identityChanged ? 'identityChanged' : error?.session ? 'sessionExpired' : word(error?.reasonCode, REASON_CODES, reasonCode(error?.message)), reasonName:errorReason(error) };
+      const source = error?.liveStop || data.events.findLast(e => e.type === 'error' && e.reasonName === failure.reasonName && e.step === failure.step);
+      const stopped = { ...failure, lastAction:source?.lastAction || lastAction, stage: source?.stage || word(error?.stage, stages, stage), page: source?.page || snapshot() };
+      data.stop ||= stopped;
+      Object.assign(result.steps.find(s => s.id === step) || {}, { code:failure.code, reasonName:failure.reasonName });
+      recordRun({ type:'stop', ...failure, result:'failed' });
+    },
+    cleanup() { pending.length = 0; forcedStep = 'recovery'; recordRun({type:'cleanup'}); },
+    finish() { data.finish = snapshot(); recordRun({type:'finish', result:result.state === 'complete' ? 'passed' : 'failed'}); release(); },
+  };
+}
+function cleanPage(page) {
+  if (!page) return null;
+  if (page.unavailable === true) return {unavailable:true};
+  return {view:word(page.view,views),periods:Number.isSafeInteger(page.periods) && page.periods>=0 ? page.periods : null,
+    windows:{open:count(page.windows?.open),hidden:count(page.windows?.hidden)},covers:count(page.covers),
+    windowKinds:(page.windowKinds || []).map(w=>({kind:word(w.kind,windowKinds),visible:w.visible===true}))};
+}
+function cleanEvent(event) {
+  const safe = {time:Number.isFinite(event.time) && event.time>=0 ? event.time : null,step:stepName(event.step),type:word(event.type,types,'observation'),
+    stage:word(event.stage,stages),wait:word(event.wait,waitNames),seconds:Number.isFinite(event.seconds) && event.seconds>=0 ? event.seconds : null,
+    result:word(event.result,results,'unconfirmed'),code:word(event.code,REASON_CODES,'none'),reasonName:word(event.reasonName,REASON_NAMES,'none'),
+    boxType:word(event.boxType,boxTypes),assignPeriod:word(event.assignPeriod,periods)};
+  if (event.page) safe.page=cleanPage(event.page);
+  if (actions.has(event.action)) safe.action=event.action;
+  if (actions.has(event.lastAction) || stages.has(event.lastAction)) safe.lastAction=event.lastAction;
+  for (const key of ['rows','selected','count','write']) if (Number.isSafeInteger(event[key]) && event[key]>=0) safe[key]=event[key];
+  if (Array.isArray(event.writes)) safe.writes=event.writes.filter(n=>Number.isSafeInteger(n) && n>0);
+  if (['passed','failed','unconfirmed'].includes(event.proof)) safe.proof=event.proof;
+  return safe;
+}
+function shortLiveReport(result) {
+  const data = result.diagnostic || {}, raw = data.stop;
+  const stop = raw ? {step:stepName(raw.step),code:word(raw.code,REASON_CODES,'unknownFailure'),reasonName:word(raw.reasonName,REASON_NAMES,'unknownFailure'),
+    lastAction:word(raw.lastAction,new Set([...stages,...actions])),stage:word(raw.stage,stages),page:cleanPage(raw.page)} : null;
+  const taxMonday = result.mode === 'tax' && result.steps?.some(s=>s.id==='taxPast' && s.state==='failed')
+    && data.events?.some(e=>e.type==='writeAttempt' && e.step==='taxPast') ? mondayDate(data.taxMonday) : null;
+  const outstanding = result.cleanup === 'unconfirmed' ? [...new Set([...(result.ledger?.outstanding || []).map(r=>r.date), ...(result.outstanding || []).map(r=>r.date), ...(taxMonday ? [taxMonday] : [])])].filter(d=>date(d,result.week) || taxMonday && d===taxMonday).map(date=>({date,rows:null})) : [];
+  return JSON.stringify({ version:version(result.version), verdict: result.state === 'complete' ? 'PASS' : 'FAIL',
+    span:{start:date(result.week?.start),end:date(result.week?.end)},
+    assignPeriod:word(data.assignPeriod,periods), failedStep:stop ? { step:stop.step, code:stop.code, reasonName:stop.reasonName } : null,
+    stop, finds:(data.events || []).filter(e=>e.type==='findBoxes').map(cleanEvent).map(e=>({time:e.time,step:e.step,boxType:e.boxType})),
+    cleanup:word(result.cleanup,new Set(['empty','notNeeded','unconfirmed']),'unconfirmed'),
+    ledger:{outstanding}, unconfirmedSpan:result.cleanup === 'unconfirmed' && !outstanding.length ? {start:date(result.week?.start),end:date(result.week?.end)} : null,
+    writes:{attempted:result.diagnostic ? (data.events || []).filter(e=>e.type==='writeAttempt').length : count(result.writes),proved:(data.events || []).filter(e=>e.type==='writeAttempt' && e.proof==='passed').length},
+    finish:cleanPage(data.finish) },null,2);
+}
+function liveEventLog(result) {
+  return JSON.stringify({ version:version(result.version), span:{start:date(result.week?.start),end:date(result.week?.end)}, assignPeriod:word(result.diagnostic?.assignPeriod,periods), events:(result.diagnostic?.events || []).map(cleanEvent) },null,2);
+}
+__exports.beginLiveDiagnostics = beginLiveDiagnostics;
+__exports.shortLiveReport = shortLiveReport;
+__exports.liveEventLog = liveEventLog;
 },
 "files/run-report.js": function (__require, __exports, document, window) {
 'use strict';
@@ -12693,11 +13034,17 @@ const { COLOURS } = __require("../family/look.js");
 const { createLeaveWarning } = __require("../family/leave-warning.js");
 const { createSessionClock, paintClock } = __require("./session-clock.js");
 const { SN_COLUMNS, readTable } = __require("../servicenow/files.js");
-const { todayOf, compareDays } = __require("../rules/dates.js");
+const { todayOf, compareDays, addDays } = __require("../rules/dates.js");
 const { sortCases } = __require("../servicenow/sort.js");
 const { reportPull } = __require("../files/groups.js");
-const { checkPerson } = __require("../rules/shared.js");
+const { checkPerson, termDayOf } = __require("../rules/shared.js");
 const { decideExit } = __require("../rules/exit.js");
+const { entriesToAdd } = __require("../mysource/copy.js");
+const { reportDays } = __require("../run/backup.js");
+const { alreadyAdded } = __require("../run/work.js");
+const { DNS_CLIENT, LOA_CLIENT } = __require("../mysource/checks.js");
+const { leavePeriod, leaveRuns } = __require("../rules/leaves.js");
+const { valueKey } = __require("../rules/prepare.js");
 const { personSlice, readReport } = __require("../files/report.js");
 const { el, wrongPageNotice } = __require("./ui.js");
 const { isSchedulePage, SCHEDULE_PAGE_WORDS } = __require("../mysource/schedule.js");
@@ -12841,6 +13188,30 @@ function attachReport(cases, report, pull) {
       if (checked.outcome !== one.decision.outcome || checked.code !== one.decision.code || one.record.subcategory?.business === 'audit') one.decision = checked;
       if (one.record.subcategory?.business === 'audit' && one.slice.status === 'ready') one.personStop = checkPerson({ ...one.record.person, resourceManager: one.slice.resourceManager }, one.decision);
     }
+    delete one.reportHint;
+    if (one.record.subcategory?.site === 'tax' || one.slice.site === 'tax' || one.personStop || one.slice.status !== 'ready' || one.slice.mode !== 'day'
+      || !['add', 'dns', 'clearClients'].includes(one.decision.plan?.action)) continue;
+    const plan = one.decision.plan;
+    const window = { start: todayOf(), end: reportEnd };
+    const days = reportDays({ ...one.slice, entries: one.slice.backupEntries }, window);
+    if (plan.action === 'add') {
+      const loa = days.filter(row => valueKey(row.client) === valueKey(LOA_CLIENT));
+      const { runs } = leaveRuns(loa, leavePeriod(loa, plan, window.start));
+      const last = runs.at(-1)?.end;
+      const watchedEnd = addDays(last && compareDays(last, plan.loaEnd) > 0 ? last : plan.loaEnd, 56);
+      if (compareDays(watchedEnd, window.end) < 0) window.end = watchedEnd;
+    }
+    const { problems } = entriesToAdd({ window, days: days.filter(row => compareDays(row.day, window.end) <= 0) });
+    if (problems.length) {
+      one.personStop = { outcome: 'byHand', code: 'cannotRestore', problems };
+      continue;
+    }
+    if (plan.action !== 'dns') continue;
+    const termText = String(one.slice.person?.termDate || '').trim();
+    const term = termText ? termDayOf(termText) : null;
+    const dnsEnd = compareDays(plan.dnsEnd, reportEnd) < 0 ? plan.dnsEnd : reportEnd;
+    if (term && compareDays(term, plan.dnsStart) < 0) one.reportHint = 'Schedule greyed out: no schedule change.';
+    else if (alreadyAdded({ days }, plan.dnsStart, dnsEnd, DNS_CLIENT, true)) one.reportHint = 'DNS already there; no change';
   }
 }
 function start(version) {
@@ -12896,7 +13267,7 @@ function start(version) {
       const next = await readReport(file);
       if (!currentRead(read)) return;
       requireFreshReport(next);
-      data = next; rebuild();
+      data = next; work.staffReport = next; rebuild();
     } catch (error) { if (currentRead(read)) errorLine(error.message); }
     finally { endRead(read); }
   };
