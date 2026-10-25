@@ -4002,13 +4002,33 @@ async function setupView() {
     const button = [...document.querySelectorAll(CUSTOM_BUTTON)].find(shown);
     if (!button) throw new PageError('The Custom view button was not found.');
     await click(button);
-    await waitFor(isCustom, 'the Custom view');
+    let previous = null, stillSince = null;
+    await waitFor(() => {
+      const view = calendarView(), laidOut = document.body.getBoundingClientRect().width > 0;
+      const dates = [];
+      for (const cell of view?.querySelectorAll('td.fc-day[data-date]') || []) {
+        if (!onScreen(cell)) continue;
+        const box = cell.getBoundingClientRect();
+        if (laidOut && (!box.width || !box.height)) continue;
+        const date = readIsoDay(cell.getAttribute('data-date'));
+        if (!date) { previous = null; stillSince = null; return false; }
+        dates.push(date);
+      }
+      if (!view?.matches(CUSTOM_VIEW) || !dates.length) {
+        previous = null; stillSince = null; return false;
+      }
+      const signature = dates.sort(compareDays).map(date => `${date.y}-${date.m}-${date.d}`).join(',');
+      if (signature !== previous) { previous = signature; stillSince = Date.now(); }
+      return Date.now() - stillSince >= Math.min(1000, WAIT.window / 4);
+    }, 'the Custom view and its dated range to settle', WAIT.window);
+    await pageReady('after the Custom view change');
   }
   if (!configuredPeriods.has(document)) await setPeriods();
   await pageReady('after the view change');
   configuredPeriods.add(document);
 }
 async function openPeriods() {
+  await pageReady('before opening No. of Periods');
   const settings = [...document.querySelectorAll('button.fc-settings-button')].find(shown);
   if (!settings) throw new PageError('The ⋮ settings button was not found.');
   await click(settings);
@@ -4022,6 +4042,37 @@ async function openPeriods() {
   if (!select && !input) throw new PageError('The No. of Periods window has no list or box Snooze knows.');
   const current = String(select ? text(select.selectedOptions?.[0]) || select.value : input.value).trim();
   return { dialog, select, input, current };
+}
+async function waitPeriodsClosed(dialog) {
+  await waitFor(() => !dialog.isConnected || !shown(dialog), 'the No. of Periods window to close', WAIT.window).catch(async error => {
+    await closeWindow(dialog, 'No. of Periods').catch(closeError => { keepFlags(closeError, error); });
+    throw error;
+  });
+}
+async function waitPeriodsCalendar(value) {
+  const expected = Number(value) * 3;
+  let previous = null, stillSince = null;
+  await waitFor(() => {
+    const view = calendarView(), laidOut = document.body.getBoundingClientRect().width > 0;
+    const weeks = new Set();
+    for (const cell of view?.querySelectorAll('td.fc-day[data-date]') || []) {
+      if (!onScreen(cell)) continue;
+      const box = cell.getBoundingClientRect();
+      if (laidOut && (!box.width || !box.height)) continue;
+      const date = readIsoDay(cell.getAttribute('data-date'));
+      if (!date) return false;
+      const week = mondayOf(date);
+      weeks.add(Date.UTC(week.y, week.m - 1, week.d));
+    }
+    const dates = [...weeks].sort((a, b) => a - b);
+    if (!view?.matches(CUSTOM_VIEW) || dates.length !== expected || dates.some((date, i) => i && date - dates[i - 1] !== 7 * 86400000)) {
+      previous = null; stillSince = null; return false;
+    }
+    const signature = dates.join(',');
+    if (signature !== previous) { previous = signature; stillSince = Date.now(); }
+    return Date.now() - stillSince >= Math.min(1000, WAIT.window / 4);
+  }, 'the calendar to show the No. of Periods span', WAIT.window);
+  await pageReady('after No. of Periods change');
 }
 async function setPeriods() {
   const { dialog, select, input, current } = await openPeriods();
@@ -4040,13 +4091,16 @@ async function setPeriods() {
     if (!submit) throw new PageError('The No. of Periods window has no Submit.');
     await click(submit);
   }
-  await waitFor(() => !dialog.isConnected || !shown(dialog), 'the No. of Periods window to close', WAIT.window);
+  await waitPeriodsClosed(dialog);
   await waitFor(isCustom, 'the Custom view after No. of Periods');
   if (current === PERIODS) return;
+  let spanError;
+  await waitPeriodsCalendar(PERIODS).catch(error => { if (stopFlagged(error)) throw error; spanError = error; });
   const check = await openPeriods();
   await closeWindow(check.dialog, 'No. of Periods');
-  await waitFor(() => !check.dialog.isConnected || !shown(check.dialog), 'the No. of Periods window to close', WAIT.window);
+  await waitPeriodsClosed(check.dialog);
   if (check.current !== PERIODS) throw new PageError(`No. of Periods did not change to 14 (it reads ${check.current || 'blank'}). Nothing was changed.`);
+  if (spanError) throw spanError;
 }
 const MENU = 'ul.context-menu-list.context-menu-root';
 const menuShown = () => [...document.querySelectorAll(MENU)].find(shown);
@@ -4474,6 +4528,9 @@ __exports.resumePageReady = resumePageReady;
 __exports.personEntityId = personEntityId;
 __exports.personIdCheck = personIdCheck;
 __exports.setupView = setupView;
+__exports.openPeriods = openPeriods;
+__exports.waitPeriodsClosed = waitPeriodsClosed;
+__exports.waitPeriodsCalendar = waitPeriodsCalendar;
 __exports.closeContextLayer = closeContextLayer;
 __exports.menuItem = menuItem;
 __exports.canAddAssignment = canAddAssignment;
@@ -10605,7 +10662,7 @@ const { apply, recover, previewRestore, removeLeaveRun, BACKUP_KIND } = __requir
 const { restoreWindow } = __require("./restore.js");
 const { copyWindow, compareCopies, dayOf } = __require("./copy.js");
 const { LOA_CLIENT, DNS_CLIENT } = __require("./checks.js");
-const { findAssignments, readEditTable, closeEdit, scheduleFacts, checkPersonIdentity, emptySpots, menuItem, buttonIn, pageReady } = __require("./schedule.js");
+const { findAssignments, readEditTable, closeEdit, scheduleFacts, checkPersonIdentity, emptySpots, menuItem, buttonIn, openPeriods, waitPeriodsClosed, waitPeriodsCalendar } = __require("./schedule.js");
 const { PageError, WAIT, shown, text, click, settled, waitFor, closeWindow, typeInto, chooseInSelect2, fieldByLabel } = __require("./dom.js");
 const { showDate, titleWithIcon } = __require("./calendar.js");
 const { compareDays, usDate, workingDays } = __require("../rules/dates.js");
@@ -10813,15 +10870,7 @@ function createLiveGroups(context) {
       await guard(own());
       const open = async () => {
         await checked();
-        const button = [...document.querySelectorAll('button.fc-settings-button')].find(shown);
-        if (!button) throw new PageError('The diagnostic No. of Periods settings button is missing.');
-        await click(button);
-        const item = await waitFor(() => [...document.querySelectorAll('.dropdown-menu a, .dropdown-menu button, .dropdown-menu li, .dropdown-item')].find(node => shown(node) && text(node) === 'No. of Periods'), 'diagnostic No. of Periods menu');
-        const before = new Set([...document.querySelectorAll('.modal, [role=dialog]')].filter(shown));
-        await click(item);
-        const dialog = await settled(await waitFor(() => [...document.querySelectorAll('.modal, [role=dialog]')].find(node => shown(node) && !before.has(node)), 'diagnostic No. of Periods'));
-        const select = dialog.querySelector('select');
-        return { dialog, select, current: String(select ? text(select.selectedOptions?.[0]) || select.value : '').trim() };
+        return openPeriods();
       };
       const set = async value => {
         const form = await open();
@@ -10833,8 +10882,8 @@ function createLiveGroups(context) {
           form.select.value = option.value; form.select.dispatchEvent(new window.Event('change', { bubbles: true }));
         }
         await click(buttonIn(form.dialog, 'Submit'));
-        await waitFor(() => !form.dialog.isConnected || !shown(form.dialog), 'diagnostic periods to close', WAIT.window);
-        await pageReady('diagnostic periods change'); await checked();
+        await waitPeriodsClosed(form.dialog);
+        await waitPeriodsCalendar(value); await checked();
         const proof = await open();
         await closeWindow(proof.dialog, 'No. of Periods');
         if (proof.current !== String(value)) throw new PageError('The diagnostic period count was not kept.');
