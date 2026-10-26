@@ -1,61 +1,21 @@
-// Yoink page-structure capture, for one screenshot. Paste into the DevTools
-// console on staff search, the Consulting report or the Tax report, with the
-// boxes EMPTY. It draws a compact outline of the search form over the page:
-// containers, labels, fields, buttons and links, their classes/ids/data-* names,
-// and whether each is shown. No values, selected people, dropdown rows, chips or
-// option names; emails and runs of 4+ digits are masked. Read-only: click the
-// outline to remove it. Take one screenshot of it.
+/*
+ * Snooze site check — read-only (Claude, 2026-10-26).
+ * Paste into the console on Tax MySource > Schedule > Calendar view, menus
+ * closed. It clicks nothing and changes nothing. It prints only what Snooze's
+ * site check looks at: the tab names, and whether the Tax Resource Center
+ * link is there. No person's name or schedule.
+ */
 (() => {
-  document.getElementById('yoink-structure')?.remove();
-  const mask = s => String(s ?? '')
-    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<email>')
-    .replace(/\d{4,}/g, '#').replace(/\s+/g, ' ').trim();
-  const PRIVATE = '.select2-selection__choice, .select2-results, .select2-dropdown, option';
-  const INTEREST = 'label, select, input:not([type=hidden]), textarea, button, a, .select2-container, .collapse, '
-    + '[data-column-name], [data-group-name], .dynamic-field-column, .dynamic-field-container, .dynamic-form-group, '
-    + '.grid-search, form, .modal, [data-bs-toggle], [aria-controls]';
-  const shown = n => { const c = getComputedStyle(n); return c.display !== 'none' && c.visibility === 'visible' && n.getClientRects().length > 0; };
-  // The search area: the report's .grid-search, else the form holding the Select2 fields.
-  const root = document.querySelector('.grid-search')
-    || document.querySelector('select.select2-hidden-accessible')?.closest('form')
-    || document.querySelector('select')?.closest('form') || document.body;
-  const short = n => {
-    let s = n.tagName.toLowerCase();
-    if (n.id) s += '#' + mask(n.id);
-    const cls = [...n.classList].filter(c => !/^(col|row|mb|mt|ms|me|p[xy]?|m[xy]?|d|w|h|text|fw|fs|g)-/.test(c)).slice(0, 4);
-    if (cls.length) s += '.' + cls.map(mask).join('.');
-    for (const a of ['data-column-name', 'data-group-name', 'data-action', 'data-bs-target', 'aria-controls', 'for', 'type', 'name', 'multiple', 'href']) {
-      if (n.hasAttribute(a)) s += ` [${a}${n.getAttribute(a) ? '=' + mask(n.getAttribute(a)).replace(/\?.*$/, '?…').slice(0, 30) : ''}]`;
-    }
-    if (n.tagName === 'SELECT') s += ` (${n.options.length} opts)`;
-    if (n.matches('label, button, a, legend') && !n.closest(PRIVATE)) {
-      const own = mask([...n.childNodes].filter(c => c.nodeType === 3).map(c => c.textContent).join(' ')).slice(0, 28);
-      if (own) s += ` "${own}"`;
-    }
-    if (!shown(n)) s += ' ·hidden';
-    return s;
-  };
-  const lines = [];
-  const walk = (n, depth) => {
-    if (lines.length > 400 || n.closest('#yoink-structure, #bp-panel')) return;
-    const keep = n.matches(INTEREST);
-    if (keep) lines.push(' '.repeat(Math.min(depth, 12)) + short(n));
-    if (n.matches(PRIVATE) || n.matches('select, .select2-selection')) return;
-    if (n.matches('.modal') && !shown(n)) return; // a closed pop-up: its line only
-    for (const c of n.children) walk(c, depth + (keep ? 1 : 0));
-  };
-  walk(root, 0);
-  const expired = document.querySelector('.session-expired-modal');
-  const head = `${location.pathname} · jQuery ${window.jQuery?.fn?.jquery || '-'} · Select2 ${window.jQuery?.fn?.select2 ? 'yes' : 'no'}`
-    + ` · expiry modal ${expired ? 'present' : 'absent'} · ${lines.length} lines`;
-  const box = document.createElement('pre');
-  box.id = 'yoink-structure';
-  box.textContent = [head, ...lines].join('\n');
-  box.style.cssText = 'position:fixed;inset:0;z-index:2147483647;margin:0;padding:8px;background:#fff;color:#000;'
-    + 'font:9px/1.25 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto;'
-    + 'column-width:300px;column-fill:auto;column-gap:12px;column-rule:1px solid #ccc;cursor:pointer;';
-  box.title = 'Click to close';
-  box.onclick = () => box.remove();
-  document.body.appendChild(box);
-  console.log(`Yoink outline: ${lines.length} lines. Screenshot it, then click it to close.`);
+  const key = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
+  const outside = node => !node.closest('#snooze-panel-host, #snooze-panel');
+  const tabs = [...document.querySelectorAll('[role="tab"], .nav-tabs a, .nav-tabs button')].filter(outside);
+  const links = [...document.querySelectorAll('a')].filter(outside).filter(node => /tax\s*resource/i.test(node.textContent));
+  console.log(JSON.stringify({
+    tabs: tabs.map(node => ({ text: key(node.textContent).slice(0, 40), shown: shown(node) })),
+    taxLinks: links.map(node => ({ text: key(node.textContent).slice(0, 60), shown: shown(node) })),
+    staffTabShown: tabs.some(node => shown(node) && key(node.textContent) === 'staff'),
+    professionalTabShown: tabs.some(node => shown(node) && key(node.textContent) === 'professional'),
+    exactTaxLink: links.some(node => key(node.textContent) === 'mysource tax resource center'),
+  }, null, 1));
 })();
