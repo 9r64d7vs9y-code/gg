@@ -10093,8 +10093,8 @@ __exports.taxLiveReport = taxLiveReport;
 const { stageNotes } = __require("./note-stage.js");
 const { createLiveGroups } = __require("./live-groups.js");
 const { createLivePictures } = __require("./live-pictures.js");
-const { PageError, setBatchGuard, shown, click, settled, text, waitFor, WAIT } = __require("./dom.js");
-const { calendarView, openPerson, personIdentity, checkPersonIdentity, requireSchedulePage, scheduleFacts, findAssignments, findAssignmentsRange, readEditTable, closeEdit, setupView } = __require("./schedule.js");
+const { PageError, setBatchGuard, shown, click, settled, text, waitFor, WAIT, closeWindow, cleanupAfter } = __require("./dom.js");
+const { calendarView, openPerson, personIdentity, checkPersonIdentity, requireSchedulePage, scheduleFacts, findAssignments, findAssignmentsRange, readEditTable, closeEdit, setupView, pageReady } = __require("./schedule.js");
 const { sessionExpired, cancelBatchWindows } = __require("./batch.js");
 const { copyWindow, compareCopies, dayOf, entriesToAdd, knownAssignmentRows } = __require("./copy.js");
 const { createEditability } = __require("./editability.js");
@@ -10164,7 +10164,42 @@ function liveControlState() {
     interceptsPointer: window.getComputedStyle(node).pointerEvents !== 'none',
   })), documentHandlers: events(document) };
 }
-function liveTestPage({ today = todayOf(), mode = 'consulting' } = {}) {
+const openEdits = () => [...document.querySelectorAll('#editEventGridModal')].filter(node =>
+  node.isConnected && (node.classList.contains('show') || node.classList.contains('in'))
+  && node.ownerDocument.defaultView.getComputedStyle(node).display !== 'none');
+function ownedDeleteEdit() {
+  const edits = openEdits();
+  if (edits.length !== 1 || edits[0].querySelectorAll('#editGrid').length !== 1)
+    throw new PageError('The A&A delete table is not unique.');
+  return edits[0];
+}
+async function cancelLiveWindows() {
+  try {
+    for (const confirmation of [...document.querySelectorAll('.bootbox-confirm')].filter(shown).reverse())
+      await closeWindow(confirmation, 'confirmation window');
+    for (const edit of openEdits().reverse()) await closeEdit(edit);
+    await cancelBatchWindows();
+    if (openEdits().length) throw new PageError('Edit Assignment could not be closed safely.');
+    await pageReady('live test cleanup');
+  } catch (error) { error.pageBlocked = true; throw error; }
+}
+function liveTestPage(options = {}) {
+  const page = createLiveTestPage(options);
+  for (const [name, action] of Object.entries(page)) {
+    if (typeof action !== 'function') continue;
+    page[name] = function (...args) {
+      const value = action.apply(this, args);
+      if (!value?.then) return value;
+      return value.catch(async error => {
+        if (error.stage === 'delete' && openEdits().length || [...document.querySelectorAll('.bootbox-confirm')].some(shown))
+          await cleanupAfter(error, cancelLiveWindows);
+        throw error;
+      });
+    };
+  }
+  return page;
+}
+function createLiveTestPage({ today = todayOf(), mode = 'consulting' } = {}) {
   if (mode === 'audit') return auditLivePage(today);
   if (mode === 'tax') return taxLivePage(today);
   let identity = null, scope = null, observations = null, owningStep = null, verifiedOwnership = null, pendingSave = null;
@@ -10539,7 +10574,7 @@ function taxLivePage(today) {
     async taxCleanup(write, error) {
       if (!started) return 'notNeeded';
       if (error?.identityChanged || error?.session || error?.pageBlocked) return 'unconfirmed';
-      await cancelBatchWindows(); check();
+      await cancelLiveWindows(); check();
       if (pastOriginal) {
         const actual = await pastRead();
         if (!matches({ days: [pastOriginal] }, actual)) {
@@ -10549,7 +10584,7 @@ function taxLivePage(today) {
       }
       await resolve();
       try { await clear(write); }
-      catch (error) { await cancelBatchWindows(); await resolve(); if (known.days.length) throw error; }
+      catch (error) { await cancelLiveWindows(); await resolve(); if (known.days.length) throw error; }
       return known.days.length ? 'unconfirmed' : 'empty';
     },
     taxFinish() { release?.(); release = null; },
@@ -10614,9 +10649,8 @@ function auditLivePage(today) {
       if (pending) { known = pending.after; pending = null; }
       let deleteRange = operation.range, staged = false, editRange = null;
       if (operation.kind === 'delete') {
-        const edits = [...document.querySelectorAll('#editEventGridModal')].filter(shown);
-        if (edits.length !== 1) throw new PageError('The A&A delete table is not unique.');
-        editRange = findAssignmentsRange(edits[0]) || operation.range;
+        const edit = ownedDeleteEdit();
+        editRange = findAssignmentsRange(edit) || operation.range;
         if (!editRange.start || !editRange.end) throw new PageError('The A&A delete range could not be proved.');
         deleteRange = { start:compareDays(editRange.start,operation.range.start)>0 ? editRange.start : operation.range.start,
           end:compareDays(editRange.end,operation.range.end)<0 ? editRange.end : operation.range.end };
@@ -10628,9 +10662,8 @@ function auditLivePage(today) {
       if (operation.kind !== 'delete' || !pending.after.days.some(row=>inside(row.day,operation.range) && (!operation.client || valueKey(row.client)===valueKey(operation.client)))) index++;
       const proveDelete = async () => {
         if (operation.kind !== 'delete') return;
-        const edits = [...document.querySelectorAll('#editEventGridModal')].filter(shown);
-        if (edits.length !== 1) throw new PageError('The A&A delete table is not unique.');
-        const actual = { days: (await readEditTable(edits[0])).map(row => ({ ...row, day: dayOf(row.date) })) };
+        const edit = ownedDeleteEdit();
+        const actual = { days: (await readEditTable(edit)).map(row => ({ ...row, day: dayOf(row.date) })) };
         const queried = staged ? editRange : deleteRange;
         if (!queried?.start || !queried.end) throw new PageError('The A&A delete range could not be proved.');
         const expected = { days: (staged ? pending.after : pending.before).days.filter(row => inside(row.day, queried) && (!operation.client || valueKey(row.client) === valueKey(operation.client))) };
@@ -10766,9 +10799,9 @@ function auditLivePage(today) {
     async auditCleanup(write, error) {
       if (!started) return 'notNeeded';
       if (error?.identityChanged || error?.session || error?.pageBlocked) return 'unconfirmed';
-      await cancelBatchWindows(); check(); await resolve();
+      await cancelLiveWindows(); check(); await resolve();
       try { await clear(write); }
-      catch (error) { await cancelBatchWindows(); await resolve(); if (known.days.length) throw error; }
+      catch (error) { await cancelLiveWindows(); await resolve(); if (known.days.length) throw error; }
       return (await read()).days.length ? 'unconfirmed' : 'empty';
     },
     auditOutstanding(cleanup) {
@@ -11517,7 +11550,6 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     if (!saving?.then && live) live.saved = true;
     await saving;
     if (work.liveTest === live && live) live.saved = true;
-    await save('Snooze live test 2028 log.txt', liveEventLog(result), 'text/plain');
   }
   async function start(part = mode) {
     if (active || work.busy || result) return;
@@ -11549,17 +11581,21 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
   const downloadButton = el('button', { class: 'blue', onclick: () => download().catch(() => {
     notice = 'Download did not finish. Try Download report again.'; draw();
   }) }, 'Download report');
+  const logButton = el('button', { class: 'grey', style: 'font-size:12px;padding:5px 8px', onclick: async () => {
+    try { await save('Snooze live test 2028 log.txt', liveEventLog(result), 'text/plain'); }
+    catch { notice = 'Download did not finish. Try Download log again.'; draw(); }
+  } }, 'Download log');
   function draw() {
     const scroll = box.querySelector('.restore-list')?.scrollTop || 0;
     if (panel) panel.style.width = photo ? 'min(1280px, calc(100vw - 32px))' : originalWidth;
     box.style.overflow = photo ? 'auto' : '';
     box.replaceChildren(); email.disabled = active || !!result;
-    back.disabled = active; go.disabled = active || !!result; auditGo.disabled = active || !!result; downloadButton.disabled = active;
+    back.disabled = active; go.disabled = active || !!result; auditGo.disabled = active || !!result; downloadButton.disabled = active; logButton.disabled = active;
     if (photo && result && !active) {
       const report = renderPhotoReport(result);
       box.append(report);
       if (notice) box.append(el('div', { class: 'restore-warning', role: 'status' }, notice));
-      box.append(el('div', { class: 'restore-footer' }, el('div', { class: 'buttons' }, back, downloadButton)));
+      box.append(el('div', { class: 'restore-footer' }, el('div', { class: 'buttons' }, back, downloadButton, logButton)));
       fitPhotoReport(report);
       window.requestAnimationFrame?.(() => { if (report.isConnected) fitPhotoReport(report); });
       return;
@@ -11594,10 +11630,11 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     if (notice) box.append(el('div', { class: 'restore-warning', role: 'status' }, notice));
     const buttons = el('div', { class: 'buttons' }, back, mode !== 'consulting' && result && !active ? downloadButton : go);
     if (mode === 'consulting' && !result) buttons.append(auditGo);
+    if (mode !== 'consulting' && result && !active) buttons.append(logButton);
     box.append(el('div', { class: 'restore-footer' }, buttons));
   }
   draw();
-  return { email, go, auditGo, download: downloadButton, get result() { return result; } };
+  return { email, go, auditGo, download: downloadButton, downloadLog: logButton, get result() { return result; } };
 }
 __exports.liveTestButton = liveTestButton;
 __exports.mountLiveTestPanel = mountLiveTestPanel;
@@ -11790,14 +11827,21 @@ const mondayDate = value => {
   return day && weekday(day) === 1 ? value : null;
 };
 function pageState(controls, seenPeriods) {
+  const kinds = {}, visible = new Set();
+  for (const window of controls?.windows || []) {
+    const kind = word(window.kind, windowKinds); kinds[kind] = (kinds[kind] || 0) + 1;
+    if (window.visible === true) visible.add(kind);
+  }
   return { view: word(controls?.view, views),
     periods: Number.isSafeInteger(controls?.periods) ? controls.periods : seenPeriods,
     windows: { open: (controls?.windows || []).filter(w => w.visible === true).length,
       hidden: (controls?.windows || []).filter(w => w.visible === false).length },
-    windowKinds: (controls?.windows || []).map(w => ({ kind: word(w.kind, windowKinds), visible: w.visible === true })),
+    windowKinds: kinds, visibleWindows: [...visible],
     covers: count(controls?.covers?.length) };
 }
 function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
+  const started = Date.now();
+  const elapsed = () => Math.max(0, Date.now() - started) / 1000;
   const data = result.diagnostic = { assignPeriod: word(assignPeriod, periods), events: [], stop: null };
   const runDay = result.mode === 'tax' && dayFromParts(today?.y, today?.m, today?.d);
   if (runDay) data.taxMonday = usDate(mondayOf(runDay));
@@ -11808,7 +11852,7 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
     if (stages.has(event.stage)) { stage = event.stage; if (event.type === 'begin') lastAction = stage; }
     if (event.type === 'periods' && Number.isSafeInteger(event.count)) seenPeriods = event.count;
     if (event.type === 'findBoxes') boxType = word(event.boxType, boxTypes);
-    const safe = { time: Date.now(), step: stepName(event.step || forcedStep || result.steps.find(s => s.state === 'running')?.id || result.steps.at(-1)?.id),
+    const safe = { time: elapsed(), step: stepName(event.step || forcedStep || result.steps.find(s => s.state === 'running')?.id || result.steps.at(-1)?.id),
       type: word(event.type, types, 'observation'), stage, wait: WAIT_NAMES.has(event.waitName) ? event.waitName : word(event.name, waitNames),
       seconds: Number.isFinite(event.seconds) && event.seconds >= 0 ? event.seconds : null,
       result: word(event.result, results, typeof event.ok === 'boolean' ? event.ok ? 'passed' : 'failed' : 'unconfirmed'),
@@ -11842,7 +11886,7 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
       pending.length = 0;
       const failure = { step: stepName(step), code: error?.identityChanged ? 'identityChanged' : error?.session ? 'sessionExpired' : word(error?.reasonCode, REASON_CODES, reasonCode(error?.message)), reasonName:errorReason(error) };
       const source = error?.liveStop || data.events.findLast(e => e.type === 'error' && e.reasonName === failure.reasonName && e.step === failure.step);
-      const stopped = { ...failure, lastAction:source?.lastAction || lastAction, stage: source?.stage || word(error?.stage, stages, stage), page: source?.page || snapshot() };
+      const stopped = { ...failure, time: elapsed(), lastAction:source?.lastAction || lastAction, stage: source?.stage || word(error?.stage, stages, stage), page: source?.page || snapshot() };
       data.stop ||= stopped;
       Object.assign(result.steps.find(s => s.id === step) || {}, { code:failure.code, reasonName:failure.reasonName });
       recordRun({ type:'stop', ...failure, result:'failed' });
@@ -11856,7 +11900,8 @@ function cleanPage(page) {
   if (page.unavailable === true) return {unavailable:true};
   return {view:word(page.view,views),periods:Number.isSafeInteger(page.periods) && page.periods>=0 ? page.periods : null,
     windows:{open:count(page.windows?.open),hidden:count(page.windows?.hidden)},covers:count(page.covers),
-    windowKinds:(page.windowKinds || []).map(w=>({kind:word(w.kind,windowKinds),visible:w.visible===true}))};
+    windowKinds:Object.fromEntries(Object.entries(page.windowKinds || {}).filter(([kind])=>windowKinds.has(kind) || kind==='unknown').map(([kind,n])=>[kind,count(n)])),
+    visibleWindows:[...new Set((page.visibleWindows || []).map(kind=>word(kind,windowKinds)))]};
 }
 function cleanEvent(event) {
   const safe = {time:Number.isFinite(event.time) && event.time>=0 ? event.time : null,step:stepName(event.step),type:word(event.type,types,'observation'),
@@ -11871,26 +11916,143 @@ function cleanEvent(event) {
   if (['passed','failed','unconfirmed'].includes(event.proof)) safe.proof=event.proof;
   return safe;
 }
-function shortLiveReport(result) {
+function liveReportSummary(result, includeMonday = true) {
   const data = result.diagnostic || {}, raw = data.stop;
   const stop = raw ? {step:stepName(raw.step),code:word(raw.code,REASON_CODES,'unknownFailure'),reasonName:word(raw.reasonName,REASON_NAMES,'unknownFailure'),
-    lastAction:word(raw.lastAction,new Set([...stages,...actions])),stage:word(raw.stage,stages),page:cleanPage(raw.page)} : null;
-  const taxMonday = result.mode === 'tax' && result.steps?.some(s=>s.id==='taxPast' && s.state==='failed')
+    lastAction:word(raw.lastAction,new Set([...stages,...actions])),stage:word(raw.stage,stages),time:Number.isFinite(raw.time) && raw.time>=0 ? raw.time : null,page:cleanPage(raw.page)} : null;
+  const taxMonday = includeMonday && result.mode === 'tax' && result.steps?.some(s=>s.id==='taxPast' && s.state==='failed')
     && data.events?.some(e=>e.type==='writeAttempt' && e.step==='taxPast') ? mondayDate(data.taxMonday) : null;
-  const outstanding = result.cleanup === 'unconfirmed' ? [...new Set([...(result.ledger?.outstanding || []).map(r=>r.date), ...(result.outstanding || []).map(r=>r.date), ...(taxMonday ? [taxMonday] : [])])].filter(d=>date(d,result.week) || taxMonday && d===taxMonday).map(date=>({date,rows:null})) : [];
-  return JSON.stringify({ version:version(result.version), verdict: result.state === 'complete' ? 'PASS' : 'FAIL',
+  const outstanding = result.cleanup === 'unconfirmed' ? [...new Set([...(result.ledger?.outstanding || []).map(r=>r.date), ...(result.outstanding || []).map(r=>r.date), ...(taxMonday ? [taxMonday] : [])])].filter(d=>date(d,result.week) || taxMonday && d===taxMonday) : [];
+  return { version:version(result.version), verdict: result.state === 'complete' ? 'PASS' : 'FAIL',
     span:{start:date(result.week?.start),end:date(result.week?.end)},
     assignPeriod:word(data.assignPeriod,periods), failedStep:stop ? { step:stop.step, code:stop.code, reasonName:stop.reasonName } : null,
-    stop, finds:(data.events || []).filter(e=>e.type==='findBoxes').map(cleanEvent).map(e=>({time:e.time,step:e.step,boxType:e.boxType})),
+    stop, finds:findSummary(data.events || []),
     cleanup:word(result.cleanup,new Set(['empty','notNeeded','unconfirmed']),'unconfirmed'),
-    ledger:{outstanding}, unconfirmedSpan:result.cleanup === 'unconfirmed' && !outstanding.length ? {start:date(result.week?.start),end:date(result.week?.end)} : null,
+    unconfirmed:dateRanges(outstanding), unconfirmedSpan:result.cleanup === 'unconfirmed' && !outstanding.length ? {start:date(result.week?.start),end:date(result.week?.end)} : null,
     writes:{attempted:result.diagnostic ? (data.events || []).filter(e=>e.type==='writeAttempt').length : count(result.writes),proved:(data.events || []).filter(e=>e.type==='writeAttempt' && e.proof==='passed').length},
-    finish:cleanPage(data.finish) },null,2);
+    finish:cleanPage(data.finish), seconds:(data.events || []).map(e=>e.time).filter(n=>Number.isFinite(n) && n>=0).at(-1) ?? null };
+}
+function dateRanges(dates) {
+  const sorted = [...new Set(dates)].sort((a,b)=>dateNumber(a)-dateNumber(b)), ranges = [];
+  for (const day of sorted) {
+    const last = ranges.at(-1);
+    if (last && dateNumber(day)-dateNumber(last.end)===86400000) last.end=day;
+    else ranges.push({start:day,end:day});
+  }
+  return ranges.map(r=>r.start===r.end ? r.start : `${r.start}-${r.end}`);
+}
+function dateNumber(value) {
+  const [m,d,y] = value.split('/').map(Number); return Date.UTC(y,m-1,d);
+}
+function findSummary(events) {
+  const finds = events.filter(e=>e.type==='findBoxes').map(cleanEvent), counts = {};
+  for (const find of finds) counts[find.boxType]=(counts[find.boxType] || 0)+1;
+  return {counts,first:finds[0]?.step || 'none',last:finds.at(-1)?.step || 'none'};
+}
+function packFacts(input) {
+  const facts=new Map(), lines=[];
+  for (const text of input) {
+    const at=text.indexOf(': '), name=text.slice(0,at), value=text.slice(at+2);
+    facts.set(name,[...(facts.get(name) || []),value]);
+  }
+  let current='';
+  for (const [name,values] of facts) for (const token of `${name}: ${values.join(' ')};`.split(' ')) {
+    if (current.length+token.length+(current?1:0)>100) { lines.push(current); current='More:'; }
+    current+=(current?' ':'')+token;
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+function shortLiveReport(result) {
+  const report = liveReportSummary(result), stop=report.stop, page=stop?.page, finish=report.finish, lines=[];
+  const line = (name, value) => {
+    const prefix = `${name}: `;
+    let current = prefix;
+    const tokens = Array.isArray(value) ? value.map((part,index)=>`${part}${index<value.length-1?',':''}`) : String(value ?? 'unknown').split(' ');
+    for (const token of tokens) {
+      if (current.length+token.length+(current===prefix?0:1)>100 && current!==prefix) { lines.push(current); current=prefix; }
+      current += (current===prefix?'':' ')+token;
+    }
+    lines.push(current);
+  };
+  const kinds = page => Object.keys(page?.windowKinds || {}).length ? Object.entries(page.windowKinds).map(([kind,n])=>`${kind} ${n}`) : ['none'];
+  const visible = page => page?.visibleWindows?.length ? page.visibleWindows : ['none'];
+  const state = page => !page || page.unavailable ? 'unavailable' : `${page.view}; periods ${page.periods ?? 'unknown'}; open ${page.windows.open}; hidden ${page.windows.hidden}; covers ${page.covers}`;
+  line('Verdict', `${report.verdict}; version ${report.version}`);
+  line('Failed step',stop ? `${stop.step}${stop.time==null?'':` at ${stop.time} s`}` : 'none'); line('Code',stop?.code || 'none'); line('Reason',stop?.reasonName || 'none');
+  line('Last action',stop?.lastAction || 'none'); line('Stage',stop?.stage || 'none');
+  line('Assign Period',report.assignPeriod);
+  line('Finds',Object.entries(report.finds.counts).map(([kind,n])=>`${kind} ${n}`).join(', ') || 'none');
+  line('Find steps',`${report.finds.first} - ${report.finds.last}`);
+  line('View',page?.view); line('Periods',page?.periods);
+  line('Windows',page ? `open ${page.windows?.open ?? 'unknown'}, hidden ${page.windows?.hidden ?? 'unknown'}` : 'unavailable');
+  line('Window kinds',kinds(page)); line('Visible',visible(page)); line('Covers',page?.covers);
+  line('Writes',`${report.writes.attempted} attempted / ${report.writes.proved} proved`);
+  line('Cleanup',report.cleanup);
+  let rangeStart=lines.length;
+  line('Unconfirmed',report.unconfirmed.length ? report.unconfirmed : report.unconfirmedSpan ? `${report.unconfirmedSpan.start}-${report.unconfirmedSpan.end}` : 'none');
+  const rangeEnd=lines.length;
+  line('Span',`${report.span.start}-${report.span.end}`);
+  line('Finish',`at ${report.seconds==null?'unknown':report.seconds} s; ${state(finish)}`); line('Finish visible',visible(finish)); line('Finish kinds',kinds(finish));
+  if (lines.length>30 && report.unconfirmed.length) {
+    const tail=lines.slice(rangeEnd), groups={};
+    for (const range of report.unconfirmed) {
+      const year=range.slice(6,10);
+      (groups[year] ||= []).push(range.replace(/\/\d{4}/g,''));
+    }
+    const grouped = compact => {
+      lines.length=rangeStart;
+      for (const [year,ranges] of Object.entries(groups)) line(`Unconfirmed ${year}`,compact
+        ? ranges.map(range=>range.replace(/^(\d{2})\/(\d{2})-\1\/(\d{2})$/,'$1/$2-$3')) : ranges);
+      lines.push(...tail);
+    };
+    grouped(false);
+    if (lines.length>30) grouped(true);
+    if (rangeStart+tail.length+1>30) {
+      const header=packFacts(lines.slice(0,rangeStart));
+      tail.splice(0,tail.length,...packFacts(tail));
+      lines.splice(0,rangeStart,...header); rangeStart=header.length;
+      grouped(true);
+    }
+    if (lines.length>30) {
+      const ranges=Object.entries(groups).flatMap(([year,values])=>values.map(value=>({year,value})));
+      let omitted=0;
+      const render=()=>{
+        lines.length=rangeStart;
+        for (const year of new Set(ranges.map(range=>range.year))) line(`Unconfirmed ${year}`,ranges.filter(range=>range.year===year).map(range=>range.value.replace(/^(\d{2})\/(\d{2})-\1\/(\d{2})$/,'$1/$2-$3')));
+        if (omitted) line('Unconfirmed',`and ${omitted} more dates (all in the log)`);
+        lines.push(...tail);
+      };
+      while (lines.length>30 && ranges.length) {
+        const {year,value}=ranges.pop(), [first,last=first]=value.split('-');
+        omitted+=(dateNumber(`${last}/${year}`)-dateNumber(`${first}/${year}`))/86400000+1;
+        render();
+      }
+    }
+  }
+  if (lines.length>30) {
+    return packFacts(lines).join('\n');
+  }
+  return lines.join('\n');
 }
 function liveEventLog(result) {
-  return JSON.stringify({ version:version(result.version), span:{start:date(result.week?.start),end:date(result.week?.end)}, assignPeriod:word(result.diagnostic?.assignPeriod,periods), events:(result.diagnostic?.events || []).map(cleanEvent) },null,2);
+  const report=liveReportSummary(result,false), events=(result.diagnostic?.events || []).map(cleanEvent);
+  const byStep=new Map(), compact=[];
+  let previous='unknown', seen=false;
+  for (const event of events) {
+    if (event.type!=='findBoxes') { compact.push(event); continue; }
+    if (!byStep.has(event.step)) byStep.set(event.step,{step:event.step,counts:{}});
+    const counts=byStep.get(event.step).counts;
+    counts[event.boxType]=(counts[event.boxType] || 0)+1;
+    const changed=!seen || event.boxType!==previous;
+    if (changed) compact.push({...event,from:previous});
+    else if (event.reasonName!=='none' || event.code!=='none' || ['failed','refused','late'].includes(event.result)) compact.push(event);
+    previous=event.boxType; seen=true;
+  }
+  return JSON.stringify({...report,finds:{...report.finds,byStep:[...byStep.values()]},events:compact});
 }
 __exports.beginLiveDiagnostics = beginLiveDiagnostics;
+__exports.liveReportSummary = liveReportSummary;
 __exports.shortLiveReport = shortLiveReport;
 __exports.liveEventLog = liveEventLog;
 },
