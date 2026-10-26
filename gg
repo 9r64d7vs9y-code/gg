@@ -1,26 +1,27 @@
 /*
- * Snooze Tax load probe — read-only. Run on Tax MySource, Schedule > Calendar
- * view, with the test person's schedule open by hand (Custom view).
- * Clicks nothing, saves nothing, sends nothing. Prints counts, classes and
- * sizes only: no names, clients or hours. Copy the lines it prints.
+ * Snooze Tax name probe — read-only. Run on Tax MySource, Schedule, Staff tab,
+ * with the test person's schedule open by hand (week view).
+ * Clicks nothing, saves nothing, sends nothing. Prints only how the line with
+ * the person's name is built (tags, classes, ids, text lengths), never the
+ * name itself. Copy the lines it prints.
  */
 (() => {
   const out = [];
-  const style = node => getComputedStyle(node);
-  const sized = node => { const box = node.getBoundingClientRect(); return `${Math.round(box.width)}x${Math.round(box.height)}`; };
-  const shown = node => { for (let at = node; at && at.nodeType === 1; at = at.parentElement) { const s = style(at); if (at.hidden || s.display === 'none' || s.visibility === 'hidden') return false; } return true; };
-  const names = [...document.querySelectorAll('.calendar-name')];
-  out.push(`calendar-name: ${names.length}, shown ${names.filter(shown).length}`);
-  const wrappers = [...document.querySelectorAll('.staff-calendar-wrapper')];
-  out.push(`wrappers: ${wrappers.length}; ` + wrappers.map((w, i) => `#${i} hidden=${w.hidden} shown=${shown(w)} size=${sized(w)} tabPane=${w.closest('.tab-pane')?.id || 'none'}/${w.closest('.tab-pane')?.classList.contains('active')}`).join('; '));
-  out.push(`body width: ${Math.round(document.body.getBoundingClientRect().width)}`);
-  [...document.querySelectorAll('.fc-view')].forEach((view, i) => {
-    const control = view.closest('[id^="controlCalendar_"]')?.id || 'none';
-    const fcDay = [...view.querySelectorAll('td.fc-day[data-date]')];
-    const anyDated = [...view.querySelectorAll('[data-date]')];
-    const tags = [...new Set(anyDated.map(n => `${n.tagName.toLowerCase()}.${[...n.classList].slice(0, 3).join('.')}`))].slice(0, 6).join(' | ');
-    out.push(`view #${i}: class="${view.className}" control=${control} shown=${shown(view)} size=${sized(view)} td.fc-day[data-date]=${fcDay.length} sized=${fcDay.filter(n => { const b = n.getBoundingClientRect(); return b.width > 0 && b.height > 0; }).length} any[data-date]=${anyDated.length} kinds: ${tags || 'none'}`);
+  const wrapper = document.querySelector('.staff-calendar-wrapper');
+  if (!wrapper) { console.log('no .staff-calendar-wrapper'); return; }
+  const desc = node => `${node.tagName.toLowerCase()}${node.id ? '#' + node.id : ''}${[...node.classList].map(c => '.' + c).join('')}`;
+  const ownText = node => [...node.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
+  out.push(`wrapper: ${desc(wrapper)}`);
+  let parent = wrapper.parentElement;
+  for (let i = 0; i < 3 && parent; i++, parent = parent.parentElement) out.push(`parent ${i + 1}: ${desc(parent)}`);
+  // Everything in or just above the wrapper that is not part of the calendar grid.
+  const scope = wrapper.parentElement || wrapper;
+  [...scope.querySelectorAll('*')].filter(node => !node.closest('.fc-view-container') && !node.closest('.fc-toolbar')).forEach(node => {
+    const own = ownText(node);
+    const close = /[✕×xX]/.test(own) && own.length <= 2;
+    if (own.length > 0 || node.matches('i, a, button, span')) {
+      out.push(`${desc(node)} textLength=${own.length}${close ? ' (close mark)' : ''}${/\(.*-.*\)/.test(own) ? ' (looks like name line)' : ''} title=${node.title ? 'yes' : 'no'}`);
+    }
   });
-  out.push(`entries .fc-event: ${document.querySelectorAll('.fc-event').length}`);
-  console.log(out.join('\n'));
+  console.log(out.slice(0, 60).join('\n'));
 })();
