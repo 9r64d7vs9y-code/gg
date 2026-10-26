@@ -10117,6 +10117,7 @@ const { readNotification } = __require("../servicenow/tickets.js");
 const { capturePerson } = __require("../files/batch-outputs.js");
 const { lastPicture } = __require("../files/capture.js");
 const inside = (day, window) => day && compareDays(day, window.start) >= 0 && compareDays(day, window.end) <= 0;
+const editOwnership = new WeakMap();
 function liveDiagnosticState() {
   const kinds = ['Find Assignments','Edit Assignment','Bulk Edit Assignments','Add Assignment','No. of Periods','Go to Date','View Notes'];
   let view = 'unknown';
@@ -10135,7 +10136,13 @@ function liveDiagnosticState() {
     const raw = control?.tagName === 'SELECT' ? text(control.selectedOptions?.[0]) || control.value : control?.value;
     if (/^\d+$/.test(raw || '')) periods = Number(raw);
   }
-  return { view, periods, windows, covers:[...document.querySelectorAll('div.loading, .blockUI.blockOverlay, .loading-overlay, .modal-backdrop')].filter(shown) };
+  const edits = [...document.querySelectorAll('#editEventGridModal')].slice(0,3).map(node => {
+    const display=node.ownerDocument.defaultView.getComputedStyle(node).display;
+    return {open:node.getAttribute('aria-hidden')!=='true' && openEdits().includes(node) ? 'yes' : 'no',
+      shown:shown(node) ? 'yes' : 'no',display:['block','none'].includes(display) ? display : 'other',
+      rows:node.querySelectorAll('#editGrid tbody tr[data-id]').length,owned:editOwnership.get(node) || 'unknown'};
+  });
+  return { view, periods, windows, edits, covers:[...document.querySelectorAll('div.loading, .blockUI.blockOverlay, .loading-overlay, .modal-backdrop')].filter(shown) };
 }
 function liveControlState() {
   const events = node => {
@@ -10167,11 +10174,25 @@ function liveControlState() {
 const openEdits = () => [...document.querySelectorAll('#editEventGridModal')].filter(node =>
   node.isConnected && (node.classList.contains('show') || node.classList.contains('in'))
   && node.ownerDocument.defaultView.getComputedStyle(node).display !== 'none');
-function ownedDeleteEdit() {
-  const edits = openEdits();
-  if (edits.length !== 1 || edits[0].querySelectorAll('#editGrid').length !== 1)
+async function ownedDeleteEdit(expectedFor, matches) {
+  const edits = [...document.querySelectorAll('#editEventGridModal')].filter(node=>node.isConnected), owned=[];
+  for (const edit of edits) editOwnership.set(edit,'unknown');
+  for (const edit of edits) {
+    const grids=edit.querySelectorAll('#editGrid');
+    if (grids.length!==1) {
+      if (grids.length>1) throw new PageError('The A&A delete table is not unique.');
+      editOwnership.set(edit,'no'); continue;
+    }
+    const expected=expectedFor(edit);
+    if (!expected || !expected.rows.days.length && !findAssignmentsRange(edit)) { editOwnership.set(edit,'no'); continue; }
+    const actual={days:(await readEditTable(edit)).map(row=>({...row,day:dayOf(row.date)}))};
+    const same=matches(expected.rows,actual);
+    editOwnership.set(edit,same ? 'yes' : 'no');
+    if (same) owned.push({edit,...expected});
+  }
+  if (owned.length!==1)
     throw new PageError('The A&A delete table is not unique.');
-  return edits[0];
+  return owned[0];
 }
 async function cancelLiveWindows() {
   try {
@@ -10649,25 +10670,30 @@ function auditLivePage(today) {
       if (pending) { known = pending.after; pending = null; }
       let deleteRange = operation.range, staged = false, editRange = null;
       if (operation.kind === 'delete') {
-        const edit = ownedDeleteEdit();
-        editRange = findAssignmentsRange(edit) || operation.range;
-        if (!editRange.start || !editRange.end) throw new PageError('The A&A delete range could not be proved.');
-        deleteRange = { start:compareDays(editRange.start,operation.range.start)>0 ? editRange.start : operation.range.start,
-          end:compareDays(editRange.end,operation.range.end)<0 ? editRange.end : operation.range.end };
-        bounded(deleteRange);
-        staged = !!editRange.weekBoxes && ![...document.querySelectorAll('.bootbox-confirm')].some(shown);
+        const owned=await ownedDeleteEdit(edit=>{
+          const range=findAssignmentsRange(edit) || operation.range;
+          if (!range.start || !range.end) throw new PageError('The A&A delete range could not be proved.');
+          const clipped={start:compareDays(range.start,operation.range.start)>0 ? range.start : operation.range.start,
+            end:compareDays(range.end,operation.range.end)<0 ? range.end : operation.range.end};
+          bounded(clipped);
+          const staged=!!range.weekBoxes && ![...document.querySelectorAll('.bootbox-confirm')].some(shown);
+          const deletes=row=>inside(row.day,clipped) && (!operation.client || valueKey(row.client)===valueKey(operation.client));
+          const queried=staged ? range : clipped;
+          const rows={days:known.days.filter(row=>inside(row.day,queried) && (!operation.client || valueKey(row.client)===valueKey(operation.client)) && (!staged || !deletes(row)))};
+          if (staged && !rows.days.length && !findAssignmentsRange(edit)) return null;
+          return {range,clipped,staged,rows};
+        },matches);
+        editRange=owned.range; deleteRange=owned.clipped; staged=owned.staged;
       }
       const deletes = row => inside(row.day,deleteRange) && (!operation.client || valueKey(row.client)===valueKey(operation.client));
       pending = { before: known, after: { days: operation.kind === 'delete' ? known.days.filter(row=>!deletes(row)) : operation.after(known.days) } };
       if (operation.kind !== 'delete' || !pending.after.days.some(row=>inside(row.day,operation.range) && (!operation.client || valueKey(row.client)===valueKey(operation.client)))) index++;
       const proveDelete = async () => {
         if (operation.kind !== 'delete') return;
-        const edit = ownedDeleteEdit();
-        const actual = { days: (await readEditTable(edit)).map(row => ({ ...row, day: dayOf(row.date) })) };
         const queried = staged ? editRange : deleteRange;
         if (!queried?.start || !queried.end) throw new PageError('The A&A delete range could not be proved.');
         const expected = { days: (staged ? pending.after : pending.before).days.filter(row => inside(row.day, queried) && (!operation.client || valueKey(row.client) === valueKey(operation.client))) };
-        if (!matches(expected, actual)) throw new PageError('The owned A&A delete rows changed before Yes.');
+        await ownedDeleteEdit(edit=>staged && !expected.days.length && !findAssignmentsRange(edit) ? null : {rows:expected},matches);
       };
       await proveDelete();
       await write();
@@ -11816,6 +11842,10 @@ const windowKinds = new Set([...WINDOWS,'Go to Date','Delete confirmation']);
 const views = new Set(['Custom','Month','Week','Time']);
 const boxTypes = new Set(['Date','Week']);
 const periods = new Set(['Weekly','Time','unknown']);
+const yesNo = new Set(['yes','no','unknown']);
+const displays = new Set(['block','none','other','unknown']);
+const cleanEdits = edits => (Array.isArray(edits) ? edits : []).slice(0,3).map(edit=>({
+  open:word(edit.open,yesNo),shown:word(edit.shown,yesNo),display:word(edit.display,displays),rows:count(edit.rows),owned:word(edit.owned,yesNo)}));
 const stepName = value => steps.has(value) ? value : 'unknown';
 const version = value => /^\d+\.\d+\.\d+$/.test(value) ? value : 'unknown';
 const date = (value, span) => typeof value === 'string' && /^\d{2}\/\d{2}\/2028$/.test(value)
@@ -11836,7 +11866,7 @@ function pageState(controls, seenPeriods) {
     periods: Number.isSafeInteger(controls?.periods) ? controls.periods : seenPeriods,
     windows: { open: (controls?.windows || []).filter(w => w.visible === true).length,
       hidden: (controls?.windows || []).filter(w => w.visible === false).length },
-    windowKinds: kinds, visibleWindows: [...visible],
+    windowKinds: kinds, visibleWindows: [...visible],edits:cleanEdits(controls?.edits),
     covers: count(controls?.covers?.length) };
 }
 function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
@@ -11901,7 +11931,7 @@ function cleanPage(page) {
   return {view:word(page.view,views),periods:Number.isSafeInteger(page.periods) && page.periods>=0 ? page.periods : null,
     windows:{open:count(page.windows?.open),hidden:count(page.windows?.hidden)},covers:count(page.covers),
     windowKinds:Object.fromEntries(Object.entries(page.windowKinds || {}).filter(([kind])=>windowKinds.has(kind) || kind==='unknown').map(([kind,n])=>[kind,count(n)])),
-    visibleWindows:[...new Set((page.visibleWindows || []).map(kind=>word(kind,windowKinds)))]};
+    visibleWindows:[...new Set((page.visibleWindows || []).map(kind=>word(kind,windowKinds)))],edits:cleanEdits(page.edits)};
 }
 function cleanEvent(event) {
   const safe = {time:Number.isFinite(event.time) && event.time>=0 ? event.time : null,step:stepName(event.step),type:word(event.type,types,'observation'),
@@ -11956,9 +11986,15 @@ function packFacts(input) {
     facts.set(name,[...(facts.get(name) || []),value]);
   }
   let current='';
-  for (const [name,values] of facts) for (const token of `${name}: ${values.join(' ')};`.split(' ')) {
-    if (current.length+token.length+(current?1:0)>100) { lines.push(current); current='More:'; }
-    current+=(current?' ':'')+token;
+  for (const [name,values] of facts) {
+    if (/^Edit [123]$/.test(name)) {
+      if (current) lines.push(current);
+      lines.push(`${name}: ${values.join(' ')}`); current=''; continue;
+    }
+    for (const token of `${name}: ${values.join(' ')};`.split(' ')) {
+      if (current.length+token.length+(current?1:0)>100) { lines.push(current); current='More:'; }
+      current+=(current?' ':'')+token;
+    }
   }
   if (current) lines.push(current);
   return lines;
@@ -11987,6 +12023,7 @@ function shortLiveReport(result) {
   line('View',page?.view); line('Periods',page?.periods);
   line('Windows',page ? `open ${page.windows?.open ?? 'unknown'}, hidden ${page.windows?.hidden ?? 'unknown'}` : 'unavailable');
   line('Window kinds',kinds(page)); line('Visible',visible(page)); line('Covers',page?.covers);
+  for (const [index,edit] of (page?.edits || []).entries()) line(`Edit ${index+1}`,`open ${edit.open}, shown ${edit.shown}, display ${edit.display}, rows ${edit.rows}, owned ${edit.owned}`);
   line('Writes',`${report.writes.attempted} attempted / ${report.writes.proved} proved`);
   line('Cleanup',report.cleanup);
   let rangeStart=lines.length;
