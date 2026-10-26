@@ -3370,10 +3370,9 @@ function readSite(doc = document) {
     !node.closest('#snooze-panel-host, #snooze-panel'));
   const tabs = present('[role="tab"], .nav-tabs a, .nav-tabs button').filter(shown);
   const has = text => tabs.some(node => valueKey(node.textContent) === text);
-  const taxLink = present('a').some(node => valueKey(node.textContent) === 'mysource tax resource center');
   const staff = has('staff'), professional = has('professional');
-  if (staff && taxLink && !professional) { sites.set(doc, 'tax'); return 'tax'; }
-  if (professional && !staff && !taxLink) { sites.set(doc, 'consulting'); return 'consulting'; }
+  if (staff && !professional) { sites.set(doc, 'tax'); return 'tax'; }
+  if (professional && !staff) { sites.set(doc, 'consulting'); return 'consulting'; }
   throw new PageError("Can't tell which MySource this is.");
 }
 __exports.isTaxPage = isTaxPage;
@@ -9419,9 +9418,9 @@ __exports.mountRestorePanel = mountRestorePanel;
 'use strict';
 const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { NOTE_STAGE_EXITS, isNoteStageRefusal } = __require("../mysource/note-stage.js");
-const { LIVE_TEST_PARTS, testPart, TAX_LIVE_STEPS, taxLiveReport } = __require("./live-proof.js");
+const { LIVE_TEST_PARTS, testPart, TAX_LIVE_STEPS, SMALL_LIVE_STEPS, taxLiveReport } = __require("./live-proof.js");
 const { runTaxLiveTest } = __require("./tax-live-test.js");
-const { runAuditLiveTest, AUDIT_LIVE_STEPS, auditLiveReport } = __require("./audit-live-test.js");
+const { runAuditLiveTest, runSmallConsultingTest, AUDIT_LIVE_STEPS, auditLiveReport } = __require("./audit-live-test.js");
 const { GROUP_TITLES, GROUP_PROOFS, runLiveGroups } = __require("./live-groups.js");
 const { addDays, compareDays, readIsoDay, dayFromParts, todayOf, usDate } = __require("../rules/dates.js");
 const { addressCount } = __require("../rules/prepare.js");
@@ -9451,6 +9450,7 @@ const LIVE_TEST_STEPS = {
   ...TAX_LIVE_STEPS,
   ...GROUP_TITLES,
   ...EXTENSION_STEPS,
+  ...SMALL_LIVE_STEPS,
   open: 'Open professional', empty: 'Check empty period', editable: 'Check editable dates',
   loaAdd: 'Add LOA', loaReplace: 'Replace LOA, hover and screenshot',
   loaDelete: 'Delete LOA', loaAlter: 'Change test entries before Restore', loaRestore: 'Restore LOA',
@@ -9502,9 +9502,10 @@ function liveTimingSummary(events) {
   const sum = rows => rows.every(row => row.seconds !== null) ? Math.round(rows.reduce((sum,row) => sum + row.seconds, 0) * 100) / 100 : null;
   return { waits, saves, waitSeconds: sum(waits), saveSeconds: sum(saves) };
 }
-async function runLiveTest({ email, week, length = 'year', through, version, today = todayOf(), onUpdate = () => {}, mode = 'consulting', assignPeriod = 'unknown' }, page) {
+async function runLiveTest({ email, week, length = 'year', through, version, today = todayOf(), onUpdate = () => {}, mode = 'consulting', assignPeriod = 'unknown', small = false }, page) {
+  if (small && mode !== 'tax') return runSmallConsultingTest({ email, version, today, onUpdate, assignPeriod }, page);
   if (mode === 'audit') return runAuditLiveTest({ email, version, today, onUpdate, assignPeriod }, page);
-  if (mode === 'tax') return runTaxLiveTest({ email, version, today, onUpdate, assignPeriod }, page);
+  if (mode === 'tax') return runTaxLiveTest({ email, version, today, onUpdate, assignPeriod, small }, page);
   const runStarted = Date.now();
   const window = testPeriod(week, length, today, through);
   if (!String(email || '').trim()) throw new Error('Enter the professional email.');
@@ -9677,16 +9678,19 @@ __exports.liveTestReport = liveTestReport;
 const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { addressCount } = __require("../rules/prepare.js");
 const { todayOf } = __require("../rules/dates.js");
-const { TAX_LIVE_STEPS, TAX_LIVE_FINDINGS, taxTestPeriod } = __require("./live-proof.js");
-async function runTaxLiveTest({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
+const { TAX_LIVE_STEPS, SMALL_TAX_STEPS, TAX_LIVE_FINDINGS, taxTestPeriod } = __require("./live-proof.js");
+async function runTaxLiveTest({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown', small = false }, page) {
   const window = taxTestPeriod(today);
   if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
-  const result = { kind: 'Snooze live test 1', mode: 'tax', version, length: 'month', design: 'tax8',
+  const result = { kind: 'Snooze live test 1', mode: 'tax', version, length: 'month', design: small ? 'tax5' : 'tax8',
     week: { start: '04/03/2028', end: '04/28/2028' }, state: 'running', cleanup: 'notNeeded', writes: 0,
-    steps: Object.keys(TAX_LIVE_STEPS).map(id => ({ id, state: 'notExercised', findings: [] })), events: [], pictures: [] };
+    steps: Object.keys(small ? SMALL_TAX_STEPS : TAX_LIVE_STEPS).map(id => ({ id, state: 'notExercised', findings: [] })), events: [], pictures: [] };
   const diagnostic = beginLiveDiagnostics(result, page, assignPeriod, today);
   const write = () => { result.writes++; };
-  const actions = [
+  const actions = small ? [
+    () => page.taxSmallStart(String(email).trim(), window), () => page.taxSmallAdd(write),
+    () => page.taxHours(write), () => page.taxPartial(write, { short: true }), () => page.taxClear(write), () => page.taxPast(write),
+  ] : [
     () => page.taxStart(String(email).trim(), window),
     () => page.taxFind(write), () => page.taxAdd(write), () => page.taxHoliday(write),
     () => page.taxHours(write), () => page.taxPartial(write), () => page.taxClear(write), () => page.taxPast(write),
@@ -9698,7 +9702,7 @@ async function runTaxLiveTest({ email, version, today = todayOf(), onUpdate = ()
         const value = await actions[index]();
         step.state = value?.notExercised ? 'notExercised' : 'passed';
         step.findings = (value?.findings || []).filter(word => TAX_LIVE_FINDINGS.has(word));
-      } catch (error) { diagnostic.fail(error, step.id); step.state = 'failed'; throw error; }
+      } catch (error) { diagnostic.fail(error, step.id); step.state = 'failed'; step.part = (small ? SMALL_TAX_STEPS : TAX_LIVE_STEPS)[step.id]; throw error; }
       onUpdate(result);
     }
     result.state = 'complete'; result.cleanup = 'empty';
@@ -9718,6 +9722,40 @@ __exports.runTaxLiveTest = runTaxLiveTest;
 const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { addressCount } = __require("../rules/prepare.js");
 const { compareDays, todayOf, usDate } = __require("../rules/dates.js");
+const { SMALL_LIVE_STEPS } = __require("./live-proof.js");
+async function runSmallConsultingTest({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
+  const window = auditTestPeriod(today);
+  if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
+  const result = { kind: 'Snooze live test 1', mode: 'consulting', version, design: 'small7', length: 'twoWeeks',
+    expectedSteps: 7, week: { start: usDate(window.start), end: usDate(window.end) },
+    state: 'running', cleanup: 'notNeeded', writes: 0, steps: Object.keys(SMALL_LIVE_STEPS).map(id => ({ id, state: 'notExercised' })),
+    events: [], pictures: [], outstanding: [] };
+  const diagnostic = beginLiveDiagnostics(result, page, assignPeriod, today);
+  const write = () => { result.writes++; };
+  const actions = [() => page.smallStart(String(email).trim(), window), () => page.smallAdd(write),
+    () => page.smallChange(write), () => page.smallDelete(write),
+    async () => { result.pictures.push(...await page.smallPicture()); },
+    () => page.smallUndo(write), () => page.auditClear(write)];
+  let release;
+  try {
+    release = await page.begin(result.events);
+    for (let index = 0; index < actions.length; index++) {
+      const step = result.steps[index]; step.state = 'running'; page.setStep?.(step.id); onUpdate(result);
+      try { Object.assign(step, await actions[index]()); step.state = 'passed'; }
+      catch (error) { step.state = 'failed'; step.part = SMALL_LIVE_STEPS[step.id]; diagnostic.fail(error, step.id); throw error; }
+      finally { page.finishStep?.(); onUpdate(result); }
+    }
+    result.state = 'complete'; result.cleanup = 'empty';
+  } catch (error) {
+    if (!result.diagnostic.stop) diagnostic.fail(error, result.steps.find(s => s.state === 'running')?.id || 'smallOpen');
+    result.state = 'failed'; diagnostic.cleanup();
+    try { result.cleanup = await page.auditCleanup(write, error); }
+    catch (cleanupError) { diagnostic.fail(cleanupError, 'recovery'); result.cleanup = 'unconfirmed'; }
+  } finally {
+    result.outstanding = page.auditOutstanding(result.cleanup); release?.(); diagnostic.finish(); onUpdate(result);
+  }
+  return result;
+}
 const AUDIT_LIVE_STEPS = {
   aaSetup: 'A&A · Setup LOA and DNS; read back',
   aaExit: 'A&A · Exit; delete ranges exclude Wednesday',
@@ -9772,6 +9810,7 @@ function auditLiveReport(result) {
     steps: result.steps.map(step => ({ ...step, verdict: step.state === 'passed' ? 'PASS' : step.state === 'failed' ? 'FAIL' : 'Not exercised' })),
     events: result.events, pictures: result.pictures, outstanding: result.outstanding }, null, 2);
 }
+__exports.runSmallConsultingTest = runSmallConsultingTest;
 __exports.AUDIT_LIVE_STEPS = AUDIT_LIVE_STEPS;
 __exports.auditTestPeriod = auditTestPeriod;
 __exports.runAuditLiveTest = runAuditLiveTest;
@@ -10046,6 +10085,16 @@ const LIVE_TEST_PARTS = new Set(['Saved rows failed.', 'Retained rows failed.', 
 async function testPart(part, action) {
   try { return await action(); } catch (error) { if (!LIVE_TEST_PARTS.has(error.livePart)) error.livePart = part; throw error; }
 }
+const SMALL_LIVE_STEPS = {
+  smallOpen: 'Open and read', smallAdd: 'Add LOA, DNS and blank-note A&A DNS',
+  smallChange: 'Replace, combined Edit Submit and Cancel', smallDelete: 'Delete around a kept DNS day',
+  smallPicture: 'Hover picture and plain A&A picture', smallUndo: 'Undo from the backup', cleanup: 'Clear and check empty',
+};
+const SMALL_TAX_STEPS = {
+  taxEmpty: 'Open, read and check empty month', taxAdd: 'Add LOA, DNS, Holiday and Replace',
+  taxHours: 'Lower and restore saved Hours', taxPartial: 'Partial-week apply and Undo',
+  taxClear: 'Clear and check empty month', taxPast: 'Optional: restore this week’s past Monday',
+};
 const TAX_LIVE_STEPS = {
   taxEmpty: 'Check empty month and weekly view',
   taxFind: 'Find one day and a whole week',
@@ -10075,7 +10124,7 @@ function taxLiveReport(result) {
   return JSON.stringify({ kind: 'Snooze Tax live test', period: 'April 2028',
     state: result.state === 'complete' ? 'PASS' : 'FAIL',
     cleanup: ['empty', 'notNeeded', 'unconfirmed'].includes(result.cleanup) ? result.cleanup : 'unconfirmed',
-    steps: Object.entries(TAX_LIVE_STEPS).map(([id, title], index) => {
+    steps: Object.entries(result.design === 'tax5' ? SMALL_TAX_STEPS : TAX_LIVE_STEPS).map(([id, title], index) => {
       const step = result.steps?.find(step => step.id === id);
       return { step: index + 1, title, result: states[step?.state] || 'not exercised',
         findings: (step?.findings || []).filter(word => TAX_LIVE_FINDINGS.has(word)) };
@@ -10083,6 +10132,8 @@ function taxLiveReport(result) {
 }
 __exports.LIVE_TEST_PARTS = LIVE_TEST_PARTS;
 __exports.testPart = testPart;
+__exports.SMALL_LIVE_STEPS = SMALL_LIVE_STEPS;
+__exports.SMALL_TAX_STEPS = SMALL_TAX_STEPS;
 __exports.TAX_LIVE_STEPS = TAX_LIVE_STEPS;
 __exports.TAX_LIVE_FINDINGS = TAX_LIVE_FINDINGS;
 __exports.taxTestPeriod = taxTestPeriod;
@@ -10099,7 +10150,7 @@ const { sessionExpired, cancelBatchWindows } = __require("./batch.js");
 const { copyWindow, compareCopies, dayOf, entriesToAdd, knownAssignmentRows } = __require("./copy.js");
 const { createEditability } = __require("./editability.js");
 const { calendarDates, showDate } = __require("./calendar.js");
-const { addAssignment, deleteAll, preflightDates, setAssignmentHours, splitDeleteWeeks } = __require("./write.js");
+const { addAssignment, deleteAll, deleteRange, refreshNotes, preflightDates, setAssignmentHours, splitDeleteWeeks } = __require("./write.js");
 const { restoreWindow } = __require("./restore.js");
 const { addDays, compareDays, mondayOf, todayOf, usDate, workingDays } = __require("../rules/dates.js");
 const { readSite, isTaxPage } = __require("./site.js");
@@ -10220,9 +10271,10 @@ function liveTestPage(options = {}) {
   }
   return page;
 }
-function createLiveTestPage({ today = todayOf(), mode = 'consulting' } = {}) {
+function createLiveTestPage({ today = todayOf(), mode = 'consulting', small = false } = {}) {
   if (mode === 'audit') return auditLivePage(today);
   if (mode === 'tax') return taxLivePage(today);
+  if (small) return auditLivePage(today);
   let identity = null, scope = null, observations = null, owningStep = null, verifiedOwnership = null, pendingSave = null;
   let openedEmail = null, liveGuardRelease = null;
   const check = probe => {
@@ -10533,6 +10585,20 @@ function taxLivePage(today) {
       if (seed.days.length !== 1 || !matches(seed, monday) || wednesday.days.length || !matches(seed, week)) throw new PageError('Single-day Tax Find could not be proved.');
       return { findings: ['One-day Find: Monday seed only.', 'Wednesday Find: empty.', 'Whole-week Find: Monday seed only.'] };
     },
+    async taxSmallStart(typedEmail, window) {
+      await this.taxStart(typedEmail, window);
+      if ((await read({ start: day(3), end: day(7) })).days.length) throw new PageError('The Tax week is not empty.');
+      return {};
+    },
+    async taxSmallAdd(write) {
+      await add(LOA, day(24), day(28), 40, 'Normal', fixedNote, write);
+      await add(DNS, day(3), day(7), 40, 'Normal', fixedNote, write);
+      seedIds = known.days.filter(row => row.client === DNS).map(row => row.id);
+      await add(HOLIDAY, day(18), day(18), 8, 'Normal', '', write);
+      await add(LOA, day(17), day(21), 32, 'Replace', '', write);
+      if (known.days.some(row => row.client === HOLIDAY)) throw new PageError('Tax Replace did not clear Holiday.');
+      return { findings: ['Weekly Add: hours on Monday.', 'Replace cleared Holiday.'] };
+    },
     async taxAdd(write) {
       await add(LOA, day(24), day(28), 40, 'Normal', fixedNote, write);
       await add(LOA, day(26), day(26), 24, 'Normal', fixedNote, write);
@@ -10554,12 +10620,12 @@ function taxLivePage(today) {
       target = known.days.find(row => row.id === id); await hours(target, 40, write);
       return { findings: ['Hours lowered and restored; note count unchanged.'] };
     },
-    async taxPartial(write) {
+    async taxPartial(write, { short = false } = {}) {
       await assertKnown(); const checkpoint = known;
-      const plan = { action: 'add', loaStart: day(5), loaEnd: day(19), notes: fixedNote };
+      const plan = { action: 'add', loaStart: day(5), loaEnd: day(short ? 7 : 19), notes: fixedNote };
       const taxPlan = planTaxWeeks({ plan, today, rows: checkpoint.days.map(row => ({ ...row,
         ...(seedIds.includes(row.id) && row.client === DNS ? { kind: 'client' } : {}) })) });
-      if (taxPlan.outcome !== 'report' || taxPlan.weeks.flatMap(week => week.lowerClients).length !== 2) throw new PageError('The Tax diagnostic stand-ins were not exercised.');
+      if (taxPlan.outcome !== 'report' || taxPlan.weeks.flatMap(week => week.lowerClients).length !== (short ? 1 : 2)) throw new PageError('The Tax diagnostic stand-ins were not exercised.');
       const backup = { kind: BACKUP_KIND, diagnostic: true, site: 'tax', email, professional: identity.name.split('(')[0].trim(),
         window: scope, watchedWindow: scope, today, reportEnd: scope.end, days: checkpoint.days.map(row => ({ ...row, notes: 0 })),
         plan: { action: 'add', loaStart: plan.loaStart, loaEnd: plan.loaEnd },
@@ -10572,7 +10638,7 @@ function taxLivePage(today) {
       if (restorePlan.skippedLater.length || restorePlan.skippedLocked.length || restorePlan.skippedUnconfirmed.length) throw new PageError('The normal Tax Undo was refused.');
       const restored = await sequence(statesForRestore(known, restorePlan), notice => restoreWindow(backup, { today, identity, after: applied.after, onWrite: notice }), write);
       if (!restored.same || !matches({ days: checkpoint.days.map(row => row.client === LOA && inside(row.day, { start: plan.loaStart, end: plan.loaEnd }) || row.client === HOLIDAY ? { ...row, id: '' } : row) }, known)) throw new PageError('The Tax month did not match its checkpoint after Undo.');
-      return { findings: ['DNS stand-in lowered in both partial weeks.', 'Normal Tax apply and Undo checked.'] };
+      return { findings: [...(short ? [] : ['DNS stand-in lowered in both partial weeks.']), 'Normal Tax apply and Undo checked.'] };
     },
     async taxClear(write) { await clear(write); if (known.days.length) throw new PageError('Tax month cleanup unconfirmed.'); return { findings: ['Month empty and checked.'] }; },
     async taxPast(write) {
@@ -10725,6 +10791,12 @@ function auditLivePage(today) {
     const row = copy.days.filter(row => sameDay(row.day, wednesday));
     if (row.length !== 1 || !matches({ days: [kept] }, { days: row })) throw new PageError('Wednesday DNS changed.');
   };
+  const smallNote = 'Snooze small live test';
+  let smallCheckpoint = null, smallKept = null;
+  const smallKeep = () => {
+    const row = known.days.find(row => row.id === smallKept?.id);
+    if (!row || !matches({ days: [smallKept] }, { days: [row] })) throw new PageError('The kept DNS day changed.');
+  };
   return {
     diagnosticState: liveDiagnosticState,
     observe: liveControlState,
@@ -10741,6 +10813,98 @@ function auditLivePage(today) {
       return () => { stop(); release?.(); release = null; };
     },
     setStep(id) { step = id; },
+    async smallStart(typedEmail, window) {
+      await this.auditStart(typedEmail, window);
+      return {};
+    },
+    async smallAdd(write) {
+      const week = { start: scope.start, end: addDays(scope.start, 4) };
+      const next = { start: addDays(scope.start, 7), end: scope.end };
+      await add(LOA, week, 8, smallNote, write);
+      await add(DNS, next, 8, smallNote, write);
+      await add(DNS, { start: wednesday, end: wednesday }, 8, '', write);
+      smallCheckpoint = await assertKnown();
+      smallKept = known.days.find(row => sameDay(row.day, addDays(scope.start, 9)) && row.client === DNS);
+      if (!smallKept?.id || smallKept.notes !== 1) throw new PageError('The kept DNS checkpoint is unreadable.');
+      return { blankNotesAccepted: true };
+    },
+    async smallChange(write) {
+      await assertKnown();
+      const replace = { start: addDays(scope.start, 3), end: addDays(scope.start, 4), client: DNS,
+        hoursPerDay: 8, notes: smallNote, billable: 'Non-Billable', utilization: 'No' };
+      await sequence([{ range: replace, after: before => [...before.filter(row => !inside(row.day, replace)), ...entryRows(replace)] }],
+        notice => addAssignment(replace, 'Replace', { onWrite: notice }), write);
+      const query = { start: scope.start, end: wednesday, clients: [LOA] };
+      const rows = known.days.filter(row => row.client === LOA && inside(row.day, query));
+      const remove = rows.filter(row => sameDay(row.day, wednesday));
+      if (rows.length !== 3 || remove.length !== 1) throw new PageError('The combined reduction checkpoint is unreadable.');
+      await sequence([{ range: query, after: before => before.filter(row => !remove.some(old => old.id === row.id)) }],
+        notice => refreshNotes(query, { days: rows }, smallNote + ' refreshed', { remove, onWrite: notice }), write);
+      await assertKnown();
+      const cancelQuery = { start: scope.start, end: addDays(scope.start, 1), clients: [LOA] };
+      const cancelRows = known.days.filter(row => row.client === LOA && inside(row.day, cancelQuery));
+      const staged = await stageNotes(cancelQuery, { days: cancelRows }, 'Snooze small discarded note', { remove: cancelRows.slice(1) });
+      if (!staged) throw new PageError('The Cancel stage could not be proved.');
+      const cancels = [...staged.edit.querySelectorAll('button')].filter(node => shown(node) && text(node) === 'Cancel' && !node.disabled);
+      if (cancels.length !== 1) throw new PageError('The staged Cancel button is unclear.');
+      await click(cancels[0]);
+      await waitFor(() => !staged.edit.isConnected || !shown(staged.edit), 'the staged Cancel to close', WAIT.window);
+      await assertKnown(); smallKeep(); return { combinedReduction: true, cancelUnchanged: true };
+    },
+    async smallDelete(write) {
+      await assertKnown(); smallKeep();
+      const ranges = [{ start: scope.start, end: addDays(smallKept.day, -1) }, { start: addDays(smallKept.day, 1), end: scope.end }];
+      let weekBoxes = false;
+      for (const range of ranges) {
+        await sequence([deleteOp(range)], notice => deleteRange(range, known, {
+          read, protectedRows: [smallKept], validate: async () => { check(); },
+          onWrite: async () => {
+            weekBoxes ||= [...document.querySelectorAll('#editEventGridModal')].some(edit => findAssignmentsRange(edit)?.weekBoxes);
+            await notice();
+          },
+        }), write);
+        smallKeep();
+      }
+      if (known.days.length !== 1) throw new PageError('The delete left unexpected rows.');
+      return { keptId: true, keptNotes: true, partWeek: weekBoxes };
+    },
+    async smallPicture() {
+      await assertKnown(); smallKeep();
+      const pictures = createLivePictures({ today, scope: () => scope, identity: () => identity, email: () => email,
+        bounded: async range => bounded(range), checked: async () => check(), assertSame: async expected => {
+          if (!matches(expected, await read())) throw new PageError('The picture checkpoint changed.');
+        } });
+      const hover = await pictures.diagnosticPicture(DNS, known, smallNote);
+      const one = { record: { email, person: { professional: identity.name.split('(')[0].trim() }, subcategory: { business: 'audit' } },
+        decision: { plan: { action: 'dns', dnsStart: scope.start, dnsEnd: scope.end, withoutNotes: true } } };
+      const row = { state: 'done', one, prepared: { identity }, after: known, diagnostic: { steps: [], paint: [] } };
+      try {
+        await capturePerson(row, { alreadyOpen: true, identity }); check(); await assertKnown();
+        const shots = one.outputs?.screenshots || [];
+        if (!shots.length || one.outputs.warnings || lastPicture.notesPainted || row.diagnostic.paint.length) throw new PageError('The plain A&A picture was not proved.');
+        return [{ kind: 'dns', ...hover }, { kind: 'audit', views: shots.length,
+          bytes: shots.reduce((sum, blob) => sum + blob.size, 0), notesPainted: false, omissions: [] }];
+      } finally { if (one.outputs) one.outputs.screenshots = []; }
+    },
+    async smallUndo(write) {
+      await assertKnown(); smallKeep();
+      const ranges = [{ start: scope.start, end: addDays(smallKept.day, -1) }, { start: addDays(smallKept.day, 1), end: scope.end }];
+      const missing = smallCheckpoint.days.filter(row => row.id !== smallKept.id);
+      const exactEntries = ranges.flatMap(range => entriesToAdd({ days: missing.filter(row => inside(row.day, range)) }, { exact: true }).entries);
+      const capability = await preflightDates(missing.map(row => row.day), { anchor: scope.start, entries: exactEntries });
+      const operations = ranges.flatMap(range => entriesToAdd({ days: missing.filter(row => inside(row.day, range)) }, { exact: capability.exact }).entries.map(addOp));
+      const backup = { kind: BACKUP_KIND, diagnostic: true, email, professional: identity.name.split('(')[0].trim(),
+        window: scope, days: smallCheckpoint.days, plan: { action: 'add' } };
+      const after = known;
+      const restored = await sequence(operations, notice => restoreWindow(backup, { today, identity, after,
+        verifyBefore: async actual => {
+          bounded(actual.window); const expected = pending?.after || known;
+          if (!matches({ days: expected.days.filter(row => inside(row.day, actual.window)) }, actual)) throw new PageError('The small Undo table changed.');
+        }, onWrite: notice }), write);
+      const expected = { days: smallCheckpoint.days.map(row => row.id === smallKept.id ? row : { ...row, id: '', notes: 0 }) };
+      if (!restored.same || restored.skippedLater?.length || !matches(expected, known)) throw new PageError('The small backup was not restored.');
+      smallKeep(); return { backupRestored: true };
+    },
     async auditStart(typedEmail, window) {
       if (scope || !String(typedEmail || '').trim() || addressCount(typedEmail) > 1) throw new PageError('Enter one test professional.');
       if (!sameDay(window.start, allowed.start) || !sameDay(window.end, allowed.end)) throw new PageError('Outside the approved A&A period.');
@@ -10840,6 +11004,7 @@ function auditLivePage(today) {
 }
 __exports.liveDiagnosticState = liveDiagnosticState;
 __exports.liveControlState = liveControlState;
+__exports.ownedDeleteEdit = ownedDeleteEdit;
 __exports.liveTestPage = liveTestPage;
 },
 "mysource/live-groups.js": function (__require, __exports, document, window) {
@@ -11537,21 +11702,25 @@ const { newBatchPopup } = __require("./batch-panel.js");
 const { batchCover } = __require("../mysource/batch.js");
 const { liveTestPage } = __require("../mysource/live-test.js");
 const { renderPhotoReport, fitPhotoReport } = __require("./live-test-report.js");
-const { runLiveTest, liveTestReport, liveStepTitle, LIVE_TEST_PROBLEMS, testPeriod, liveRefusalReason } = __require("../run/live-test.js");
+const { runLiveTest, liveStepTitle, LIVE_TEST_PROBLEMS, liveRefusalReason } = __require("../run/live-test.js");
 const { taxTestPeriod } = __require("../run/live-proof.js");
 const { auditTestPeriod } = __require("../run/audit-live-test.js");
 const { readSite } = __require("../mysource/site.js");
 const { todayOf } = __require("../rules/dates.js");
 function liveTestButton(work, body, onBack) {
+  let site = null;
+  try { site = readSite(); } catch {   }
+  const notice = el('div', { class: 'restore-warning', role: 'status' });
   const button = el('button', { disabled: !!work.busy, onclick: () => {
     if (!work.busy) {
-      let mode = 'consulting';
-      try { if (readSite() === 'tax') mode = 'tax'; } catch {   }
-      mountLiveTestPanel(work, body, onBack, { mode });
+      try { site = readSite(); }
+      catch { notice.textContent = "Can't tell which MySource this is."; return; }
+      mountLiveTestPanel(work, body, onBack, { mode: site });
     }
-  } }, '→ Live test · 2028');
+  } }, site ? `Live test · ${site === 'tax' ? 'Tax' : 'Consulting'}` : 'Live test');
+  if (!site) notice.textContent = "Can't tell which MySource this is.";
   work.listeners?.add(() => { button.disabled = !!work.busy; });
-  return el('div', { class: 'live-test-entry' }, button);
+  return el('div', { class: 'live-test-entry' }, button, notice);
 }
 function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run = runLiveTest, save = saveFile } = {}) {
   if (work.busy) return;
@@ -11577,33 +11746,30 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     await saving;
     if (work.liveTest === live && live) live.saved = true;
   }
-  async function start(part = mode) {
+  async function start() {
     if (active || work.busy || result) return;
-    try { if (part === 'tax') taxTestPeriod(todayOf()); else if (part === 'audit') auditTestPeriod(todayOf()); else testPeriod(undefined, 'year', undefined, '2028-10-11'); if (!email.value.trim() || !email.checkValidity()) throw new Error('Enter a valid professional email.'); }
+    try { if (mode === 'tax') taxTestPeriod(todayOf()); else auditTestPeriod(todayOf()); if (!email.value.trim() || !email.checkValidity()) throw new Error('Enter a valid professional email.'); }
     catch (error) { notice = error.message; draw(); return; }
-    mode = part;
-    if (mode === 'audit') work.setScreenTitle?.('A&A live test · 2028');
     active = work.busy = true; notice = ''; work.host.dataset.batchReserved = 'true';
     work.liveTest = { active: true, changed: false, saved: false };
     const release = batchCover(work.host, work.host);
     let timer;
     try {
-      result = await run({ email: email.value.trim(), ...(mode === 'tax' ? { mode: 'tax', length: 'month' } : mode === 'audit' ? { mode: 'audit' } : { length: 'year', through: '2028-10-11' }), version: work.version, assignPeriod: reportAssignPeriod(work.staffReport, email.value.trim()), extended: true, onUpdate: value => {
+      result = await run({ email: email.value.trim(), mode, small: true, length: mode === 'tax' ? 'month' : 'twoWeeks', version: work.version, assignPeriod: reportAssignPeriod(work.staffReport, email.value.trim()), extended: true, onUpdate: value => {
         result = value; slow = false; clearTimeout(timer);
         work.liveTest.changed ||= value.writes > 0;
         if (value.steps.at(-1)?.state === 'running') timer = setTimeout(() => { slow = true; draw(); }, 15000);
         draw();
-      } }, page || liveTestPage({ mode }));
+      } }, page || liveTestPage({ mode, small: true }));
     } catch {
       notice = 'The live test could not start. No test result was confirmed.';
     } finally {
       clearTimeout(timer); release(); active = work.busy = false; slow = false;
       work.liveTest.active = false; work.liveTest.result = !!result; work.liveTest.changed ||= result?.writes > 0;
-      delete work.host.dataset.batchReserved; photo = !!result && mode === 'consulting'; draw(); for (const listener of work.listeners) listener();
+      delete work.host.dataset.batchReserved; photo = !!result && (mode === 'consulting' || result.design === 'tax5'); draw(); for (const listener of work.listeners) listener();
     }
   }
   const go = el('button', { class: 'green', onclick: () => start() }, 'Run live test');
-  const auditGo = el('button', { class: 'green', onclick: () => start('audit') }, 'Run A&A live test');
   const downloadButton = el('button', { class: 'blue', onclick: () => download().catch(() => {
     notice = 'Download did not finish. Try Download report again.'; draw();
   }) }, 'Download report');
@@ -11616,21 +11782,24 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     if (panel) panel.style.width = photo ? 'min(1280px, calc(100vw - 32px))' : originalWidth;
     box.style.overflow = photo ? 'auto' : '';
     box.replaceChildren(); email.disabled = active || !!result;
-    back.disabled = active; go.disabled = active || !!result; auditGo.disabled = active || !!result; downloadButton.disabled = active; logButton.disabled = active;
+    back.disabled = active; go.disabled = active || !!result; downloadButton.disabled = active; logButton.disabled = active;
     if (photo && result && !active) {
-      const report = renderPhotoReport(result);
+      const small = ['small7','tax5'].includes(result.design) || !Array.isArray(result.events);
+      const report = small ? el('div', { role: 'region', 'aria-label': 'Photo report' },
+        el('pre', { style: 'font:13px/1.35 Consolas,monospace;white-space:pre;margin:0' }, shortLiveReport(result))) : renderPhotoReport(result);
       box.append(report);
       if (notice) box.append(el('div', { class: 'restore-warning', role: 'status' }, notice));
       box.append(el('div', { class: 'restore-footer' }, el('div', { class: 'buttons' }, back, downloadButton, logButton)));
-      fitPhotoReport(report);
-      window.requestAnimationFrame?.(() => { if (report.isConnected) fitPhotoReport(report); });
+      if (!small) {
+        fitPhotoReport(report);
+        window.requestAnimationFrame?.(() => { if (report.isConnected) fitPhotoReport(report); });
+      }
       return;
     }
     if (!result) {
       box.append(el('label', { class: 'sign-off' }, 'Professional email', email),
-        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'April 2028 · four Monday–Friday weeks' : 'January 3 – October 11, 2028 · 203 working days'),
-        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'Checks an empty month with LOA, DNS, Holiday and Undo, then clears its entries. Separately lowers and restores this week’s past Monday only when exactly one eligible entry is present.' : 'Run live test checks the whole period is empty, tests LOA, DNS and Restore, then clears the test entries.'));
-      if (mode === 'consulting') box.append(el('div', { class: 'restore-notice' }, 'A&A · July 3–14, 2028. Separately checks an empty span, retained Wednesday DNS, blank Notes, a plain screenshot and Undo, then clears its test entries.'));
+        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'April 2028 · four Monday–Friday weeks' : 'July 3–14, 2028 · two Monday–Friday weeks'),
+        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'Checks an empty month with LOA, DNS, Holiday and Undo, then clears its entries. Separately lowers and restores this week’s past Monday only when exactly one eligible entry is present.' : 'One Consulting and A&A test: open and read, Add, Change, Delete, Picture, Undo and Clear. Run once with a Weekly person and once with a Time person.'));
     } else {
       box.append(el('div', { class: 'restore-top' }, el('strong', {}, (active ? 'Testing…' : result.state === 'complete' ? 'Tests complete' : 'Test stopped'))),
         el('div', { class: 'restore-notice' }, `${result.week.start} – ${result.week.end}`));
@@ -11655,12 +11824,11 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     }
     if (notice) box.append(el('div', { class: 'restore-warning', role: 'status' }, notice));
     const buttons = el('div', { class: 'buttons' }, back, mode !== 'consulting' && result && !active ? downloadButton : go);
-    if (mode === 'consulting' && !result) buttons.append(auditGo);
     if (mode !== 'consulting' && result && !active) buttons.append(logButton);
     box.append(el('div', { class: 'restore-footer' }, buttons));
   }
   draw();
-  return { email, go, auditGo, download: downloadButton, downloadLog: logButton, get result() { return result; } };
+  return { email, go, download: downloadButton, downloadLog: logButton, get result() { return result; } };
 }
 __exports.liveTestButton = liveTestButton;
 __exports.mountLiveTestPanel = mountLiveTestPanel;
@@ -11827,10 +11995,11 @@ __exports.errorReason = errorReason;
 },
 "run/live-diagnostics.js": function (__require, __exports, document, window) {
 'use strict';
+const { SMALL_LIVE_STEPS, SMALL_TAX_STEPS } = __require("./live-proof.js");
 const { observeRun, recordRun, STAGES, WINDOWS, FIELDS, WAIT_NAMES, REASON_CODES, reasonCode } = __require("../core/run-records.js");
 const { REASON_NAMES, errorReason } = __require("../core/reason-names.js");
 const { dayFromParts, mondayOf, weekday, usDate } = __require("../rules/dates.js");
-const steps = new Set('aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
+const steps = new Set('smallOpen smallAdd smallChange smallDelete smallPicture smallUndo aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
 const word = (value, allowed, fallback = 'unknown') => allowed.has(value) ? value : fallback;
 const count = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
 const stages = new Set([...STAGES, 'move calendar']);
@@ -12015,6 +12184,11 @@ function shortLiveReport(result) {
   const visible = page => page?.visibleWindows?.length ? page.visibleWindows : ['none'];
   const state = page => !page || page.unavailable ? 'unavailable' : `${page.view}; periods ${page.periods ?? 'unknown'}; open ${page.windows.open}; hidden ${page.windows.hidden}; covers ${page.covers}`;
   line('Verdict', `${report.verdict}; version ${report.version}`);
+  const smallSteps = result.design === 'small7' ? SMALL_LIVE_STEPS : result.design === 'tax5' ? SMALL_TAX_STEPS : null;
+  if (smallSteps) for (const [index, [id, title]] of Object.entries(smallSteps).entries()) {
+    const step = result.steps?.find(step => step.id === id);
+    line(`Step ${index + 1}`, `${title}: ${step?.state === 'passed' ? 'PASS' : step?.state === 'failed' ? 'FAIL' : 'not exercised'}`);
+  }
   line('Failed step',stop ? `${stop.step}${stop.time==null?'':` at ${stop.time} s`}` : 'none'); line('Code',stop?.code || 'none'); line('Reason',stop?.reasonName || 'none');
   line('Last action',stop?.lastAction || 'none'); line('Stage',stop?.stage || 'none');
   line('Assign Period',report.assignPeriod);
@@ -12025,7 +12199,7 @@ function shortLiveReport(result) {
   line('Window kinds',kinds(page)); line('Visible',visible(page)); line('Covers',page?.covers);
   for (const [index,edit] of (page?.edits || []).entries()) line(`Edit ${index+1}`,`open ${edit.open}, shown ${edit.shown}, display ${edit.display}, rows ${edit.rows}, owned ${edit.owned}`);
   line('Writes',`${report.writes.attempted} attempted / ${report.writes.proved} proved`);
-  line('Cleanup',report.cleanup);
+  line('Cleanup',smallSteps && report.cleanup === 'unconfirmed' ? 'UNCONFIRMED' : report.cleanup);
   let rangeStart=lines.length;
   line('Unconfirmed',report.unconfirmed.length ? report.unconfirmed : report.unconfirmedSpan ? `${report.unconfirmedSpan.start}-${report.unconfirmedSpan.end}` : 'none');
   const rangeEnd=lines.length;
