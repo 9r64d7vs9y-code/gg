@@ -1,39 +1,33 @@
 /*
- * Snooze Tax identity probe — read-only. Run on Tax MySource, Schedule, Staff
- * tab, with the test person's schedule open by hand (week view).
- * Clicks nothing, saves nothing, sends nothing. Prints only whether the
- * person's id marks and links exist and agree, never an id, name or link.
- * Copy the lines it prints.
+ * Snooze Tax identity probe 2 — read-only. Same place as probe 1: Tax
+ * MySource, Schedule, Staff tab, the test person's schedule open by hand.
+ * Clicks nothing, saves nothing, sends nothing. Prints only yes/no and counts,
+ * never an id, name or link. Copy the lines it prints.
  */
 (() => {
   const out = [];
   const wrapper = document.querySelector('.staff-calendar-wrapper');
   if (!wrapper) { console.log('no .staff-calendar-wrapper'); return; }
-  const desc = node => `${node.tagName.toLowerCase()}${[...node.classList].map(c => '.' + c).join('')}`;
   const shown = node => !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
-  const grid = node => node.closest('.fc-view-container, .fc-toolbar');
-  // Snooze's identity check: one data-entity-id in the wrapper, matched by a link button.
-  const marks = [wrapper, ...wrapper.querySelectorAll('*')].filter(node => node.hasAttribute('data-entity-id'));
-  out.push(`data-entity-id in wrapper: ${marks.length}`);
-  marks.slice(0, 5).forEach(node => out.push(`  on ${desc(node)} digitsOnly=${/^\d+$/.test(node.getAttribute('data-entity-id') || '')}`));
-  const id = marks.length === 1 ? marks[0].getAttribute('data-entity-id') : null;
-  const buttons = [...wrapper.querySelectorAll('a.btn[href]')].filter(shown);
-  const forecast = buttons.filter(link => link.getAttribute('aria-label') === 'Forecast View');
-  out.push(`shown a.btn links: ${buttons.length}, Forecast View: ${forecast.length}`);
-  const hrefs = (forecast.length ? forecast : buttons).map(link => link.getAttribute('href') || '').filter(href => /\d/.test(href));
-  out.push(`links with digits: ${hrefs.length}`);
-  if (id && /^\d+$/.test(id)) out.push(`a link carries the id: ${hrefs.some(href => new RegExp(`(?:^|\\D)${id}(?:\\D|$)`).test(href))}`);
-  // Other places a person id might sit: attribute names only, outside the grid.
-  const seen = new Map();
-  [wrapper, ...wrapper.querySelectorAll('*')].filter(node => !grid(node)).forEach(node => {
-    for (const attr of node.attributes) {
-      if (/^(class|style|title|aria-|role)/.test(attr.name)) continue;
-      if (!/\d/.test(attr.value)) continue;
-      const key = `${desc(node)} [${attr.name}]${attr.name === 'href' ? '' : ` digitsOnly=${/^\d+$/.test(attr.value)}`}`;
-      seen.set(key, (seen.get(key) || 0) + 1);
-    }
-  });
-  out.push(`attributes with digits outside the calendar grid: ${seen.size}`);
-  [...seen].slice(0, 25).forEach(([key, count]) => out.push(`  ${key} x${count}`));
+  const has = (text, id) => new RegExp(`(?:^|\\D)${id}(?:\\D|$)`).test(text || '');
+  const marks = [...wrapper.querySelectorAll('[data-entity-id]')];
+  const ids = marks.map(node => node.getAttribute('data-entity-id'));
+  out.push(`id marks: ${marks.length}, shown: ${marks.filter(shown).length}, all the same id: ${new Set(ids).size === 1}`);
+  marks.forEach((node, i) => out.push(`  mark ${i + 1}: shown=${shown(node)} inside .fc=${!!node.closest('.fc')} inside #controlCalendar_staff=${!!node.closest('#controlCalendar_staff')} same row as the name link=${!!node.parentElement?.querySelector(':scope > span > a')}`));
+  const id = ids[0];
+  if (!id) { console.log(out.join('\n')); return; }
+  // The name link and list icon in the header row, and the two calendars' record ids.
+  const close = [...wrapper.querySelectorAll('a')].find(a => a.querySelector('i.fa-times') && shown(a));
+  const row = close?.parentElement;
+  const nameLink = row?.querySelector(':scope > span > a');
+  const listIcon = row?.querySelector(':scope > a.schedule-icon');
+  out.push(`name link found: ${!!nameLink}, its link carries the id: ${has(nameLink?.getAttribute('href'), id)}`);
+  out.push(`list icon found: ${!!listIcon}, its link carries the id: ${has(listIcon?.getAttribute('href'), id)}`);
+  out.push(`shown id mark in the name row: ${!!row && [...row.querySelectorAll('[data-entity-id]')].filter(shown).length}`);
+  const calendars = [...wrapper.querySelectorAll('[data-record-id]')];
+  calendars.forEach((node, i) => out.push(`  calendar ${i + 1}: shown=${shown(node)} size=${node.offsetWidth}x${node.offsetHeight} record id equals the id: ${node.getAttribute('data-record-id') === id}`));
+  // Does the id appear anywhere else on the page, outside this person's schedule?
+  const elsewhere = [...document.querySelectorAll('[data-entity-id]')].filter(node => !wrapper.contains(node));
+  out.push(`id marks outside the schedule: ${elsewhere.length}, with the same id: ${elsewhere.filter(node => node.getAttribute('data-entity-id') === id).length}`);
   console.log(out.join('\n'));
 })();
