@@ -1,27 +1,39 @@
 /*
- * Snooze Tax name probe — read-only. Run on Tax MySource, Schedule, Staff tab,
- * with the test person's schedule open by hand (week view).
- * Clicks nothing, saves nothing, sends nothing. Prints only how the line with
- * the person's name is built (tags, classes, ids, text lengths), never the
- * name itself. Copy the lines it prints.
+ * Snooze Tax identity probe — read-only. Run on Tax MySource, Schedule, Staff
+ * tab, with the test person's schedule open by hand (week view).
+ * Clicks nothing, saves nothing, sends nothing. Prints only whether the
+ * person's id marks and links exist and agree, never an id, name or link.
+ * Copy the lines it prints.
  */
 (() => {
   const out = [];
   const wrapper = document.querySelector('.staff-calendar-wrapper');
   if (!wrapper) { console.log('no .staff-calendar-wrapper'); return; }
-  const desc = node => `${node.tagName.toLowerCase()}${node.id ? '#' + node.id : ''}${[...node.classList].map(c => '.' + c).join('')}`;
-  const ownText = node => [...node.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
-  out.push(`wrapper: ${desc(wrapper)}`);
-  let parent = wrapper.parentElement;
-  for (let i = 0; i < 3 && parent; i++, parent = parent.parentElement) out.push(`parent ${i + 1}: ${desc(parent)}`);
-  // Everything in or just above the wrapper that is not part of the calendar grid.
-  const scope = wrapper.parentElement || wrapper;
-  [...scope.querySelectorAll('*')].filter(node => !node.closest('.fc-view-container') && !node.closest('.fc-toolbar')).forEach(node => {
-    const own = ownText(node);
-    const close = /[✕×xX]/.test(own) && own.length <= 2;
-    if (own.length > 0 || node.matches('i, a, button, span')) {
-      out.push(`${desc(node)} textLength=${own.length}${close ? ' (close mark)' : ''}${/\(.*-.*\)/.test(own) ? ' (looks like name line)' : ''} title=${node.title ? 'yes' : 'no'}`);
+  const desc = node => `${node.tagName.toLowerCase()}${[...node.classList].map(c => '.' + c).join('')}`;
+  const shown = node => !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
+  const grid = node => node.closest('.fc-view-container, .fc-toolbar');
+  // Snooze's identity check: one data-entity-id in the wrapper, matched by a link button.
+  const marks = [wrapper, ...wrapper.querySelectorAll('*')].filter(node => node.hasAttribute('data-entity-id'));
+  out.push(`data-entity-id in wrapper: ${marks.length}`);
+  marks.slice(0, 5).forEach(node => out.push(`  on ${desc(node)} digitsOnly=${/^\d+$/.test(node.getAttribute('data-entity-id') || '')}`));
+  const id = marks.length === 1 ? marks[0].getAttribute('data-entity-id') : null;
+  const buttons = [...wrapper.querySelectorAll('a.btn[href]')].filter(shown);
+  const forecast = buttons.filter(link => link.getAttribute('aria-label') === 'Forecast View');
+  out.push(`shown a.btn links: ${buttons.length}, Forecast View: ${forecast.length}`);
+  const hrefs = (forecast.length ? forecast : buttons).map(link => link.getAttribute('href') || '').filter(href => /\d/.test(href));
+  out.push(`links with digits: ${hrefs.length}`);
+  if (id && /^\d+$/.test(id)) out.push(`a link carries the id: ${hrefs.some(href => new RegExp(`(?:^|\\D)${id}(?:\\D|$)`).test(href))}`);
+  // Other places a person id might sit: attribute names only, outside the grid.
+  const seen = new Map();
+  [wrapper, ...wrapper.querySelectorAll('*')].filter(node => !grid(node)).forEach(node => {
+    for (const attr of node.attributes) {
+      if (/^(class|style|title|aria-|role)/.test(attr.name)) continue;
+      if (!/\d/.test(attr.value)) continue;
+      const key = `${desc(node)} [${attr.name}]${attr.name === 'href' ? '' : ` digitsOnly=${/^\d+$/.test(attr.value)}`}`;
+      seen.set(key, (seen.get(key) || 0) + 1);
     }
   });
-  console.log(out.slice(0, 60).join('\n'));
+  out.push(`attributes with digits outside the calendar grid: ${seen.size}`);
+  [...seen].slice(0, 25).forEach(([key, count]) => out.push(`  ${key} x${count}`));
+  console.log(out.join('\n'));
 })();
