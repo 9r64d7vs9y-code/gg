@@ -2577,8 +2577,17 @@ function decideAuditExit(record, today, slice) {
   if (record.person?.region !== undefined && !region) return stop('byHand', 'exitNoLwdRegion', { business: 'audit', region: suppliedRegion });
   if (region === 'USI' && lastWorkingDay) return stop('byHand', 'auditUsiLwd', { business: 'audit' });
   const from = lastWorkingDay || mondayOf(today);
-  const entries = (slice?.backupEntries ?? slice?.entries ?? []).filter(entry => entryKind(entry) === 'client' &&
-    (entry.days ?? entry.windowDays ?? []).some(row => row.hours > 0 && compareDays(row.day, from) >= (lastWorkingDay ? 1 : 0)));
+  const entries = (slice?.backupEntries ?? slice?.entries ?? []).filter(entry => {
+    if (entryKind(entry) !== 'client') return false;
+    const weekly = entry.mode === 'week' || slice?.mode === 'week' || !entry.days?.length && !entry.windowDays?.length && Array.isArray(entry.hours);
+    const rows = entry.days?.length ? entry.days : entry.windowDays?.length ? entry.windowDays : entry.hours || [];
+    return rows.some(row => {
+      const day = row.day || row.monday;
+      if (!day || !Number.isFinite(row.hours)) return true;
+      const last = weekly || compareDays(day, mondayOf(day)) === 0 && row.hours > 8 ? addDays(mondayOf(day), 4) : day;
+      return row.hours > 0 && compareDays(last, from) >= (lastWorkingDay ? 1 : 0);
+    });
+  });
   const unique = new Map(entries.map(entry => [JSON.stringify([valueKey(entry.client), valueKey(entry.wbs)]), { client: entry.client, wbs: entry.wbs || '' }]));
   const template = !lastWorkingDay ? entries.length ? 1 : 2 : entries.length ? 3 : 4;
   const audit = { region, template, clients: [...unique.values()], from };
@@ -3364,6 +3373,7 @@ __exports.chooseInSelect2 = chooseInSelect2;
 const { PageError, shown } = __require("./dom.js");
 const { valueKey } = __require("../rules/prepare.js");
 const sites = new WeakMap();
+const hasReadSite = (doc = document) => sites.has(doc);
 const isTaxPage = (doc = document) => sites.get(doc) === 'tax';
 function readSite(doc = document) {
   const present = selector => [...doc.querySelectorAll(selector)].filter(node =>
@@ -3375,6 +3385,7 @@ function readSite(doc = document) {
   if (professional && !staff) { sites.set(doc, 'consulting'); return 'consulting'; }
   throw new PageError("Can't tell which MySource this is.");
 }
+__exports.hasReadSite = hasReadSite;
 __exports.isTaxPage = isTaxPage;
 __exports.readSite = readSite;
 },
@@ -3529,7 +3540,7 @@ __exports.preflightFormIdentity = preflightFormIdentity;
 },
 "mysource/schedule.js": function (__require, __exports, document, window) {
 'use strict';
-const { isTaxPage } = __require("./site.js");
+const { isTaxPage, hasReadSite, readSite } = __require("./site.js");
 const { findTaxAssignments } = __require("./tax-page.js");
 const { timedRun } = __require("../core/run-records.js");
 const { retirePreflightForm } = __require("./preflight-form.js");
@@ -3537,7 +3548,7 @@ const { usDate, readIsoDay, compareDays, sameDay, todayOf, mondayOf, addDays } =
 const { termDayOf } = __require("../rules/shared.js");
 const { emailKey, emailFormKey } = __require("../rules/prepare.js");
 const { findByEmail } = __require("../family/email.js");
-const { recordRun } = __require("../core/run-records.js");
+const { recordRun, observeRun } = __require("../core/run-records.js");
 const { DNS_CLIENT } = __require("./checks.js");
 const { PageError, WAIT, activeGuardProbe, probeStyleReader, chooseInSelect2, click, closeWindow, describe, fieldByLabel, guardPage, guardReady, guarded, keepFlags, cleanupAfter, rightClick, sameText, setChecked, settled, shown, shownUsing, stopFlagged, text, typeInto, waitFor, withPersonGuard } = __require("./dom.js");
 const SEARCH_SELECT = 'select[id^="ScheduleAddForm_Staff_Form_field_"]';
@@ -3688,7 +3699,7 @@ function nameFrom(names) {
 }
 const personIdentity = () => {
   const names = shownNames(document);
-  return { name: nameFrom(names), id: idFrom(entityElementsFrom(names)) };
+  return { name: nameFrom(names), id: provedIdFrom(entityElementsFrom(names), names) };
 };
 const identityNameKey = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
 const sameIdentityName = (before, shown) => sameText(before, shown) && identityNameKey(before) === identityNameKey(shown);
@@ -3698,8 +3709,8 @@ function sameNameApartFromDigits(saved, shown) {
 }
 function observeIdentityPage(probe) {
   let styleOf = probeStyleReader(probe);
-  const names = shownNames(document, styleOf), elements = entityElementsFrom(names);
-  const id = idFrom(elements);
+  const names = shownNames(document, styleOf), elements = entityElementsFrom(names, styleOf);
+  const id = provedIdFrom(elements, names, styleOf);
   let view = null, calendarAmbiguous = false;
   try { view = calendarViewUsing(styleOf); } catch {
     calendarAmbiguous = true;
@@ -3777,7 +3788,26 @@ function waitForPersonIdentity(before, operation = 'identity check') {
 }
 let rememberedPerson = null;
 let findContext = null;
-const shownNames = (doc, styleOf) => [...doc.querySelectorAll('.calendar-name')].filter(node => styleOf ? shownUsing(node, styleOf) : shown(node));
+let writtenDocument = null;
+function beginScheduleTurn() { writtenDocument = null; }
+observeRun(event => { if (event.type === 'writeAttempt') writtenDocument = document; });
+const futureReadRefusal = reason => new PageError(`${reason}${writtenDocument === document ? ' By hand.' : ' Nothing was changed; By hand.'}`);
+const taxNameClose = name => name.parentElement?.tagName === 'SPAN'
+  && name.parentElement.previousElementSibling?.matches('a')
+  && name.parentElement.previousElementSibling.querySelector('i.fa-times')
+  ? name.parentElement.previousElementSibling : null;
+const shownNames = (doc, styleOf) => {
+  const visible = node => styleOf ? shownUsing(node, styleOf) : shown(node);
+  const names = [...doc.querySelectorAll('.calendar-name')].filter(visible);
+  if (hasReadSite(doc) && !isTaxPage(doc)) return names;
+  const taxNames = [...doc.querySelectorAll('.staff-calendar-wrapper a + span > a')].filter(node =>
+    !node.closest('.fc, [class*="select2"], .js-tooltip, .schedule-tooltip, .tooltip, [role="tooltip"]')
+    && [...node.childNodes].some(child => child.nodeType === 3 && child.textContent.trim())
+    && taxNameClose(node) && visible(node) && visible(node.closest('.staff-calendar-wrapper')));
+  if (!taxNames.length) return names;
+  if (!hasReadSite(doc) && readSite(doc) !== 'tax') return names;
+  return [...new Set([...names, ...taxNames])];
+};
 const pageCalm = () => shownNames(document).length === 0 && busyCovers().length === 0;
 async function searchPageReady() {
   try {
@@ -3789,8 +3819,10 @@ async function searchPageReady() {
       await timedRun('close person', async () => {
         const started = Date.now();
         const title = name.closest('div.calendar-title');
-        const buttons = [...(title?.querySelectorAll('button.btn.btn-light.btn-xs[type="button"]') || [])]
-          .filter(button => shown(button) && button.querySelector('i.fa.fa-times'));
+        const taxClose = isTaxPage() && taxNameClose(name);
+        const buttons = taxClose ? [taxClose].filter(shown)
+          : [...(title?.querySelectorAll('button.btn.btn-light.btn-xs[type="button"]') || [])]
+            .filter(button => shown(button) && button.querySelector('i.fa.fa-times'));
         if (buttons.length !== 1) throw new PageError('The ✕ beside the current person was not found. Close their schedule by hand before Resume.');
         await click(buttons[0]);
         await waitFor(() => {
@@ -3813,8 +3845,14 @@ async function resumePageReady({ empty = false } = {}) {
 function personEntityElements() {
   return entityElementsFrom(shownNames(document));
 }
-function entityElementsFrom(names) {
+function entityElementsFrom(names, styleOf) {
   if (names.length !== 1) return [];
+  if (isTaxPage(names[0].ownerDocument)) {
+    const header = taxNameClose(names[0])?.parentElement;
+    if (!header) return [];
+    return [...header.querySelectorAll('[data-entity-id]')].filter(node => !node.closest('.fc')
+      && (styleOf ? shownUsing(node, styleOf) : shown(node)));
+  }
   const elementsIn = area => [...(area.hasAttribute('data-entity-id') ? [area] : []), ...area.querySelectorAll('[data-entity-id]')];
   const title = names[0].closest('div.calendar-title');
   if (title) return elementsIn(title);
@@ -3823,18 +3861,32 @@ function entityElementsFrom(names) {
   return elementsIn(wrapper);
 }
 function personEntityId() {
-  return idFrom(personEntityElements());
+  const names = shownNames(document);
+  return provedIdFrom(entityElementsFrom(names), names);
 }
 function idFrom(elements) {
   if (elements.length !== 1) return null;
   const value = elements[0].getAttribute('data-entity-id');
   return value && !/\D/.test(value) ? value : null;
 }
+function taxIdConfirmed(names, id, styleOf) {
+  if (!id || names.length !== 1) return false;
+  const name = names[0], wrapper = name.closest('.staff-calendar-wrapper');
+  if (!wrapper || !new RegExp(`(?:^|\\D)${id}(?:\\D|$)`).test(name.getAttribute('href') || '')) return false;
+  const calendars = [...wrapper.querySelectorAll('.js-dynamic-calendar.rm-schedule-calendar[data-record-id]')]
+    .filter(node => styleOf ? shownUsing(node, styleOf) : shown(node));
+  return calendars.length > 0 && calendars.every(node => node.getAttribute('data-record-id') === id);
+}
+function provedIdFrom(elements, names, styleOf) {
+  const id = idFrom(elements);
+  return names.length === 1 && isTaxPage(names[0].ownerDocument) && !taxIdConfirmed(names, id, styleOf) ? null : id;
+}
 function personIdCheck() {
   const elements = personEntityElements();
   const entityId = personEntityId();
   const id = elements.length > 1 ? 'ambiguous' : entityId !== null ? 'found' : 'missing';
   const names = shownNames(document);
+  if (isTaxPage()) return { id, forecastLink: 'missing', matches: idFrom(elements) === null ? null : taxIdConfirmed(names, idFrom(elements)) };
   const area = names.length === 1
     ? names[0].closest('div.calendar-title') || names[0].closest('div.js-calendar-wrapper, div.staff-calendar-wrapper')
     : null;
@@ -3984,9 +4036,12 @@ async function openPersonRecorded(email, expectedName = '', record = null, { fre
     });
     const loadedName = currentPerson();
     loadedIdentity = personIdentity();
+    if (isTaxPage() && loadedIdentity.id === null) throw identityRefusal(loadedIdentity, 'open person',
+      'The Tax id could not be confirmed from the name link and calendar records. Nothing was changed; By hand.',
+      { initialTaxIdUnconfirmed: true, reasonCode: 'taxIdUnconfirmed' });
     recordRun({ type: 'personLoaded' });
     await setupView();
-    const loadedNodes = [...document.querySelectorAll('.calendar-name')].filter(shown);
+    const loadedNodes = shownNames(document);
     const nameText = loadedNodes.length === 1 ? loadedNodes[0].textContent : null;
     const entityId = personEntityId();
     openPerson.last.reloaded = reloaded;
@@ -4004,7 +4059,9 @@ async function openPersonRecorded(email, expectedName = '', record = null, { fre
       error.pageBlocked = true;
     } else {
       error.noReplay = true;
-      await cleanupAfter(error, () => requirePersonIdentity(loadedIdentity));
+      if (!error.initialTaxIdUnconfirmed || !sameIdentityName(loadedIdentity.name, currentPerson()) || personIdentity().id !== null) {
+        await cleanupAfter(error, () => requirePersonIdentity(loadedIdentity));
+      }
     }
     throw error;
   } finally {
@@ -4392,7 +4449,7 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
   await pageReady('after setting Find Assignments filters');
   measured('settle');
   const from = termDayOf(startBox.value.trim()), to = termDayOf(endBox.value.trim());
-  const startKept = future ? startBox.value.trim() === usDate(start)
+  const startKept = future ? startBox.value.trim() === usDate(start) || weekBoxes && from && sameDay(from, mondayOf(start))
     : from && (sameDay(from, start) || sameDay(from, mondayOf(start)));
   const endKept = future || (end ? to && compareDays(to, end) >= 0 && sameDay(mondayOf(to), mondayOf(end)) : endBox.value.trim() === '');
   const controls = [['Include All Future Assignments', futureBox], ['Include All Clients', allClients], ['Pricing ID', pricing]];
@@ -4424,7 +4481,7 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
   await waitFor(() => !modal.isConnected || !shown(modal), 'Find Assignments to close');
   await editTableReady(edit);
   measured('table');
-  assignmentRanges.set(edit, { start: from, end: future ? null : to, weekBoxes });
+  assignmentRanges.set(edit, { start: from, end: future ? null : to, weekBoxes, future, clients, requestedStart: start });
   return edit;
 }
 async function editTableReady(edit) {
@@ -4463,13 +4520,14 @@ function readEditTableRecorded(edit) {
   const rows = [...table.querySelectorAll('tbody tr')];
   if (!rows.length) throw new PageError('The Edit Assignment grid has no proved rows or empty result. Nothing was read or changed.');
   const empty = rows.length === 1 && rows[0].querySelector('td.dataTables_empty');
-  const total = dataTableRowCount(table);
+  const range = assignmentRanges.get(edit);
+  const total = dataTableRowCount(table) ?? (range?.future ? displayedTableRowCount(edit) : null);
+  if (range?.future && total === null) throw futureReadRefusal('The future assignment table has no readable total row count.');
   if (total !== null && total !== (empty ? 0 : rows.length)) {
     throw new PageError(`The Edit Assignment table shows ${empty ? 0 : rows.length} of its ${total} rows; Snooze cannot copy it whole.`);
   }
-  if (empty) return [];
   const professional = currentPerson().split('(')[0].trim();
-  return rows.map((row, index) => {
+  const readRows = empty ? [] : rows.map((row, index) => {
     const tax = isTaxPage();
     const required = new Set(['date', 'hours', 'jobCode', 'client', 'wbs', 'notes']);
     const read = Object.fromEntries(Object.entries(COLUMNS).map(([field, column]) => {
@@ -4486,6 +4544,44 @@ function readEditTableRecorded(edit) {
     if (!read.professional || !sameText(read.professional, professional)) throw new PageError(`Row ${index + 1} of the Edit Assignment table has a different or empty Professional. Nothing was changed.`);
     return { id: row.getAttribute('data-id') || '', ...read, hours, notes: Number(notes) };
   });
+  if (range?.future && !isTaxPage()) {
+    if (range.weekBoxes && readRows.some(row => {
+      if (row.hours > 8) return true;
+      const day = termDayOf(row.date);
+      return row.hours > 0 && day && sameDay(day, mondayOf(day)) && compareDays(day, range.requestedStart) < 0
+        && !readRows.some(other => {
+          const date = termDayOf(other.date);
+          return date && compareDays(date, day) > 0 && sameDay(mondayOf(date), day) && sameText(row.client, other.client) && sameText(row.wbs, other.wbs);
+        });
+    })) throw futureReadRefusal('A Weekly assignment does not prove its daily hours or its share after the last working day.');
+    proveCalendarRows(readRows, range);
+  }
+  return readRows;
+}
+function displayedTableRowCount(edit) {
+  const info = [...edit.querySelectorAll('#editGrid_info, .dataTables_info, .dt-info')];
+  if (info.length !== 1) return null;
+  const match = text(info[0]).match(/^Showing ([\d,]+) to ([\d,]+) of ([\d,]+) entries$/i);
+  if (!match) return null;
+  const [from, to, total] = match.slice(1).map(value => Number(value.replace(/,/g, '')));
+  return [from, to, total].every(Number.isSafeInteger) && from === (total ? 1 : 0) && to === total ? total : null;
+}
+function proveCalendarRows(rows, range) {
+  for (const tile of tilesOnScreen()) {
+    const cell = tile.closest('td.fc-day[data-date]');
+    const day = readIsoDay(tile.getAttribute('data-date') || cell?.getAttribute('data-date') || '');
+    if (!day || compareDays(day, range.start) < 0) continue;
+    const client = tileClient(tile);
+    if (range.clients && !range.clients.some(wanted => sameText(wanted, client))) continue;
+    const matching = rows.filter(row => {
+      const date = termDayOf(row.date);
+      return date && sameText(row.client, client) && sameDay(mondayOf(date), mondayOf(day));
+    });
+    const hours = text(tile.querySelector('.field-value')).match(/^(\d+(?:\.\d+)?)h$/);
+    if (!matching.length || hours && sameDay(day, mondayOf(day)) && matching.reduce((sum, row) => sum + row.hours, 0) + 0.001 < Number(hours[1])) {
+      throw futureReadRefusal('The calendar shows an assignment missing from the future table.');
+    }
+  }
 }
 function dataTableRowCount(table) {
   const jq = table?.ownerDocument.defaultView.jQuery;
@@ -4549,6 +4645,7 @@ __exports.personIdentity = personIdentity;
 __exports.checkPersonIdentity = checkPersonIdentity;
 __exports.requirePersonIdentity = requirePersonIdentity;
 __exports.waitForPersonIdentity = waitForPersonIdentity;
+__exports.beginScheduleTurn = beginScheduleTurn;
 __exports.pageCalm = pageCalm;
 __exports.searchPageReady = searchPageReady;
 __exports.resumePageReady = resumePageReady;
@@ -4578,7 +4675,7 @@ __exports.readEditTable = readEditTable;
 const { addDays, compareDays, readIsoDay, todayOf, usDate, weekday } = __require("../rules/dates.js");
 const { PageError } = __require("./dom.js");
 const { canAddAssignment, emptySpots, personIdentity, waitForPersonIdentity: requirePersonIdentity } = __require("./schedule.js");
-const { showDate } = __require("./calendar.js");
+const { showDate, calendarHolds } = __require("./calendar.js");
 function createEditability({ today = todayOf(), term = null, identity = personIdentity(), move = showDate } = {}) {
   let reading = null;
   const cells = async () => {
@@ -4648,9 +4745,16 @@ function createEditability({ today = todayOf(), term = null, identity = personId
         info = await view(addDays(last, 1));
       }
     },
-    async enabled(day) {
+    async enabled(day, { probeAfterTerm = false } = {}) {
       await requirePersonIdentity(identity);
-      if (compareDays(day, today) < 0 || term && compareDays(day, term) > 0) return false;
+      if (compareDays(day, today) < 0) return false;
+      if (term && compareDays(day, term) > 0) {
+        if (!probeAfterTerm) return false;
+        if (!calendarHolds(day)) await move(day);
+        const enabled = await canAddAssignment(day, { dayOnly: true });
+        await requirePersonIdentity(identity);
+        return enabled;
+      }
       const info = await view(day);
       return info.enabledThrough >= 0 && compareDays(day, addDays(info.rows[info.enabledThrough].day, info.weekly ? 6 : 0)) <= 0;
     },
@@ -5730,7 +5834,7 @@ async function copyWindowRecorded(window, { future = false, noteRows = [], reuse
     });
     found = rows;
     canRefreshNotes = !!edit.querySelector('.js-assignment-edit-edit-all');
-    rows = rows.filter(row => future || compareDays(row.day, window.start) >= 0 && compareDays(row.day, window.end) <= 0);
+    rows = rows.filter(row => compareDays(row.day, window.start) >= 0 && (future || compareDays(row.day, window.end) <= 0));
     for (const row of rows) {
       const day = dayOf(row.date);
       if (typeof row.noteText !== 'string' && day && noteRows.some(old => compareDays(old.day, day) === 0 && valueKey(old.client) === valueKey(row.client))) row.noteText = row.notes > 0 ? await readRowNote(edit, row.id) : '';
@@ -5992,7 +6096,7 @@ async function restorePlanRecorded(backup, { after = null, today = todayOf(), fu
     if (termText && !term) throw new PageError('The Term Date cannot be read. Nothing was restored; By hand.');
     const permissions = createEditability({ today, term, move });
     for (const day of candidates) {
-      const enabled = await permissions.enabled(day);
+      const enabled = await permissions.enabled(day, { probeAfterTerm: automaticRecovery });
       if (!enabled) {
         skippedLocked.push(day); protectedDays.add(usDate(day));
       }
@@ -7106,7 +7210,8 @@ function auditRequestBytes(clients) {
   const fields = ['Requestor Name *', 'Client *', 'WBS', 'Project Status *', 'Role Title*', 'Role Description*', 'Business Area*', 'Business Line*', 'Market Offering *', 'Practice*', 'Industry*', 'Industry Sector*', 'Accept Travelers *'];
   const styles = '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="2" borderId="0" xfId="0" applyFill="1"/></cellXfs>';
   const cell = (ref, value, style = 0) => `<c r="${ref}" s="${style}" t="inlineStr"><is><t xml:space="preserve">${xml(value)}</t></is></c>`;
-  const sheetXml = () => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="1" width="26" customWidth="1"/><col min="2" max="${Math.max(2, clients.length + 1)}" width="40" customWidth="1"/></cols><sheetData>${fields.map((field, i) => `<row r="${i + 1}">${cell(`A${i + 1}`, field, i === 1 || i === 2 ? 0 : 1)}${i === 1 || i === 2 ? clients.map((client, c) => cell(`${column(c + 1)}${i + 1}`, i === 1 ? client.client : client.wbs)).join('') : ''}</row>`).join('')}</sheetData></worksheet>`;
+  const widths = [26, 42, 24, 24, 26, 60, 26, 26, 26, 26, 26, 26, 24];
+  const sheetXml = () => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>${widths.map((width, i) => `<col min="${i + 1}" max="${i + 1}" width="${width}" customWidth="1"/>`).join('')}</cols><sheetData><row r="1">${fields.map((field, i) => cell(`${column(i)}1`, field, i === 1 || i === 2 ? 0 : 1)).join('')}</row>${clients.map((client, i) => `<row r="${i + 2}">${cell(`B${i + 2}`, client.client)}${cell(`C${i + 2}`, client.wbs)}</row>`).join('')}</sheetData></worksheet>`;
   return workbookBytes([{ name: 'Audit Request Template' }], { xml, sheetXml, styles });
 }
 async function saveBatch(rows, signOff, { excelName = batchExcelName(), backupReport = null, runReport = '', batchLabel = excelName.replace(/\.xlsx$/, ''), packVersion = 1 } = {}) {
@@ -7670,8 +7775,10 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
         } catch (error) {
           if (row.pictureToTakeByHand && ['done', 'nothing'].includes(row.state) && stopFlagged(error)) throw error;
           if (error.schedulePage) throw error;
+          const firstTaxId = error.initialTaxIdUnconfirmed && row.one.record.subcategory?.site === 'tax'
+            && row.state === 'ready' && !row.prepared;
           if (!wrote && !error.addPressed && !error.session && !sessionExpired() &&
-              error instanceof PageError && !error.pageBlocked && !error.batchWide && !error.identityChanged) {
+              error instanceof PageError && !error.pageBlocked && !error.batchWide && (!error.identityChanged || firstTaxId)) {
             if (error.timeout) error.reasonCode = 'pageTimeout';
             error.reasonCode ||= reasonCode(error.message);
             row.state = 'skipped';
@@ -8449,7 +8556,7 @@ const { addDays, compareDays, mondayOf, reportWindow, todayOf, usDate, workingDa
 const { entryKind } = __require("../rules/entries.js");
 const { emailKey, valueKey, rememberPageName, professionalName } = __require("../rules/prepare.js");
 const { PageError, withPersonGuard, stopFlagged, cleanupAfter } = __require("../mysource/dom.js");
-const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, proveFindReopenAfter, canAddAssignment } = __require("../mysource/schedule.js");
+const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, proveFindReopenAfter, canAddAssignment, beginScheduleTurn } = __require("../mysource/schedule.js");
 const { calendarHolds, showDate } = __require("../mysource/calendar.js");
 const { leaveRuns, leavePeriod, loaBlocks, dayRanges, inRange, auditLoaInPlace } = __require("../rules/leaves.js");
 const { deleteAll, deleteRange, addAssignment, preflightDates, refreshNotes, setAssignmentHours } = __require("../mysource/write.js");
@@ -8474,7 +8581,8 @@ function reportMismatch(stop, differences) {
 }
 function alreadyAdded(copy, start, end, client, future = false) {
   const rows = copy.days.filter(row => compareDays(row.day, start) >= 0 && (future || compareDays(row.day, end) <= 0));
-  const expected = workingDays(start, end);
+  const through = future ? rows.reduce((last, row) => compareDays(row.day, last) > 0 ? row.day : last, end) : end;
+  const expected = workingDays(start, through);
   return expected.length > 0 && rows.length === expected.length && expected.every(day => {
     const onDay = rows.filter(row => compareDays(row.day, day) === 0);
     return onDay.length === 1 && valueKey(onDay[0].client) === valueKey(client) && onDay[0].hours === HOURS_PER_DAY &&
@@ -8492,6 +8600,7 @@ function checkedLoa(after, plan) {
   return checkLoaAdded(after,plan,HOURS_PER_DAY);
 }
 async function prepare(one, version, today = todayOf(), { step = fn => fn() } = {}) {
+  beginScheduleTurn();
   const { record, decision, slice } = one;
   if (record.subcategory?.site === 'tax') return prepareTax(one, version, today, { step });
   const { plan } = decision;
@@ -8630,6 +8739,7 @@ function exitReplaceEligible(plan, prepared) {
   const dnsDates = new Set(workingDays(plan.dnsStart, prepared.editableDnsEnd || plan.dnsEnd).map(usDate));
   const later = prepared.copy.days.filter(row => compareDays(row.day, plan.dnsStart) >= 0);
   return prepared.addDns && !prepared.dnsKept?.length && !prepared.earlyDns?.length && targets.length > 0
+    && !(prepared.dnsRepairRuns?.length) && !knownAssignmentRows(prepared.copy).range?.weekBoxes
     && targets.length === later.length && later.every(row => targets.includes(row) && dnsDates.has(usDate(row.day)));
 }
 function auditRangeTouchesKept(prepared, range) {
@@ -8711,6 +8821,18 @@ async function applyRecorded(one, prepared, { step = fn => fn(), onWrite: writeN
     if (!replace) for (const run of prepared.exitRuns) current = await removeExitEntries(
       { start: run.start, ...(run.future ? { future: true } : { end: run.end, clients: [run.client] }) },
       row => inRange(row.day, run.start, run.end) && (run.future || valueKey(row.client) === valueKey(run.client)), prepared, current, step, writeThrough(run.rows.map(row => row.day)));
+    for (const run of prepared.dnsRepairRuns || []) {
+      if (auditRangeTouchesKept(prepared, run)) throw new PageError('A kept DNS row is inside the repair range. Restore this person before continuing.');
+      await step(() => addAssignment({ client: DNS_CLIENT, start: run.start, end: run.end, hoursPerDay: HOURS_PER_DAY,
+        billable: 'Non-Billable', utilization: 'No', notes: plan.notes }, 'Normal', { onWrite: writeThrough(workingDays(run.start, run.end)) }));
+      const after = await copyWindow(prepared.watchedWindow, { future: true });
+      recordLaterChange(prepared, after);
+      const added = row => inRange(row.day, run.start, run.end);
+      const checked = checkDnsAdded({ days: after.days.filter(added) }, { ...plan, dnsStart: run.start, dnsEnd: run.end }, HOURS_PER_DAY);
+      if (!checked.ok || !compareCopies({ days: current.days.filter(row => !added(row)) }, { days: after.days.filter(row => !added(row)) }).same
+        || prepared.dnsKept?.some(old => !after.days.some(row => old.id === row.id && old.notes === row.notes))) throw new PageError('The DNS repair could not be proved. Restore this person before continuing.');
+      current = writtenNoteCopy(after, { ...plan, dnsStart: run.start, dnsEnd: run.end });
+    }
     if (prepared.addDns) {
       for (const run of prepared.dnsAddRuns || [{ start: plan.dnsStart, end: prepared.editableDnsEnd }]) {
         await step(() => {
@@ -8856,12 +8978,18 @@ async function prepareExit(one, version, today, { step }) {
   const startGreyed = termGreyed || !(await step(() => permissions.enabled(plan.dnsStart)));
   const termLimitsDns = termDay && compareDays(termDay, plan.dnsEnd) < 0;
   const permittedEnd = startGreyed ? null : await step(() => permissions.through(plan.dnsEnd, plan.dnsStart));
-  const greyed = startGreyed || !!termLimitsDns || !permittedEnd || compareDays(permittedEnd, plan.dnsEnd) < 0;
+  let greyed = startGreyed || !!termLimitsDns || !permittedEnd || compareDays(permittedEnd, plan.dnsEnd) < 0;
   const editableDnsEnd = permittedEnd || (termLimitsDns ? termDay : plan.dnsEnd);
   let addDns = !startGreyed && !!permittedEnd && workingDays(plan.dnsStart, editableDnsEnd).length > 0;
   const copy = await step(() => copyWindow({ start: today, end: addDays(plan.dnsEnd, 56) }, { future: true }));
   const watchedWindow = copy.window;
-  const dnsKept = withoutNotes ? copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && inRange(row.day, plan.dnsStart, editableDnsEnd)
+  const dnsAlready = plan.action === 'dns' && alreadyAdded(copy, plan.dnsStart, plan.dnsEnd, DNS_CLIENT, true);
+  const keepTail = alreadyAdded({ days: copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT)) }, plan.dnsStart, plan.dnsEnd, DNS_CLIENT, true)
+    && copy.days.some(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, plan.dnsEnd) > 0);
+  if (keepTail) addDns = false;
+  const properDns = row => valueKey(row.client) === valueKey(DNS_CLIENT) && workingDays(row.day, row.day).length
+    && row.hours === HOURS_PER_DAY && valueKey(row.billable) === 'non billable' && valueKey(row.utilization) === 'no';
+  const dnsKept = keepTail ? copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, plan.dnsStart) >= 0) : withoutNotes ? copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && inRange(row.day, plan.dnsStart, editableDnsEnd)
     && workingDays(row.day, row.day).length && row.hours === HOURS_PER_DAY && valueKey(row.billable) === 'non billable' && valueKey(row.utilization) === 'no'
     && copy.days.filter(other => compareDays(other.day, row.day) === 0 && valueKey(other.client) === valueKey(DNS_CLIENT)).length === 1) : [];
   const dnsAddRuns = withoutNotes && addDns ? [] : null;
@@ -8874,24 +9002,38 @@ async function prepareExit(one, version, today, { step }) {
   const earlyCandidates = copy.days.filter(row => compareDays(row.day, plan.dnsStart) < 0 && valueKey(row.client) === valueKey(DNS_CLIENT)
     && (!termDay || compareDays(row.day, termDay) <= 0)).sort((a, b) => compareDays(a.day, b.day));
   const dnsEditableDates = new Set();
+  const improper = copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && inRange(row.day, plan.dnsStart, plan.dnsEnd) &&
+    (!properDns(row) || copy.days.filter(other => valueKey(other.client) === valueKey(DNS_CLIENT) && compareDays(other.day, row.day) === 0).length !== 1));
   const dnsCandidates = copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, today) >= 0
-    && (!termGreyed || compareDays(row.day, termDay) <= 0));
+    && (!termGreyed || compareDays(row.day, termDay) <= 0 || improper.includes(row)));
   for (const day of [...new Map(dnsCandidates.map(row => [usDate(row.day), row.day])).values()]) {
-    const enabled = await step(() => termGreyed
+    const repair = improper.some(row => compareDays(row.day, day) === 0);
+    const enabled = await step(() => termGreyed || repair
       ? withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), async () => {
         if (!calendarHolds(day)) await showDate(day);
         return canAddAssignment(day, { dayOnly: true });
       }) : permissions.enabled(day));
     if (enabled) dnsEditableDates.add(usDate(day));
   }
-  const dnsEditable = row => !startGreyed && dnsEditableDates.has(usDate(row.day));
+  const dnsEditable = row => (!startGreyed || improper.some(old => compareDays(old.day, row.day) === 0)) && dnsEditableDates.has(usDate(row.day));
+  if (improper.some(row => inRange(row.day, plan.dnsStart, editableDnsEnd) && !dnsEditable(row))) { addDns = false; greyed = true; }
+  const repairDays = [...new Map(improper.filter(row => compareDays(row.day, plan.dnsEnd) <= 0 && dnsEditable(row) && (!addDns || !inRange(row.day, plan.dnsStart, editableDnsEnd)))
+    .map(row => [usDate(row.day), row.day])).values()].sort(compareDays);
+  if (repairDays.some(day => !workingDays(day, day).length)) return { stop: 'An improper DNS entry is on a weekend. Nothing was changed; By hand.' };
+  const dnsRepairRuns = [];
+  for (const day of repairDays) {
+    const last = dnsRepairRuns.at(-1);
+    if (last && !workingDays(addDays(last.end, 1), addDays(day, -1)).length) last.end = day;
+    else dnsRepairRuns.push({ start: day, end: day });
+  }
+  if (!addDns && dnsRepairRuns.length) dnsKept.push(...copy.days.filter(row => compareDays(row.day, plan.dnsStart) >= 0
+    && properDns(row) && !improper.includes(row) && !dnsKept.includes(row)));
   const earlyDns = earlyCandidates.filter(row => dnsEditableDates.has(usDate(row.day)));
   const window = { start: earlyDns[0]?.day || plan.dnsStart, end: watchedWindow.end };
   const inChange = row => earlyDns.includes(row) || !dnsKept.includes(row) && compareDays(row.day, plan.dnsStart) >= 0 &&
     (valueKey(row.client) !== valueKey(DNS_CLIENT) || dnsEditable(row));
   const exitPeople = { dpName: facts.resourceManager || slice.resourceManager || record.person.resourceManager || '',
     dpEmail: facts.resourceManagerEmail || slice.resourceManagerEmail || '', dpNotFound: valueKey(facts.resourceManager || slice.resourceManager || record.person.resourceManager) === 'not applicable' };
-  const dnsAlready = plan.action === 'dns' && alreadyAdded(copy, plan.dnsStart, plan.dnsEnd, DNS_CLIENT, true);
   const removing = new Map();
   for (const row of copy.days.filter(inChange)) {
     const item = removing.get(row.client) || { client: row.client, days: 0, hours: 0, clientHours: 0 };
@@ -8922,8 +9064,8 @@ async function prepareExit(one, version, today, { step }) {
   if (problems.length) return { stop: `Snooze could not put these days back if needed: ${problems.join('; ')}.` };
   const backup = { kind: BACKUP_KIND, snooze: version, taken: copy.taken, ticket: record.number, email: record.email,
     professional: professionalName(record), plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')), window: { ...watchedWindow, end: compareDays(watchedWindow.end, reportEnd) < 0 ? watchedWindow.end : reportEnd }, days, reportEnd, termDate: termText,
-    ...(addDns && !withoutNotes ? { noteChangedDays: copy.days.filter(row => inReport(row) && valueKey(row.client) === valueKey(DNS_CLIENT)
-      && inRange(row.day, plan.dnsStart, editableDnsEnd)).map(row => row.day) } : {}),
+    ...((addDns || repairDays.length) && !withoutNotes ? { noteChangedDays: copy.days.filter(row => inReport(row) && valueKey(row.client) === valueKey(DNS_CLIENT)
+      && (addDns && inRange(row.day, plan.dnsStart, editableDnsEnd) || repairDays.some(day => compareDays(day, row.day) === 0))).map(row => row.day) } : {}),
     report: slice.fileName || 'the Staff Schedule Hours Report by Day' };
   const later = copy.days.filter(row => compareDays(row.day, plan.dnsStart) >= 0);
   const clearLater = later.length > 0 && later.every(inChange);
@@ -8931,11 +9073,15 @@ async function prepareExit(one, version, today, { step }) {
   const clients = [...new Set(separate.map(row => row.client))];
   const exitRuns = clients.flatMap(client => loaBlocks(separate.filter(row => row.client === client)).map(run => ({ ...run, client })));
   if (clearLater) exitRuns.push({ start: plan.dnsStart, end: watchedWindow.end, rows: later, future: true });
-  if (withoutNotes && dnsKept.length) {
+  if (dnsKept.length) {
     const split = exitRuns.flatMap(run => splitAuditExitRun(run, dnsKept));
     exitRuns.splice(0, exitRuns.length, ...split);
   }
   let exitDatePreflight = null;
+  if (repairDays.length) {
+    const dateStop = await caseDates(repairDays, identity, step, { anchor: repairDays[0] });
+    if (dateStop.stop) return dateStop;
+  }
   if (termGreyed) {
     const dates = earlyDns.map(row => row.day).filter(day => compareDays(day, termDay) <= 0);
     if (dates.length) {
@@ -8951,8 +9097,8 @@ async function prepareExit(one, version, today, { step }) {
     }
   }
   return { window, watchedWindow, copy, watched: copy, backup, removing: [...removing.values()], daysCompared: new Set(copy.days.map(row => usDate(row.day))).size,
-    reportEnd, checks: [], earlyDns, dnsAlready: false, identity, termGreyed, termDay, exitRuns, addDns, editableDnsEnd, exitDatePreflight,
-    ...(withoutNotes ? { dnsKept, dnsAddRuns } : {}) };
+    reportEnd, checks: [], earlyDns, dnsAlready: false, identity, termGreyed, termDay, exitRuns, addDns, editableDnsEnd, exitDatePreflight, dnsRepairRuns,
+    ...(withoutNotes || keepTail || dnsRepairRuns.length ? { dnsKept, dnsAddRuns } : {}) };
 }
 async function caseDates(dates, identity, step, options = {}) {
   try { return await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => preflightDates(dates, options))); }
@@ -8965,6 +9111,19 @@ async function caseDates(dates, identity, step, options = {}) {
 async function removeExitEntries(query, matches, prepared, before, step, onWrite) {
   return step(async () => {
     const edit = await findAssignments(query);
+    if (query.future && findAssignmentsRange(edit)?.weekBoxes) {
+      await closeEdit(edit);
+      return deleteRange({ start: query.start, end: prepared.watchedWindow.end, weekEndFriday: true }, before, { onWrite,
+        protectedRows: prepared.dnsKept || [],
+        validate: async actual => {
+          if (actual.days.some(row => !matches(row))) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.');
+        },
+        read: async () => {
+          const after = await copyWindow(prepared.watchedWindow, { future: true });
+          recordLaterChange(prepared, after); return after;
+        },
+      });
+    }
     if (!query.future && findAssignmentsRange(edit)?.weekBoxes) {
       if (auditRangeTouchesKept(prepared, query)) {
         const error = new PageError('The Exit entries changed since the backup. Nothing was deleted.', { reasonName:'keptRowInRange' });
@@ -9677,13 +9836,13 @@ __exports.liveTestReport = liveTestReport;
 'use strict';
 const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { addressCount } = __require("../rules/prepare.js");
-const { todayOf } = __require("../rules/dates.js");
+const { todayOf, usDate } = __require("../rules/dates.js");
 const { TAX_LIVE_STEPS, SMALL_TAX_STEPS, TAX_LIVE_FINDINGS, taxTestPeriod } = __require("./live-proof.js");
 async function runTaxLiveTest({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown', small = false }, page) {
-  const window = taxTestPeriod(today);
+  const window = taxTestPeriod(today, { small });
   if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
-  const result = { kind: 'Snooze live test 1', mode: 'tax', version, length: 'month', design: small ? 'tax5' : 'tax8',
-    week: { start: '04/03/2028', end: '04/28/2028' }, state: 'running', cleanup: 'notNeeded', writes: 0,
+  const result = { kind: 'Snooze live test 1', mode: 'tax', version, length: small ? 'twelveWeeks' : 'month', design: small ? 'tax5' : 'tax8',
+    week: { start: usDate(window.start), end: usDate(window.end) }, state: 'running', cleanup: 'notNeeded', writes: 0,
     steps: Object.keys(small ? SMALL_TAX_STEPS : TAX_LIVE_STEPS).map(id => ({ id, state: 'notExercised', findings: [] })), events: [], pictures: [] };
   const diagnostic = beginLiveDiagnostics(result, page, assignPeriod, today);
   const write = () => { result.writes++; };
@@ -9722,11 +9881,11 @@ __exports.runTaxLiveTest = runTaxLiveTest;
 const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { addressCount } = __require("../rules/prepare.js");
 const { compareDays, todayOf, usDate } = __require("../rules/dates.js");
-const { SMALL_LIVE_STEPS } = __require("./live-proof.js");
+const { SMALL_LIVE_STEPS, smallTestPeriod } = __require("./live-proof.js");
 async function runSmallConsultingTest({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
-  const window = auditTestPeriod(today);
+  const window = smallTestPeriod(today);
   if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
-  const result = { kind: 'Snooze live test 1', mode: 'consulting', version, design: 'small7', length: 'twoWeeks',
+  const result = { kind: 'Snooze live test 1', mode: 'consulting', version, design: 'small7', length: 'twelveWeeks',
     expectedSteps: 7, week: { start: usDate(window.start), end: usDate(window.end) },
     state: 'running', cleanup: 'notNeeded', writes: 0, steps: Object.keys(SMALL_LIVE_STEPS).map(id => ({ id, state: 'notExercised' })),
     events: [], pictures: [], outstanding: [] };
@@ -10091,9 +10250,9 @@ const SMALL_LIVE_STEPS = {
   smallPicture: 'Hover picture and plain A&A picture', smallUndo: 'Undo from the backup', cleanup: 'Clear and check empty',
 };
 const SMALL_TAX_STEPS = {
-  taxEmpty: 'Open, read and check empty month', taxAdd: 'Add LOA, DNS, Holiday and Replace',
+  taxEmpty: 'Open, read and check empty span', taxAdd: 'Add LOA, DNS, Holiday and Replace',
   taxHours: 'Lower and restore saved Hours', taxPartial: 'Partial-week apply and Undo',
-  taxClear: 'Clear and check empty month', taxPast: 'Optional: restore this week’s past Monday',
+  taxClear: 'Clear and check empty span', taxPast: 'Optional: restore this week’s past Monday',
 };
 const TAX_LIVE_STEPS = {
   taxEmpty: 'Check empty month and weekly view',
@@ -10112,16 +10271,23 @@ const TAX_LIVE_FINDINGS = new Set([
   'Hours lowered and restored; note count unchanged.',
   'DNS stand-in lowered in both partial weeks.', 'Normal Tax apply and Undo checked.',
   'Month empty and checked.', 'Past Monday restored; note count unchanged.',
+  'Span empty and checked.',
 ]);
-function taxTestPeriod(today) {
-  const window = { start: { y: 2028, m: 4, d: 3 }, end: { y: 2028, m: 4, d: 28 } };
+function smallTestPeriod(today) {
+  const window = { start: { y: 2028, m: 5, d: 1 }, end: { y: 2028, m: 7, d: 21 } };
+  if (!today || window.start.y * 10000 + window.start.m * 100 + window.start.d <= today.y * 10000 + today.m * 100 + today.d)
+    throw new Error('The live test period must still be in the future.');
+  return window;
+}
+function taxTestPeriod(today, { small = false } = {}) {
+  const window = { start: { y: 2028, m: 4, d: 3 }, end: small ? { y: 2028, m: 6, d: 23 } : { y: 2028, m: 4, d: 28 } };
   const number = day => day.y * 10000 + day.m * 100 + day.d;
   if (!today || number(window.start) <= number(today)) throw new Error('The Tax test month must still be in the future.');
   return window;
 }
 function taxLiveReport(result) {
   const states = { passed: 'PASS', failed: 'FAIL', notExercised: 'not exercised' };
-  return JSON.stringify({ kind: 'Snooze Tax live test', period: 'April 2028',
+  return JSON.stringify({ kind: 'Snooze Tax live test', period: result.design === 'tax5' ? 'April 3–June 23, 2028' : 'April 2028',
     state: result.state === 'complete' ? 'PASS' : 'FAIL',
     cleanup: ['empty', 'notNeeded', 'unconfirmed'].includes(result.cleanup) ? result.cleanup : 'unconfirmed',
     steps: Object.entries(result.design === 'tax5' ? SMALL_TAX_STEPS : TAX_LIVE_STEPS).map(([id, title], index) => {
@@ -10136,12 +10302,13 @@ __exports.SMALL_LIVE_STEPS = SMALL_LIVE_STEPS;
 __exports.SMALL_TAX_STEPS = SMALL_TAX_STEPS;
 __exports.TAX_LIVE_STEPS = TAX_LIVE_STEPS;
 __exports.TAX_LIVE_FINDINGS = TAX_LIVE_FINDINGS;
+__exports.smallTestPeriod = smallTestPeriod;
 __exports.taxTestPeriod = taxTestPeriod;
 __exports.taxLiveReport = taxLiveReport;
 },
 "mysource/live-test.js": function (__require, __exports, document, window) {
 'use strict';
-const { stageNotes } = __require("./note-stage.js");
+const { stageNotes, stageRemoval } = __require("./note-stage.js");
 const { createLiveGroups } = __require("./live-groups.js");
 const { createLivePictures } = __require("./live-pictures.js");
 const { PageError, setBatchGuard, shown, click, settled, text, waitFor, WAIT, closeWindow, cleanupAfter } = __require("./dom.js");
@@ -10150,7 +10317,7 @@ const { sessionExpired, cancelBatchWindows } = __require("./batch.js");
 const { copyWindow, compareCopies, dayOf, entriesToAdd, knownAssignmentRows } = __require("./copy.js");
 const { createEditability } = __require("./editability.js");
 const { calendarDates, showDate } = __require("./calendar.js");
-const { addAssignment, deleteAll, deleteRange, refreshNotes, preflightDates, setAssignmentHours, splitDeleteWeeks } = __require("./write.js");
+const { addAssignment, deleteAll, deleteRange, refreshNotes, preflightDates, setAssignmentHours, splitDeleteWeeks, saveStagedNotes } = __require("./write.js");
 const { restoreWindow } = __require("./restore.js");
 const { addDays, compareDays, mondayOf, todayOf, usDate, workingDays } = __require("../rules/dates.js");
 const { readSite, isTaxPage } = __require("./site.js");
@@ -10159,7 +10326,7 @@ const { entryKind } = __require("../rules/entries.js");
 const { planTaxWeeks } = __require("../rules/tax-weeks.js");
 const { apply, prepare, restore, BACKUP_KIND } = __require("../run/work.js");
 const { taxRestorePlan } = __require("./tax-restore.js");
-const { taxTestPeriod } = __require("../run/live-proof.js");
+const { taxTestPeriod, smallTestPeriod } = __require("../run/live-proof.js");
 const { termDayOf } = __require("../rules/shared.js");
 const { setRunRecorder, timedRun, recordRun, STAGES, WINDOWS, FIELDS, REASON_CODES } = __require("../core/run-records.js");
 const { auditTestPeriod } = __require("../run/audit-live-test.js");
@@ -10169,12 +10336,17 @@ const { capturePerson } = __require("../files/batch-outputs.js");
 const { lastPicture } = __require("../files/capture.js");
 const inside = (day, window) => day && compareDays(day, window.start) >= 0 && compareDays(day, window.end) <= 0;
 const editOwnership = new WeakMap();
+const taxViewLabel = active => {
+  const labels = ['Month','Week','Day'].filter(word => active.some(node => text(node).toLowerCase() === word.toLowerCase()));
+  return labels.length === 1 ? labels[0] : 'unknown';
+};
 function liveDiagnosticState() {
   const kinds = ['Find Assignments','Edit Assignment','Bulk Edit Assignments','Add Assignment','No. of Periods','Go to Date','View Notes'];
   let view = 'unknown';
   try {
     const node = calendarView();
-    view = node?.matches('.fc-weeklyTimeline-view') ? 'Custom' : node?.matches('.fc-month-view') ? 'Month' : 'unknown';
+    view = isTaxPage() ? taxViewLabel([...document.querySelectorAll('button.fc-state-active, button.active, button[aria-pressed=true]')].filter(shown))
+      : node?.matches('.fc-weeklyTimeline-view') ? 'Custom' : node?.matches('.fc-month-view') ? 'Month' : 'unknown';
   } catch {   }
   const windows = [...document.querySelectorAll('.modal, [role=dialog]')].map(node => {
     const title = text(node.querySelector('.modal-title, .bootbox-title, h4, [role=heading]'));
@@ -10205,7 +10377,9 @@ function liveControlState() {
   const windows = [['.bootbox-confirm', 'Delete confirmation'], ['#editEventGridModal', 'Edit Assignment'],
     ['#FindAssignmentsModal', 'Find Assignments'], ['#addShiftEventModal', 'Add Assignment']];
   const active = [...document.querySelectorAll('button.fc-state-active, button.active, button[aria-pressed=true]')].filter(shown);
-  const view = ['Custom','Month','Week','Time'].find(word => active.some(node => text(node) === word)) || 'unknown';
+  const view = isTaxPage()
+    ? taxViewLabel(active)
+    : ['Custom','Month','Week','Time'].find(word => active.some(node => text(node) === word)) || 'unknown';
   return { view, calendar: calendarDates(), windows: windows.flatMap(([selector, kind]) => [...document.querySelectorAll(selector)].map(modal => ({
     kind, visible: shown(modal), fading: modal.classList.contains('fade'), showing: modal.classList.contains('show'),
     handlers: events(modal), rows: modal.querySelectorAll('td.column-start').length,
@@ -10273,8 +10447,8 @@ function liveTestPage(options = {}) {
 }
 function createLiveTestPage({ today = todayOf(), mode = 'consulting', small = false } = {}) {
   if (mode === 'audit') return auditLivePage(today);
-  if (mode === 'tax') return taxLivePage(today);
-  if (small) return auditLivePage(today);
+  if (mode === 'tax') return taxLivePage(today, small);
+  if (small) return auditLivePage(today, true);
   let identity = null, scope = null, observations = null, owningStep = null, verifiedOwnership = null, pendingSave = null;
   let openedEmail = null, liveGuardRelease = null;
   const check = probe => {
@@ -10438,10 +10612,12 @@ function createLiveTestPage({ today = todayOf(), mode = 'consulting', small = fa
     },
   };
 }
-function taxLivePage(today) {
+function taxLivePage(today, small = false) {
   const LOA = 'Leave of Absence (LOA)', DNS = 'Do Not Schedule (DNS)', HOLIDAY = 'HOLIDAY';
   const fixedNote = 'Snooze Tax live test';
   const day = d => ({ y: 2028, m: 4, d });
+  const longDns = { start: day(3), end: { y: 2028, m: 5, d: 12 } };
+  const longLoa = { start: { y: 2028, m: 5, d: 15 }, end: { y: 2028, m: 6, d: 23 } };
   const sameDay = (a, b) => compareDays(a, b) === 0;
   const rowAt = (client, day, hours, notes = 0) => ({ day, date: usDate(day), client, hours, notes,
     wbs: '', jobCode: '', billable: '', utilization: '', pricingId: '', assignCode: '', assignCode2: '' });
@@ -10496,8 +10672,9 @@ function taxLivePage(today) {
   const add = async (client, start, end, hours, mode, notes, write) => {
     bounded({ start, end });
     const retained = mode === 'Replace' ? known.days.filter(row => !inside(row.day, { start, end })) : known.days;
-    const added = rowAt(client, start, hours, notes ? 1 : 0);
-    await change([...retained, added], notice => addAssignment({ client, start, end, hoursPerWeek: hours, notes }, mode, { onWrite: notice }), write);
+    const added = [];
+    for (let date = start; compareDays(date, end) <= 0; date = addDays(mondayOf(date), 7)) added.push(rowAt(client, date, hours, notes ? 1 : 0));
+    await change([...retained, ...added], notice => addAssignment({ client, start, end, hoursPerWeek: hours, notes }, mode, { onWrite: notice }), write);
   };
   const hours = async (target, value, write) => {
     bounded({ start: target.day, end: target.day });
@@ -10564,7 +10741,7 @@ function taxLivePage(today) {
     async taxStart(typedEmail, window) {
       if (scope || !String(typedEmail || '').trim() || addressCount(typedEmail) > 1) throw new PageError('Enter one test professional.');
       if (readSite() !== 'tax') throw new PageError('Tax live test requires Tax MySource.');
-      const allowed = taxTestPeriod(today);
+      const allowed = taxTestPeriod(today, { small });
       if (!sameDay(window.start, allowed.start) || !sameDay(window.end, allowed.end)) throw new PageError('Outside the approved Tax month.');
       scope = allowed; email = typedEmail; release = setBatchGuard(check);
       await openPerson(email); identity = personIdentity(); check();
@@ -10591,8 +10768,8 @@ function taxLivePage(today) {
       return {};
     },
     async taxSmallAdd(write) {
-      await add(LOA, day(24), day(28), 40, 'Normal', fixedNote, write);
-      await add(DNS, day(3), day(7), 40, 'Normal', fixedNote, write);
+      await add(LOA, longLoa.start, longLoa.end, 40, 'Normal', fixedNote, write);
+      await add(DNS, longDns.start, longDns.end, 40, 'Normal', fixedNote, write);
       seedIds = known.days.filter(row => row.client === DNS).map(row => row.id);
       await add(HOLIDAY, day(18), day(18), 8, 'Normal', '', write);
       await add(LOA, day(17), day(21), 32, 'Replace', '', write);
@@ -10614,7 +10791,7 @@ function taxLivePage(today) {
       return { findings: ['Replace cleared Holiday.', 'Holiday re-added; weekly total checked.'] };
     },
     async taxHours(write) {
-      let target = known.days.find(row => sameDay(row.day, day(24)) && row.client === LOA && row.hours === 40);
+      let target = known.days.find(row => sameDay(row.day, small ? longLoa.start : day(24)) && row.client === LOA && row.hours === 40);
       if (!target) throw new PageError('No unique owned Tax hours entry.');
       const id = target.id; await hours(target, 16, write);
       target = known.days.find(row => row.id === id); await hours(target, 40, write);
@@ -10622,10 +10799,10 @@ function taxLivePage(today) {
     },
     async taxPartial(write, { short = false } = {}) {
       await assertKnown(); const checkpoint = known;
-      const plan = { action: 'add', loaStart: day(5), loaEnd: day(short ? 7 : 19), notes: fixedNote };
+      const plan = { action: 'add', loaStart: day(5), loaEnd: short ? { y: 2028, m: 5, d: 10 } : day(19), notes: fixedNote };
       const taxPlan = planTaxWeeks({ plan, today, rows: checkpoint.days.map(row => ({ ...row,
         ...(seedIds.includes(row.id) && row.client === DNS ? { kind: 'client' } : {}) })) });
-      if (taxPlan.outcome !== 'report' || taxPlan.weeks.flatMap(week => week.lowerClients).length !== (short ? 1 : 2)) throw new PageError('The Tax diagnostic stand-ins were not exercised.');
+      if (taxPlan.outcome !== 'report' || taxPlan.weeks.flatMap(week => week.lowerClients).length !== 2) throw new PageError('The Tax diagnostic stand-ins were not exercised.');
       const backup = { kind: BACKUP_KIND, diagnostic: true, site: 'tax', email, professional: identity.name.split('(')[0].trim(),
         window: scope, watchedWindow: scope, today, reportEnd: scope.end, days: checkpoint.days.map(row => ({ ...row, notes: 0 })),
         plan: { action: 'add', loaStart: plan.loaStart, loaEnd: plan.loaEnd },
@@ -10636,11 +10813,12 @@ function taxLivePage(today) {
       if (!applied.ok) throw new PageError('The normal Tax apply was not proved.');
       const restorePlan = await taxRestorePlan(backup, { today, after: applied.after });
       if (restorePlan.skippedLater.length || restorePlan.skippedLocked.length || restorePlan.skippedUnconfirmed.length) throw new PageError('The normal Tax Undo was refused.');
-      const restored = await sequence(statesForRestore(known, restorePlan), notice => restoreWindow(backup, { today, identity, after: applied.after, onWrite: notice }), write);
-      if (!restored.same || !matches({ days: checkpoint.days.map(row => row.client === LOA && inside(row.day, { start: plan.loaStart, end: plan.loaEnd }) || row.client === HOLIDAY ? { ...row, id: '' } : row) }, known)) throw new PageError('The Tax month did not match its checkpoint after Undo.');
-      return { findings: [...(short ? [] : ['DNS stand-in lowered in both partial weeks.']), 'Normal Tax apply and Undo checked.'] };
+      const restoreStates = statesForRestore(known, restorePlan);
+      const restored = await sequence(restoreStates, notice => restoreWindow(backup, { today, identity, after: applied.after, onWrite: notice }), write);
+      if (!restored.same || !matches({ days: restoreStates.at(-1) }, known) || !compareCopies(checkpoint, known).same) throw new PageError('The Tax month did not match its checkpoint after Undo.');
+      return { findings: ['DNS stand-in lowered in both partial weeks.', 'Normal Tax apply and Undo checked.'] };
     },
-    async taxClear(write) { await clear(write); if (known.days.length) throw new PageError('Tax month cleanup unconfirmed.'); return { findings: ['Month empty and checked.'] }; },
+    async taxClear(write) { await clear(write); if (known.days.length) throw new PageError('Tax month cleanup unconfirmed.'); return { findings: [small ? 'Span empty and checked.' : 'Month empty and checked.'] }; },
     async taxPast(write) {
       await assertKnown();
       if (known.days.length) throw new PageError('The Tax month must be empty before the Monday check.');
@@ -10677,7 +10855,7 @@ function taxLivePage(today) {
     taxFinish() { release?.(); release = null; },
   };
 }
-function auditLivePage(today) {
+function auditLivePage(today, small = false) {
   const LOA = 'Leave of Absence (LOA)', DNS = 'Do Not Schedule (DNS)', note = 'Snooze A&A test';
   const sameDay = (a, b) => compareDays(a, b) === 0;
   const inside = (day, range) => day && compareDays(day, range.start) >= 0 && compareDays(day, range.end) <= 0;
@@ -10696,7 +10874,7 @@ function auditLivePage(today) {
     wbs: entry.wbs || '', jobCode: entry.jobCode || '', assignCode: entry.assignCode || '', assignCode2: entry.assignCode2 || '',
     pricingId: entry.pricingId || '', billable: entry.billable, utilization: entry.utilization,
   }));
-  const allowed = auditTestPeriod(today);
+  const allowed = small ? smallTestPeriod(today) : auditTestPeriod(today);
   const first = { start: allowed.start, end: addDays(allowed.start, 1) };
   const second = { start: addDays(allowed.start, 3), end: addDays(allowed.start, 4) };
   const wednesday = addDays(allowed.start, 2), thursday = second.start;
@@ -10713,12 +10891,19 @@ function auditLivePage(today) {
   };
   const read = async () => { bounded(scope); const copy = await copyWindow(scope); check(); return copy; };
   const assertKnown = async () => { const actual = await read(); if (!matches(known, actual)) throw new PageError('The owned A&A test rows changed.'); return actual; };
-  const resolve = async (mustBeAfter = false) => {
-    const actual = await read();
+  const resolveRead = (actual, mustBeAfter = false) => {
     if (!pending ? !matches(known, actual) : !matches(pending.after, actual) && (mustBeAfter || !matches(pending.before, actual))) throw new PageError('A&A save ownership is unconfirmed.');
-    if (pending && matches(pending.after, actual)) recordRun({type:'writeProof',ok:true,whole:true});
+    if (pending && matches(pending.after, actual)) {
+      if (smallKept && pending.renewedIds.includes(smallKept.id)) {
+        const rows = actual.days.filter(row => matches({ days: [{ ...smallKept, id: '' }] }, { days: [row] }));
+        if (rows.length !== 1) throw new PageError('The kept DNS day changed.');
+        smallKept = rows[0];
+      }
+      recordRun({type:'writeProof',ok:true,whole:true});
+    }
     known = actual; pending = null; return actual;
   };
+  const resolve = async (mustBeAfter = false) => resolveRead(await read(), mustBeAfter);
   const withReopen = async action => {
     check(); release?.(); release = null;
     try { return await action(); }
@@ -10752,13 +10937,20 @@ function auditLivePage(today) {
         editRange=owned.range; deleteRange=owned.clipped; staged=owned.staged;
       }
       const deletes = row => inside(row.day,deleteRange) && (!operation.client || valueKey(row.client)===valueKey(operation.client));
-      pending = { before: known, after: { days: operation.kind === 'delete' ? known.days.filter(row=>!deletes(row)) : operation.after(known.days) } };
+      const after = operation.kind === 'delete' ? known.days.filter(row=>!deletes(row)) : operation.after(known.days);
+      const savedRange = small ? staged ? editRange : operation.savedEdit ? operation.range : null : null;
+      const coveredBySave = row => savedRange && inside(row.day, savedRange)
+        && (!operation.range.clients || operation.range.clients.some(client => valueKey(client) === valueKey(row.client)))
+        && (!operation.client || valueKey(row.client) === valueKey(operation.client));
+      pending = { before: known,
+        after: { days: after.map(row => coveredBySave(row) ? { ...row, id: '' } : row) },
+        renewedIds: known.days.filter(coveredBySave).map(row => row.id) };
       if (operation.kind !== 'delete' || !pending.after.days.some(row=>inside(row.day,operation.range) && (!operation.client || valueKey(row.client)===valueKey(operation.client)))) index++;
       const proveDelete = async () => {
         if (operation.kind !== 'delete') return;
         const queried = staged ? editRange : deleteRange;
         if (!queried?.start || !queried.end) throw new PageError('The A&A delete range could not be proved.');
-        const expected = { days: (staged ? pending.after : pending.before).days.filter(row => inside(row.day, queried) && (!operation.client || valueKey(row.client) === valueKey(operation.client))) };
+        const expected = { days: (staged ? after : pending.before.days).filter(row => inside(row.day, queried) && (!operation.client || valueKey(row.client) === valueKey(operation.client))) };
         await ownedDeleteEdit(edit=>staged && !expected.days.length && !findAssignmentsRange(edit) ? null : {rows:expected},matches);
       };
       await proveDelete();
@@ -10792,7 +10984,7 @@ function auditLivePage(today) {
     if (row.length !== 1 || !matches({ days: [kept] }, { days: row })) throw new PageError('Wednesday DNS changed.');
   };
   const smallNote = 'Snooze small live test';
-  let smallCheckpoint = null, smallKept = null;
+  let smallCheckpoint = null, smallKept = null, smallKeptOriginalId = null;
   const smallKeep = () => {
     const row = known.days.find(row => row.id === smallKept?.id);
     if (!row || !matches({ days: [smallKept] }, { days: [row] })) throw new PageError('The kept DNS day changed.');
@@ -10818,30 +11010,32 @@ function auditLivePage(today) {
       return {};
     },
     async smallAdd(write) {
-      const week = { start: scope.start, end: addDays(scope.start, 4) };
-      const next = { start: addDays(scope.start, 7), end: scope.end };
+      const week = { start: scope.start, end: addDays(scope.start, 39) };
+      const next = { start: addDays(scope.start, 42), end: scope.end };
       await add(LOA, week, 8, smallNote, write);
       await add(DNS, next, 8, smallNote, write);
       await add(DNS, { start: wednesday, end: wednesday }, 8, '', write);
       smallCheckpoint = await assertKnown();
-      smallKept = known.days.find(row => sameDay(row.day, addDays(scope.start, 9)) && row.client === DNS);
+      smallKept = known.days.find(row => sameDay(row.day, addDays(scope.start, 44)) && row.client === DNS);
       if (!smallKept?.id || smallKept.notes !== 1) throw new PageError('The kept DNS checkpoint is unreadable.');
+      smallKeptOriginalId = smallKept.id;
       return { blankNotesAccepted: true };
     },
     async smallChange(write) {
       await assertKnown();
-      const replace = { start: addDays(scope.start, 3), end: addDays(scope.start, 4), client: DNS,
+      const replace = { start: addDays(scope.start, 38), end: addDays(scope.start, 39), client: DNS,
         hoursPerDay: 8, notes: smallNote, billable: 'Non-Billable', utilization: 'No' };
       await sequence([{ range: replace, after: before => [...before.filter(row => !inside(row.day, replace)), ...entryRows(replace)] }],
         notice => addAssignment(replace, 'Replace', { onWrite: notice }), write);
-      const query = { start: scope.start, end: wednesday, clients: [LOA] };
+      const removedDay = addDays(scope.start, 37);
+      const query = { start: scope.start, end: removedDay, clients: [LOA] };
       const rows = known.days.filter(row => row.client === LOA && inside(row.day, query));
-      const remove = rows.filter(row => sameDay(row.day, wednesday));
-      if (rows.length !== 3 || remove.length !== 1) throw new PageError('The combined reduction checkpoint is unreadable.');
-      await sequence([{ range: query, after: before => before.filter(row => !remove.some(old => old.id === row.id)) }],
+      const remove = rows.filter(row => sameDay(row.day, removedDay));
+      if (rows.length !== 28 || remove.length !== 1) throw new PageError('The combined reduction checkpoint is unreadable.');
+      await sequence([{ range: query, savedEdit: true, after: before => before.filter(row => !remove.some(old => old.id === row.id)) }],
         notice => refreshNotes(query, { days: rows }, smallNote + ' refreshed', { remove, onWrite: notice }), write);
       await assertKnown();
-      const cancelQuery = { start: scope.start, end: addDays(scope.start, 1), clients: [LOA] };
+      const cancelQuery = { start: scope.start, end: addDays(scope.start, 4), clients: [LOA] };
       const cancelRows = known.days.filter(row => row.client === LOA && inside(row.day, cancelQuery));
       const staged = await stageNotes(cancelQuery, { days: cancelRows }, 'Snooze small discarded note', { remove: cancelRows.slice(1) });
       if (!staged) throw new PageError('The Cancel stage could not be proved.');
@@ -10856,13 +11050,22 @@ function auditLivePage(today) {
       const ranges = [{ start: scope.start, end: addDays(smallKept.day, -1) }, { start: addDays(smallKept.day, 1), end: scope.end }];
       let weekBoxes = false;
       for (const range of ranges) {
-        await sequence([deleteOp(range)], notice => deleteRange(range, known, {
-          read, protectedRows: [smallKept], validate: async () => { check(); },
-          onWrite: async () => {
-            weekBoxes ||= [...document.querySelectorAll('#editEventGridModal')].some(edit => findAssignmentsRange(edit)?.weekBoxes);
-            await notice();
-          },
-        }), write);
+        for (const part of splitDeleteWeeks(range)) {
+          await sequence([deleteOp(part)], async notice => {
+            const edit = await findAssignments({ ...part, weekEndFriday: true });
+            const found = findAssignmentsRange(edit);
+            weekBoxes ||= !!found?.weekBoxes;
+            if (found?.weekBoxes && part.partial) {
+              const expected = { days: known.days.filter(row => inside(row.day, found)) };
+              const targets = expected.days.filter(row => inside(row.day, part));
+              if (targets.some(row => row.id === smallKept.id)) {
+                await closeEdit(edit); throw new PageError('The small delete exceeds its owned days.');
+              }
+              await saveStagedNotes(await stageRemoval(edit, expected, targets), notice);
+            } else await deleteRange(part, known, { edit, read, protectedRows: [smallKept],
+              validate: async () => { check(); }, onWrite: notice });
+          }, write);
+        }
         smallKeep();
       }
       if (known.days.length !== 1) throw new PageError('The delete left unexpected rows.');
@@ -10889,7 +11092,7 @@ function auditLivePage(today) {
     async smallUndo(write) {
       await assertKnown(); smallKeep();
       const ranges = [{ start: scope.start, end: addDays(smallKept.day, -1) }, { start: addDays(smallKept.day, 1), end: scope.end }];
-      const missing = smallCheckpoint.days.filter(row => row.id !== smallKept.id);
+      const missing = smallCheckpoint.days.filter(row => row.id !== smallKeptOriginalId);
       const exactEntries = ranges.flatMap(range => entriesToAdd({ days: missing.filter(row => inside(row.day, range)) }, { exact: true }).entries);
       const capability = await preflightDates(missing.map(row => row.day), { anchor: scope.start, entries: exactEntries });
       const operations = ranges.flatMap(range => entriesToAdd({ days: missing.filter(row => inside(row.day, range)) }, { exact: capability.exact }).entries.map(addOp));
@@ -10901,7 +11104,7 @@ function auditLivePage(today) {
           bounded(actual.window); const expected = pending?.after || known;
           if (!matches({ days: expected.days.filter(row => inside(row.day, actual.window)) }, actual)) throw new PageError('The small Undo table changed.');
         }, onWrite: notice }), write);
-      const expected = { days: smallCheckpoint.days.map(row => row.id === smallKept.id ? row : { ...row, id: '', notes: 0 }) };
+      const expected = { days: smallCheckpoint.days.map(row => row.id === smallKeptOriginalId ? smallKept : { ...row, id: '', notes: 0 }) };
       if (!restored.same || restored.skippedLater?.length || !matches(expected, known)) throw new PageError('The small backup was not restored.');
       smallKeep(); return { backupRestored: true };
     },
@@ -11703,8 +11906,7 @@ const { batchCover } = __require("../mysource/batch.js");
 const { liveTestPage } = __require("../mysource/live-test.js");
 const { renderPhotoReport, fitPhotoReport } = __require("./live-test-report.js");
 const { runLiveTest, liveStepTitle, LIVE_TEST_PROBLEMS, liveRefusalReason } = __require("../run/live-test.js");
-const { taxTestPeriod } = __require("../run/live-proof.js");
-const { auditTestPeriod } = __require("../run/audit-live-test.js");
+const { taxTestPeriod, smallTestPeriod } = __require("../run/live-proof.js");
 const { readSite } = __require("../mysource/site.js");
 const { todayOf } = __require("../rules/dates.js");
 function liveTestButton(work, body, onBack) {
@@ -11748,14 +11950,14 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
   }
   async function start() {
     if (active || work.busy || result) return;
-    try { if (mode === 'tax') taxTestPeriod(todayOf()); else auditTestPeriod(todayOf()); if (!email.value.trim() || !email.checkValidity()) throw new Error('Enter a valid professional email.'); }
+    try { if (mode === 'tax') taxTestPeriod(todayOf(), { small: true }); else smallTestPeriod(todayOf()); if (!email.value.trim() || !email.checkValidity()) throw new Error('Enter a valid professional email.'); }
     catch (error) { notice = error.message; draw(); return; }
     active = work.busy = true; notice = ''; work.host.dataset.batchReserved = 'true';
     work.liveTest = { active: true, changed: false, saved: false };
     const release = batchCover(work.host, work.host);
     let timer;
     try {
-      result = await run({ email: email.value.trim(), mode, small: true, length: mode === 'tax' ? 'month' : 'twoWeeks', version: work.version, assignPeriod: reportAssignPeriod(work.staffReport, email.value.trim()), extended: true, onUpdate: value => {
+      result = await run({ email: email.value.trim(), mode, small: true, length: 'twelveWeeks', version: work.version, assignPeriod: reportAssignPeriod(work.staffReport, email.value.trim()), extended: true, onUpdate: value => {
         result = value; slow = false; clearTimeout(timer);
         work.liveTest.changed ||= value.writes > 0;
         if (value.steps.at(-1)?.state === 'running') timer = setTimeout(() => { slow = true; draw(); }, 15000);
@@ -11798,8 +12000,8 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     }
     if (!result) {
       box.append(el('label', { class: 'sign-off' }, 'Professional email', email),
-        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'April 2028 · four Monday–Friday weeks' : 'July 3–14, 2028 · two Monday–Friday weeks'),
-        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'Checks an empty month with LOA, DNS, Holiday and Undo, then clears its entries. Separately lowers and restores this week’s past Monday only when exactly one eligible entry is present.' : 'One Consulting and A&A test: open and read, Add, Change, Delete, Picture, Undo and Clear. Run once with a Weekly person and once with a Time person.'));
+        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'April 3–June 23, 2028 · twelve Monday–Friday weeks' : 'May 1–July 21, 2028 · twelve Monday–Friday weeks'),
+        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'Checks an empty span with LOA, DNS, Holiday and Undo, then clears its entries. Separately lowers and restores this week’s past Monday only when exactly one eligible entry is present.' : 'One Consulting and A&A test: open and read, Add, Change, Delete, Picture, Undo and Clear. Run once with a Weekly person and once with a Time person.'));
     } else {
       box.append(el('div', { class: 'restore-top' }, el('strong', {}, (active ? 'Testing…' : result.state === 'complete' ? 'Tests complete' : 'Test stopped'))),
         el('div', { class: 'restore-notice' }, `${result.week.start} – ${result.week.end}`));
@@ -12008,7 +12210,7 @@ const results = new Set(['passed','failed','refused','late','unconfirmed','runni
 const actions = new Set(['delete','add','submit']);
 const waitNames = new Set([...WAIT_NAMES,...FIELDS,'open','filters','settle','submit','table']);
 const windowKinds = new Set([...WINDOWS,'Go to Date','Delete confirmation']);
-const views = new Set(['Custom','Month','Week','Time']);
+const views = new Set(['Custom','Month','Week','Day','Time']);
 const boxTypes = new Set(['Date','Week']);
 const periods = new Set(['Weekly','Time','unknown']);
 const yesNo = new Set(['yes','no','unknown']);
