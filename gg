@@ -1,43 +1,46 @@
-/*
- * Snooze tile date check — read-only (Claude, 2026-10-30).
- * The find-anchor check showed that in the Custom view no entry tile carries
- * a date or its own words, so Snooze cannot tell which week a tile is in.
- * Same person, same view, change nothing, paste this into the console. It
- * clicks nothing and changes nothing. For the first five tiles it prints how
- * the tile is built and what around it could carry its date: attribute
- * names, the cell's position in its row, the matching dated cell at that
- * position, and the names of the page's own data on the tile. Words are
- * shown only for labels and LOA / DNS / Holiday; a client shows as "client".
- * The result is also put on the clipboard (copy) to paste back to Claude.
- */
 (() => {
-  const mask = value => String(value || '').replace(/\d{3,}/g, '#');
-  const words = node => (node.textContent || '').replace(/\s+/g, ' ').trim();
-  const safe = text => /leave of absence|\(loa\)|do not schedule|\(dns\)|holiday|\(hol\)/i.test(text) ? text.slice(0, 40)
-    : /^(hours|name|client|date|start|end|wbs|jc|ac2?)\s*:?$/i.test(text) ? text : /^[\d.]+h?$/.test(text) ? text : text ? 'client/other' : '';
-  const attrs = node => [...node.attributes].map(a => a.name === 'class' ? null : a.name.startsWith('data-') || ['title', 'aria-label', 'href', 'id'].includes(a.name)
-    ? `${a.name}=${/date/i.test(a.name) ? a.value : mask(a.value).slice(0, 30)}` : a.name).filter(Boolean);
-  const tiles = [...document.querySelectorAll('.fc-event')].slice(0, 5).map(tile => {
-    const chain = [];
-    for (let at = tile.parentElement, i = 0; at && i < 7; at = at.parentElement, i++) chain.push(`${at.tagName.toLowerCase()}.${[...at.classList].map(mask).join('.')}${attrs(at).length ? ` [${attrs(at).join(' ')}]` : ''}`);
-    const td = tile.closest('td'), tr = td?.parentElement;
-    const col = td && tr ? [...tr.children].indexOf(td) : null;
-    const span = td?.colSpan || 1;
-    const row = tile.closest('.fc-row, .fc-week, .fc-daygrid-row, tr');
-    const datedHere = row ? [...row.querySelectorAll('td[data-date]')].map(cell => cell.getAttribute('data-date')) : [];
-    const skeletonCols = tr ? [...tr.children].map(cell => cell.colSpan || 1) : [];
-    let jq = null;
-    try { const $ = window.jQuery; jq = $ ? Object.keys($(tile).data() || {}) : 'no jQuery'; } catch (e) { jq = `error ${e.name}`; }
+  const iso = value => {
+    if (!value) return null;
+    if (typeof value.format === 'function') return value.format('YYYY-MM-DD');
+    if (value instanceof Date) return value.toISOString().slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}/.test(String(value)) ? String(value).slice(0, 10) : 'unreadable';
+  };
+  const kind = text => /leave of absence|\(loa\)/i.test(text) ? 'LOA' : /do not schedule|\(dns\)/i.test(text) ? 'DNS' : /holiday|\(hol\)/i.test(text) ? 'Holiday' : 'client/other';
+  const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
+  const view = [...document.querySelectorAll('.fc-view')].find(v => shown(v) && v.querySelector('.fc-event'));
+  if (!view) { console.log('No shown calendar view with tiles.'); return; }
+  const columnOf = (td) => {
+    const table = td.closest('table'), rows = [...table.querySelectorAll(':scope > tbody > tr, :scope > tr')];
+    const taken = [];
+    for (let r = 0; r < rows.length; r++) {
+      let col = 0;
+      for (const cell of rows[r].children) {
+        while (taken[r]?.[col]) col++;
+        if (cell === td) return col;
+        const span = cell.colSpan || 1, down = cell.rowSpan || 1;
+        for (let dr = 0; dr < down; dr++) for (let dc = 0; dc < span; dc++) (taken[r + dr] ||= [])[col + dc] = true;
+        col += span;
+      }
+    }
+    return null;
+  };
+  const rows = [...view.querySelectorAll('.fc-row')];
+  const tiles = [...view.querySelectorAll('.fc-event')].map(tile => {
+    const row = tile.closest('.fc-row'), td = tile.closest('td');
+    const dates = row ? [...row.querySelectorAll('.fc-bg td[data-date]')].map(cell => cell.getAttribute('data-date')) : [];
+    const col = td ? columnOf(td) : null;
+    let seg = null, event = null, error = null;
+    try { const $ = window.jQuery; seg = $ ? $(tile).data('fcSeg') : null; event = $ ? $(tile).data('event') || seg?.event : null; } catch (e) { error = e.name; }
     return {
-      tile: `${tile.tagName.toLowerCase()} [${attrs(tile).join(' ')}]`,
-      children: [...tile.querySelectorAll('*')].slice(0, 12).map(child => `${child.tagName.toLowerCase()}.${[...child.classList].map(mask).join('.')} "${safe(words(child)).slice(0, 40)}"${attrs(child).length ? ` [${attrs(child).join(' ')}]` : ''}`),
-      parents: chain, cellIndex: col, colSpan: span, rowCellSpans: skeletonCols, datedCellsInRow: datedHere.slice(0, 16),
-      jqueryDataKeys: jq,
+      kind: kind(tile.textContent || ''), row: rows.indexOf(row), gridColumn: col, gridDate: col === null ? null : dates[col] ?? 'no cell',
+      segColumns: seg ? [seg.leftCol ?? seg.firstCol ?? null, seg.rightCol ?? seg.lastCol ?? null] : null,
+      segDate: seg && Number.isInteger(seg.leftCol ?? seg.firstCol) ? dates[seg.leftCol ?? seg.firstCol] ?? 'no cell' : null,
+      eventStart: iso(event?.start), eventEnd: iso(event?.end), segStart: iso(seg?.start), segEnd: iso(seg?.end),
+      idParts: (tile.getAttribute('data-event-id') || '').split('|').map(part => /^\d{4}-?\d{2}-?\d{2}/.test(part) ? part.slice(0, 10) : `${part.length} chars`),
+      rowDates: dates.length ? [dates[0], dates.at(-1), dates.length] : [], error,
     };
   });
-  const views = [...document.querySelectorAll('.fc-view')].map(view => ({ classes: [...view.classList].join(' '), dated: view.querySelectorAll('td[data-date]').length, tiles: view.querySelectorAll('.fc-event').length }));
-  const result = { probe: 'tile-date 2026-10-30', views, tiles };
-  const text = JSON.stringify(result, null, 1);
+  const text = JSON.stringify({ probe: 'tile-week 2026-10-30', rows: rows.length, tiles }, null, 1);
   console.log(text);
-  try { copy(text); console.log('Copied to the clipboard.'); } catch { /* copy() exists only in the DevTools console */ }
+  try { copy(text); console.log('Copied to the clipboard.'); } catch {   }
 })();
