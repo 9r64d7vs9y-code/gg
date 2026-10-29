@@ -1,46 +1,42 @@
 /*
- * Snooze Find anchor check — read-only (Claude, 2026-10-30).
- * For the Exit on leave whose Find still refused ("no proved client entry or
- * DNS entry in the current week") with the LOA-anchor snippet. On Consulting
- * MySource > Schedule > Calendar view, open that person's schedule by hand,
- * change nothing, then paste this into the console. It clicks nothing and
- * changes nothing. For each entry tile in this week it prints what Snooze
- * reads from it: the tile's own words (only LOA / DNS / Holiday words are
- * shown; a client shows as "client" or "other"), its dates and where it sits.
+ * Snooze tile date check — read-only (Claude, 2026-10-30).
+ * The find-anchor check showed that in the Custom view no entry tile carries
+ * a date or its own words, so Snooze cannot tell which week a tile is in.
+ * Same person, same view, change nothing, paste this into the console. It
+ * clicks nothing and changes nothing. For the first five tiles it prints how
+ * the tile is built and what around it could carry its date: attribute
+ * names, the cell's position in its row, the matching dated cell at that
+ * position, and the names of the page's own data on the tile. Words are
+ * shown only for labels and LOA / DNS / Holiday; a client shows as "client".
  * The result is also put on the clipboard (copy) to paste back to Claude.
  */
 (() => {
-  const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
-  const own = node => [...node.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').replace(/\s+/g, ' ').trim();
-  const all = node => (node.textContent || '').replace(/\s+/g, ' ').trim();
+  const mask = value => String(value || '').replace(/\d{3,}/g, '#');
+  const words = node => (node.textContent || '').replace(/\s+/g, ' ').trim();
   const safe = text => /leave of absence|\(loa\)|do not schedule|\(dns\)|holiday|\(hol\)/i.test(text) ? text.slice(0, 40)
-    : /^[^:]+:\s*\d+$/.test(text) ? 'client (name: number)' : text ? 'other words' : '(none)';
-  const iso = value => /^\d{4}-\d{2}-\d{2}/.test(value || '') ? value.slice(0, 10) : value || null;
-  const todayCell = document.querySelector('td.fc-today[data-date], td.fc-day.fc-today');
-  const today = new Date(); const monday = new Date(today); monday.setDate(today.getDate() - ((today.getDay() + 6) % 7));
-  const day = d => d.toISOString().slice(0, 10);
-  const weekStart = day(new Date(Date.UTC(monday.getFullYear(), monday.getMonth(), monday.getDate())));
-  const weekEnd = day(new Date(Date.UTC(monday.getFullYear(), monday.getMonth(), monday.getDate() + 6)));
-  const views = [...document.querySelectorAll('.fc-view')];
-  const tiles = [...document.querySelectorAll('.fc-event')].map(tile => {
-    const cell = tile.closest('td.fc-day[data-date], td[data-date]');
-    const date = iso(tile.getAttribute('data-date')) || iso(cell?.getAttribute('data-date'));
+    : /^(hours|name|client|date|start|end|wbs|jc|ac2?)\s*:?$/i.test(text) ? text : /^[\d.]+h?$/.test(text) ? text : text ? 'client/other' : '';
+  const attrs = node => [...node.attributes].map(a => a.name === 'class' ? null : a.name.startsWith('data-') || ['title', 'aria-label', 'href', 'id'].includes(a.name)
+    ? `${a.name}=${/date/i.test(a.name) ? a.value : mask(a.value).slice(0, 30)}` : a.name).filter(Boolean);
+  const tiles = [...document.querySelectorAll('.fc-event')].slice(0, 5).map(tile => {
+    const chain = [];
+    for (let at = tile.parentElement, i = 0; at && i < 7; at = at.parentElement, i++) chain.push(`${at.tagName.toLowerCase()}.${[...at.classList].map(mask).join('.')}${attrs(at).length ? ` [${attrs(at).join(' ')}]` : ''}`);
+    const td = tile.closest('td'), tr = td?.parentElement;
+    const col = td && tr ? [...tr.children].indexOf(td) : null;
+    const span = td?.colSpan || 1;
+    const row = tile.closest('.fc-row, .fc-week, .fc-daygrid-row, tr');
+    const datedHere = row ? [...row.querySelectorAll('td[data-date]')].map(cell => cell.getAttribute('data-date')) : [];
+    const skeletonCols = tr ? [...tr.children].map(cell => cell.colSpan || 1) : [];
+    let jq = null;
+    try { const $ = window.jQuery; jq = $ ? Object.keys($(tile).data() || {}) : 'no jQuery'; } catch (e) { jq = `error ${e.name}`; }
     return {
-      ownWords: safe(own(tile)), allWords: safe(all(tile).replace(/^[\d.]+h\s*/, '').replace(/\s*JC:.*$/, '')),
-      tileDate: iso(tile.getAttribute('data-date')), cellDate: iso(cell?.getAttribute('data-date')), date,
-      thisWeek: !!date && date >= weekStart && date <= weekEnd,
-      shown: shown(tile), inFcView: !!tile.closest('.fc-view'), inControl: !!tile.closest('[id^="controlCalendar_"]'),
-      fcIndex: [...document.querySelectorAll('.fc')].indexOf(tile.closest('.fc')),
-      classes: [...tile.classList].filter(c => !/\d{3,}/.test(c)).join(' '),
+      tile: `${tile.tagName.toLowerCase()} [${attrs(tile).join(' ')}]`,
+      children: [...tile.querySelectorAll('*')].slice(0, 12).map(child => `${child.tagName.toLowerCase()}.${[...child.classList].map(mask).join('.')} "${safe(words(child)).slice(0, 40)}"${attrs(child).length ? ` [${attrs(child).join(' ')}]` : ''}`),
+      parents: chain, cellIndex: col, colSpan: span, rowCellSpans: skeletonCols, datedCellsInRow: datedHere.slice(0, 16),
+      jqueryDataKeys: jq,
     };
   });
-  const result = {
-    probe: 'find-anchor 2026-10-30', weekStart, weekEnd,
-    todayCell: todayCell ? iso(todayCell.getAttribute('data-date')) : null,
-    fcCount: document.querySelectorAll('.fc').length, viewCount: views.length,
-    viewsShown: views.map(shown), dayCells: document.querySelectorAll('td.fc-day[data-date]').length,
-    tilesTotal: tiles.length, thisWeek: tiles.filter(t => t.thisWeek), firstOthers: tiles.filter(t => !t.thisWeek).slice(0, 3),
-  };
+  const views = [...document.querySelectorAll('.fc-view')].map(view => ({ classes: [...view.classList].join(' '), dated: view.querySelectorAll('td[data-date]').length, tiles: view.querySelectorAll('.fc-event').length }));
+  const result = { probe: 'tile-date 2026-10-30', views, tiles };
   const text = JSON.stringify(result, null, 1);
   console.log(text);
   try { copy(text); console.log('Copied to the clipboard.'); } catch { /* copy() exists only in the DevTools console */ }
