@@ -2440,6 +2440,7 @@ function termDayOf(text) {
 }
 function checkPerson(person, decision) {
   if (!person) return null;
+  if (person.site === 'tax' && ['nationaltax', 'wnt'].includes(String(person.talentGroup || '').replace(/\s/g, '').toLowerCase())) return stop('notHandled', 'taxTalentGroup', { talentGroup: person.talentGroup });
   if (person.disagreements?.length) return stop('byHand', 'reportPersonDisagrees', { fields: person.disagreements });
   if (person.site === 'tax') {
     const level = levelGroupKey(person.levelGroup);
@@ -2663,6 +2664,10 @@ const { levelGroupKey } = __require("../rules/shared.js");
 const { PageError } = __require("../mysource/dom.js");
 const { reportPullTime } = __require("./report-time.js");
 function reportAssignPeriod(report, email) {
+  if (Array.isArray(report)) {
+    const matches = report.filter(one => reportHasPerson(one, email));
+    return matches.length === 1 ? reportAssignPeriod(matches[0], email) : 'unknown';
+  }
   const entries = report?.entries?.filter(row => row.email === emailKey(email)) || [];
   const labels = entries.map(row => {
     const raw = Object.entries(row.fields || {}).find(([key]) => headerKey(key) === headerKey('Assign Period'))?.[1];
@@ -2673,6 +2678,28 @@ function reportAssignPeriod(report, email) {
 function requireDayReport(report) {
   if (report?.mode !== 'day') throw Object.assign(new PageError('The Staff Schedule Hours Report was not pulled by Day: pull it by Day. It is the backup (Dre, 2026-10-02).'), { batchWide: true });
 }
+const loadedReports = report => Array.isArray(report) ? report : report ? [report] : [];
+const reportHasPerson = (report, email) => report.entries.some(row => row.email === emailKey(email) || row.emailsInCell?.includes(emailKey(email)));
+function reportKind(report) {
+  if (report.site === 'tax') return 'tax';
+  const kindOf = value => ({ consultingservices: 'consulting', 'audit&assurance': 'audit' })[valueKey(value).replace(/\s/g, '')];
+  const kinds = report.entries.map(row => {
+    const facts = ['Business', 'Business Area', 'Practice'].map(key => kindOf(row.fields?.[key])).filter(Boolean);
+    return new Set(facts).size === 1 ? facts[0] : null;
+  });
+  return kinds.length && kinds.every(kind => kind && kind === kinds[0]) ? kinds[0] : null;
+}
+function addLoadedReport(current, next, site, replace = null) {
+  if (site === 'tax') return next;
+  requireDayReport(next);
+  const kind = reportKind(next);
+  if (!['consulting', 'audit'].includes(kind)) throw new InputFileError('The Staff Schedule Hours Report must contain only Consulting or only Audit rows. Check Business, Business Area and Practice, then load it again.');
+  const reports = loadedReports(current);
+  if (replace && kind !== replace) throw new InputFileError(`This is not the ${replace === 'audit' ? 'Audit' : 'Consulting'} report. Load it on its own report line.`);
+  const kept = replace ? reports.filter(one => reportKind(one) !== replace) : reports;
+  if (kept.some(one => reportKind(one) === kind)) throw new InputFileError(`${kind === 'audit' ? 'An Audit' : 'A Consulting'} Staff Schedule Hours Report is already loaded. Use change to replace it.`);
+  return [...kept, next];
+}
 const REPORT_COLUMNS = {
   email: 'Professional Email', id: 'Professional ID', professional: 'Professional',
   client: 'Client', clientName: 'Client Name', clientNumber: 'Client Number', billable: 'Billable', utilization: 'Utilization Generating',
@@ -2680,7 +2707,7 @@ const REPORT_COLUMNS = {
   jobCode: 'Job Code', assignCode1: 'Assign Code 1', assignCode2: 'Assign Code 2',
   resourceManager: 'Resource Manager', resourceManagerEmail: 'Resource Manager Email', total: 'Total Scheduled Hours',
 };
-const TAX_COLUMNS = { ...REPORT_COLUMNS, email: 'Email', professional: 'Name', clientNumber: 'Client #', engagement: 'WBS Description', revenue: 'Revenue Generating', levelGroup: 'Level Group' };
+const TAX_COLUMNS = { ...REPORT_COLUMNS, email: 'Email', professional: 'Name', clientNumber: 'Client #', engagement: 'WBS Description', revenue: 'Revenue Generating', levelGroup: 'Level Group', talentGroup: 'Talent Group' };
 const REQUIRED = ['email', 'client', 'billable', 'total'];
 const TAX_REQUIRED = ['email', 'client', 'revenue', 'total', 'levelGroup'];
 const columnsIn = keys => REQUIRED.every(field => keys.includes(headerKey(REPORT_COLUMNS[field]))) ? REPORT_COLUMNS
@@ -2805,14 +2832,14 @@ function personSlice(report, email, window) {
     : wanted.filter(monday => !report.weeks.some(week => sameDay(week, monday)));
   const all = report.entries.filter(entry => entry.email === key);
   const twoEmails = report.entries.some(entry => entry.emailsInCell?.includes(key)) || all.some(entry => entry.twoManagerEmails);
-  const facts = entry => ({ ...(report.site === 'tax' ? { levelGroup: entry.levelGroup || '' } : {}), id: entry.id || '', professional: entry.professional || '', email: entry.email || '', business: entry.fields.Business || '',
+  const facts = entry => ({ ...(report.site === 'tax' ? { levelGroup: entry.levelGroup || '', talentGroup: entry.talentGroup || '' } : {}), id: entry.id || '', professional: entry.professional || '', email: entry.email || '', business: entry.fields.Business || '',
     businessArea: entry.fields['Business Area'] || '', termDate: entry.fields['Term Date'] || '',
     region: entry.fields.Region || '', costCenterDescription: entry.fields['Cost Center Description'] || '', resourceManager: entry.resourceManager || '', resourceManagerEmail: emailKey(entry.resourceManagerEmail || '') });
   const related = report.entries.filter(entry => all.some(one => entry === one
     || one.id && entry.id === one.id
     || one.professional && valueKey(entry.professional) === valueKey(one.professional)));
   const disagreements = all.length ? Object.keys(facts(all[0])).filter(field => new Set(related.map(entry =>
-    field === 'email' ? facts(entry)[field] : field === 'id' ? String(facts(entry)[field]).trim() : field === 'levelGroup' ? levelGroupKey(facts(entry)[field]) : valueKey(facts(entry)[field]))).size > 1) : [];
+    field === 'email' ? facts(entry)[field] : field === 'id' ? String(facts(entry)[field]).trim() : field === 'levelGroup' ? levelGroupKey(facts(entry)[field]) : field === 'talentGroup' ? String(facts(entry)[field]).replace(/\s/g, '').toLowerCase() : valueKey(facts(entry)[field]))).size > 1) : [];
   const weekLabel = monday => usDate(monday);
   const entries = all
     .map(entry => ({
@@ -2847,7 +2874,7 @@ function personSlice(report, email, window) {
       ? [...report.headers.filter(header => !report.dateColumns.has(header)), ...covered.map(weekLabel)]
       : report.headers.filter(header => !report.weekHeaders?.has(header) || inWindow(report.weekHeaders.get(header))),
     person: all[0] ? {
-      ...(report.site === 'tax' ? { site: 'tax', levelGroup: all[0].levelGroup || '' } : {}),
+      ...(report.site === 'tax' ? { site: 'tax', levelGroup: all[0].levelGroup || '', talentGroup: all[0].talentGroup || '' } : {}),
       professional: all[0].professional, business: all[0].fields.Business || '', practice: all[0].fields.Practice || '',
       businessArea: all[0].fields['Business Area'] || '',
       region: all[0].fields.Region || '',
@@ -2860,6 +2887,10 @@ function personSlice(report, email, window) {
 }
 __exports.reportAssignPeriod = reportAssignPeriod;
 __exports.requireDayReport = requireDayReport;
+__exports.loadedReports = loadedReports;
+__exports.reportHasPerson = reportHasPerson;
+__exports.reportKind = reportKind;
+__exports.addLoadedReport = addLoadedReport;
 __exports.dateOf = dateOf;
 __exports.readReport = readReport;
 __exports.personSlice = personSlice;
@@ -2918,11 +2949,15 @@ function reasonLine(decision, prepared = null) {
     case 'notConsulting': return `Business "${decision.business}" (not ${decision.expectedBusiness || 'Consulting Services'}) → not in the LOA SOP`;
     case 'wrongSite': return `Run on ${decision.site === 'tax' ? 'Tax' : 'Consulting'} MySource`;
     case 'taxPartnerMd': return 'Partner/MD';
+    case 'taxTalentGroup': return `Talent Group ${decision.talentGroup}: not supported by Snooze → no action; close incomplete.`;
+    case 'taxPastEnd': return 'Existing LOA runs past the new end; no schedule change.';
+    case 'taxPartialLoa': return 'An existing Tax weekly LOA starts outside the partial-week change. Nothing was changed; By hand.';
     case 'taxLevelGroup': return `Level Group: ${decision.levelGroup || '(blank)'} → by hand`;
     case 'mixedNotification': return '✗ The Description has both leave and exit dates → check the ticket';
     case 'noEmail': return '✗ The ticket has no email → check the ticket';
     case 'twoEmails': return '✗ Two email addresses in one cell → by hand; check which person the ticket means';
     case 'twoEmailsInReportCell': return '✗ Two email addresses in one report cell → by hand; check the report';
+    case 'bothReports': return 'On both the Consulting and Audit Staff Schedule Hours Reports → by hand; check both reports.';
     case 'twoTickets': {
       const fields = { start: 'start', end: 'end', estimatedReturn: 'estimated return', confirmedReturn: 'confirmed return', resignation: 'resignation', lastWorkingDay: 'last working day' };
       const tickets = (decision.tickets || []).map(ticket => `${ticket.number} ${Object.entries(fields).filter(([field]) => ticket.dates[field]).map(([field, label]) => `${label} ${usDate(ticket.dates[field])}`).join(' ') || `${ticket.kind}; no readable dates`}`);
@@ -2963,6 +2998,12 @@ class PageError extends Error {
   }
 }
 let batchGuard = null;
+let connectionGuard = null;
+function setConnectionGuard(guard) {
+  if (connectionGuard) throw new PageError('Another batch is already running.');
+  connectionGuard = guard;
+  return () => { if (connectionGuard === guard) connectionGuard = null; };
+}
 function setBatchGuard(guard) {
   if (batchGuard && guard) throw new PageError('Another batch is already running.');
   batchGuard = guard;
@@ -2997,7 +3038,7 @@ function guardPage() {
   const probe = new Map();
   guardProbes.add(probe);
   try {
-    for (const guard of [...personGuards, batchGuard]) {
+    for (const guard of [connectionGuard, ...personGuards, batchGuard]) {
       if (!guard) continue;
       try { guard(probe); }
       catch (error) {
@@ -3025,7 +3066,7 @@ function guarded(action, timeout = WAIT.timeout) {
   return attempt();
 }
 const guardReady = (timeout = WAIT.timeout) => guarded(() => true, timeout);
-const STOP_FLAGS = ['identityChanged', 'session', 'pageBlocked', 'schedulePage', 'batchWide'];
+const STOP_FLAGS = ['identityChanged', 'session', 'pageBlocked', 'schedulePage', 'batchWide', 'connectionLost'];
 const stopFlagged = error => STOP_FLAGS.some(flag => error?.[flag]);
 function keepFlags(from, to) {
   if (from?.reasonName) to.reasonName = from.reasonName;
@@ -3338,6 +3379,7 @@ async function chooseInSelect2(select, wanted, label) {
   });
 }
 __exports.PageError = PageError;
+__exports.setConnectionGuard = setConnectionGuard;
 __exports.setBatchGuard = setBatchGuard;
 __exports.activeGuardProbe = activeGuardProbe;
 __exports.probeStyleReader = probeStyleReader;
@@ -3550,7 +3592,7 @@ const { emailKey, emailFormKey } = __require("../rules/prepare.js");
 const { findByEmail } = __require("../family/email.js");
 const { recordRun, observeRun } = __require("../core/run-records.js");
 const { DNS_CLIENT } = __require("./checks.js");
-const { PageError, WAIT, activeGuardProbe, probeStyleReader, chooseInSelect2, click, closeWindow, describe, fieldByLabel, guardPage, guardReady, guarded, keepFlags, cleanupAfter, rightClick, sameText, setChecked, settled, shown, shownUsing, stopFlagged, text, typeInto, waitFor, withPersonGuard } = __require("./dom.js");
+const { PageError, WAIT, activeGuardProbe, probeStyleReader, chooseInSelect2, click, closeWindow, describe, fieldByLabel, guardReady, guarded, keepFlags, cleanupAfter, rightClick, sameText, setChecked, settled, shown, shownUsing, stopFlagged, text, typeInto, waitFor, withPersonGuard } = __require("./dom.js");
 const SEARCH_SELECT = 'select[id^="ScheduleAddForm_Staff_Form_field_"]';
 const CALENDAR_VIEW = '.fc-view';
 const SCHEDULE_PAGE_WORDS = {
@@ -3842,9 +3884,6 @@ async function resumePageReady({ empty = false } = {}) {
   currentPerson();
   if (empty && !pageCalm()) throw new PageError('The previous schedule is still open or loading. Close it and wait before Resume.');
 }
-function personEntityElements() {
-  return entityElementsFrom(shownNames(document));
-}
 function entityElementsFrom(names, styleOf) {
   if (names.length !== 1) return [];
   if (isTaxPage(names[0].ownerDocument)) {
@@ -3882,10 +3921,10 @@ function provedIdFrom(elements, names, styleOf) {
   return names.length === 1 && isTaxPage(names[0].ownerDocument) && !taxIdConfirmed(names, id, styleOf) ? null : id;
 }
 function personIdCheck() {
-  const elements = personEntityElements();
-  const entityId = personEntityId();
-  const id = elements.length > 1 ? 'ambiguous' : entityId !== null ? 'found' : 'missing';
   const names = shownNames(document);
+  const elements = entityElementsFrom(names);
+  const entityId = provedIdFrom(elements, names);
+  const id = elements.length > 1 ? 'ambiguous' : entityId !== null ? 'found' : 'missing';
   if (isTaxPage()) return { id, forecastLink: 'missing', matches: idFrom(elements) === null ? null : taxIdConfirmed(names, idFrom(elements)) };
   const area = names.length === 1
     ? names[0].closest('div.calendar-title') || names[0].closest('div.js-calendar-wrapper, div.staff-calendar-wrapper')
@@ -4366,6 +4405,11 @@ async function proveFindReopenAfter(removed) {
   } finally { await closeEdit(edit); }
   if (!retained) throw new PageError('Find Assignments would lose its current-week client entry or DNS entry after this change. Nothing was changed; By hand.');
 }
+function findClientsLabel(form) {
+  const labels = ['Clients', 'Client'].filter(name => [...form.querySelectorAll('label')].some(node => sameText(text(node).replace(/[*?]/g, ''), name)));
+  if (labels.length > 1) { recordRun({ type: 'miss', name: 'Clients' }); throw new PageError('The form has fields labelled both "Client" and "Clients".'); }
+  return labels[0] || 'Clients';
+}
 const assignmentRanges = new WeakMap();
 const findAssignmentsRange = edit => assignmentRanges.get(edit) || null;
 function findDateBox(form, edge) {
@@ -4409,7 +4453,8 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
     return edit;
   }
   const modal = await settled(await waitFor(() => [...document.querySelectorAll('#FindAssignmentsModal')].find(shown), 'the Find Assignments window', WAIT.window));
-  const form = modal.querySelector('#FindMultipleEventsForm_Form') || modal;
+  const form = modal.querySelector('#FindMultipleEventsForm_Form, #FindMultipleEventsWeeklyForm_Form') || modal;
+  const clientsLabel = findClientsLabel(form);
   const weekBoxes = [...form.querySelectorAll('label')].some(node => sameText(text(node).replace(/[*?]/g, ''), 'Start Week'));
   recordRun({ type: 'findBoxes', boxType: weekBoxes ? 'Week' : 'Date' });
   if (weekBoxes && weekEndFriday && end && compareDays(end, addDays(mondayOf(end), 4)) > 0) end = addDays(mondayOf(end), 4);
@@ -4417,7 +4462,7 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
   if (greyed) {
     const from = termDayOf(findDateBox(form, 'Start').value.trim());
     const to = termDayOf(findDateBox(form, 'End').value.trim());
-    const selected = [...fieldByLabel(form, 'Clients').selectedOptions].filter(option => option.value);
+    const selected = [...fieldByLabel(form, clientsLabel).selectedOptions].filter(option => option.value);
     if (!from || !to || !sameDay(mondayOf(from), mondayOf(today)) || !sameDay(mondayOf(to), mondayOf(today))
         || compareDays(to, from) < 0 || selected.length !== 1 || !(/^[^:]+:\s*\d+$/.test(text(selected[0])) || dnsFindAnchor(text(selected[0])))) {
       throw new PageError('Find Assignments did not prove its current-week client entry or DNS entry prefill. Nothing was read or changed; By hand.');
@@ -4427,10 +4472,10 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
   if (greyed) await setChecked(allClients, true);
   if (clients) {
     await setChecked(allClients, false);
-    const select = fieldByLabel(form, 'Clients');
+    const select = fieldByLabel(form, clientsLabel);
     for (const option of select.options) option.selected = false;
     select.dispatchEvent(new window.Event('change', { bubbles: true }));
-    for (const client of clients) await chooseInSelect2(select, client, 'Clients');
+    for (const client of clients) await chooseInSelect2(select, client, clientsLabel);
   } else {
     await setChecked(allClients, true);
   }
@@ -4459,7 +4504,7 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
       || !startKept || futureBox.checked !== future || !endKept) {
     throw new PageError('Find Assignments did not keep the dates Snooze typed. Nothing was read or changed.');
   }
-  const chosen = [...fieldByLabel(form, 'Clients').selectedOptions].filter(option => option.value).map(text);
+  const chosen = [...fieldByLabel(form, clientsLabel).selectedOptions].filter(option => option.value).map(text);
   const wbs = fieldByLabel(form, 'WBS');
   const pricingRendered = pricing.nextElementSibling?.querySelector('.select2-selection__rendered');
   const pricingChip = pricing.nextElementSibling?.querySelector('.select2-selection__choice');
@@ -4510,7 +4555,6 @@ const numberOf = value => {
   return Number.isFinite(number) ? number : NaN;
 };
 function readEditTableRecorded(edit) {
-  guardPage();
   const table = edit.querySelector('table#editGrid');
   const pager = edit.querySelector('.dataTables_paginate');
   if (pager && [...pager.querySelectorAll('a, button, li')].some(node => /^\d+$/.test(text(node)) && text(node) !== '1')) {
@@ -4629,7 +4673,7 @@ async function readRowNote(edit, id) {
   try { await guardReady(); return note.text; } finally { await closeWindow(note.popup, 'the View Notes window'); }
 }
 function openPerson(...args) { return timedRun("open person", () => openPersonRecorded(...args)); }
-function readEditTable(...args) { retirePreflightForm(); return guarded(() => timedRun("read", () => readEditTableRecorded(...args))); }
+function readEditTable(...args) { retirePreflightForm(); return timedRun("read", () => guarded(() => readEditTableRecorded(...args))); }
 __exports.SCHEDULE_PAGE_WORDS = SCHEDULE_PAGE_WORDS;
 __exports.IDENTITY_PAUSE_WORDS = IDENTITY_PAUSE_WORDS;
 __exports.schedulePageFacts = schedulePageFacts;
@@ -6374,8 +6418,7 @@ const readTitleDay = value => {
   const m = match ? MONTHS.indexOf(match[1].toLowerCase()) + 1 : 0;
   return m ? { y: Number(match[3]), m, d: Number(match[2]) } : null;
 };
-const titleWithIcon = () => {
-  const view = calendarView();
+const titleWithIcon = (view = calendarView()) => {
   const active = view?.closest('.fc'), wrapper = view?.closest('.staff-calendar-wrapper');
   const roots = wrapper?.querySelector('[id^="controlCalendar_"] > .fc-toolbar')
     ? [wrapper] : [active, wrapper].filter(Boolean);
@@ -6388,8 +6431,8 @@ const titleWithIcon = () => {
   }
   return null;
 };
-function shownRange() {
-  const h2 = titleWithIcon();
+function shownRange(view = calendarView()) {
+  const h2 = titleWithIcon(view);
   const own = h2 ? [...h2.childNodes].filter(node => node.nodeType === 3).map(node => node.textContent).join(' ').replace(/\s+/g, ' ').trim() : '';
   const [from, to] = own.split(/\s+[–—-]\s+/);
   const start = readTitleDay(from || '');
@@ -6400,15 +6443,17 @@ const toNumber = day => day.y * 10000 + day.m * 100 + day.d;
 const rangeHolds = (range, day) => Boolean(range && toNumber(range.start) <= toNumber(day) && toNumber(day) <= toNumber(range.end));
 function calendarHolds(day) {
   const monday = mondayOf(day);
-  return [...(calendarView()?.querySelectorAll('td.fc-day[data-date]') || [])].filter(onScreen).some(cell => {
+  const view = calendarView();
+  return [...(view?.querySelectorAll('td.fc-day[data-date]') || [])].filter(onScreen).some(cell => {
     const date = readIsoDay(cell.getAttribute('data-date'));
     return date && (sameDay(date, day) || sameDay(date, monday));
-  }) || rangeHolds(shownRange(), day);
+  }) || rangeHolds(shownRange(view), day);
 }
 function calendarDates() {
-  const dates = [...(calendarView()?.querySelectorAll('td.fc-day[data-date]') || [])]
+  const view = calendarView();
+  const dates = [...(view?.querySelectorAll('td.fc-day[data-date]') || [])]
     .filter(onScreen).map(cell => readIsoDay(cell.getAttribute('data-date'))).filter(Boolean).sort(compareDays);
-  return { heading: shownRange(), cells: { count: dates.length, first: dates[0] || null, last: dates.at(-1) || null } };
+  return { heading: shownRange(view), cells: { count: dates.length, first: dates[0] || null, last: dates.at(-1) || null } };
 }
 function pictureWeeksHold(start, end) {
   const view = calendarView();
@@ -6428,7 +6473,7 @@ function exactPictureRange(day) {
   try {
     const view = calendarView();
     if (!view?.classList.contains('fc-weeklyTimeline-view')) return null;
-    const range = shownRange();
+    const range = shownRange(view);
     if (!range || !sameDay(range.start, mondayOf(day)) || !rangeHolds(range, day)) return null;
     const dates = [...view.querySelectorAll('td.fc-day[data-date]')].filter(onScreen)
       .map(cell => readIsoDay(cell.getAttribute('data-date')));
@@ -6736,7 +6781,35 @@ __exports.requireFreshReport = requireFreshReport;
 "mysource/batch.js": function (__require, __exports, document, window) {
 'use strict';
 const { PageError, closeWindow, shown, waitFor, guardReady, stopFlagged } = __require("./dom.js");
-const { searchPageReady, pageCalm, closeContextLayer } = __require("./schedule.js");
+const { searchPageReady, pageCalm, closeContextLayer, waitForPersonIdentity, resumePageReady } = __require("./schedule.js");
+const CONNECTION_WORDS = 'Connection lost, waiting';
+function watchConnection({ lost = () => {}, online = () => {} } = {}) {
+  const view = window;
+  let disconnected = false, loss = 0, resumeLoss = null;
+  const offline = () => { loss++; if (!disconnected) { disconnected = true; lost(); } };
+  const connected = () => { if (view.navigator.onLine !== false) online(); };
+  view.addEventListener('offline', offline);
+  view.addEventListener('online', connected);
+  return {
+    check(resuming = false) {
+      if (view.navigator.onLine === false && !disconnected) offline();
+      if (view.navigator.onLine === false || disconnected && (!resuming || resumeLoss !== loss))
+        throw Object.assign(new PageError(CONNECTION_WORDS, { record: false }), { connectionLost: true });
+    },
+    beginResume() { resumeLoss = loss; this.check(true); },
+    accept() { this.check(true); disconnected = false; },
+    close() { view.removeEventListener('offline', offline); view.removeEventListener('online', connected); },
+  };
+}
+async function connectionPageReady(identity) {
+  await guardReady();
+  if (identity?.name) await waitForPersonIdentity(identity);
+  await resumePageReady({ empty: !!identity && !identity.name });
+  await cancelBatchWindows();
+  await resumePageReady({ empty: !!identity && !identity.name });
+  if (identity?.name) await waitForPersonIdentity(identity);
+  await guardReady();
+}
 function sessionExpired() {
   return [...document.querySelectorAll('.session-expired-modal')].some(shown);
 }
@@ -6812,6 +6885,9 @@ function batchCover(host = document.getElementById('snooze-panel-host'), control
   pageLocks.add(release);
   return release;
 }
+__exports.CONNECTION_WORDS = CONNECTION_WORDS;
+__exports.watchConnection = watchConnection;
+__exports.connectionPageReady = connectionPageReady;
 __exports.sessionExpired = sessionExpired;
 __exports.cancelBatchWindows = cancelBatchWindows;
 __exports.closeSkippedPerson = closeSkippedPerson;
@@ -6870,6 +6946,7 @@ function shortReason(row) {
   if (['personNotFound', 'pageReportMismatch'].includes(row.diagnostic?.reason) && row.message) return row.message;
   if (row.one.slice?.status === 'notOnReport' && row.state === 'skipped') return `not on the Staff Schedule Hours Report, possibly not ${row.one.record.subcategory?.business === 'audit' ? 'A&A' : row.one.record.subcategory?.site === 'tax' ? 'Tax' : 'Consulting'}`;
   const decision = row.one.personStop || row.one.decision;
+  if (decision.code === 'taxTalentGroup') return reasonLine(decision);
   const codes = { cmat: 'CMAT', noDates: 'No leave dates', noStart: 'No leave start date', noEnd: 'No leave end date', noEmail: 'No email', notesTooLong: 'Notes exceed 150 characters', noBusiness: 'Business missing', termDateUnreadable: 'Term Date unreadable', notConsulting: `Business: ${decision.business || ''}`, exitNoLwdUs: 'US person; last working day missing' };
   const reason = codes[decision.code] || row.message || reasonLine(decision);
   return reason.replace(/^[✗⚠✓]\s*/, '').replace(/\s*→.*$/, '').replace(/\s*Nothing was changed\.?/g, '').trim();
@@ -6915,6 +6992,7 @@ const { professionalName, rememberPageName, emailKey } = __require("../rules/pre
 const { reasonLine } = __require("../screen/wording.js");
 const { dayRanges } = __require("../rules/leaves.js");
 const { runReportDocx } = __require("./run-report-docx.js");
+const { loadedReports, reportKind } = __require("./report.js");
 function needsPersonPicture(row) {
   if (row.state === 'done') return true;
   if (row.state !== 'nothing' || (row.one.personStop && row.one.personStop.code !== 'taxPartnerMd') || row.one.slice?.status === 'notOnReport') return false;
@@ -7023,6 +7101,7 @@ async function capturePersonRecorded(row, { identity, operation = 'capture' } = 
   out.warnings = [...new Set(warnings)].join('; ');
 }
 const BATCH_COLUMNS = ['Ticket', 'Name', 'Email', 'Resource Manager name', 'Resource Manager email', 'Kind', 'What was done', 'Warning/failure reason', 'Resolution notes (SN)'];
+const joinReasons = parts => parts.reduce((text, part) => !text ? part : `${text}${/[.!?]$/.test(text) ? ' ' : '; '}${part}`, '');
 function rowWarnings(row) {
   if (row.state === 'timeLimit') return row.message;
   const one = row.one;
@@ -7031,7 +7110,7 @@ function rowWarnings(row) {
       : row.prepared?.alreadyDone ? row.prepared.nothing
         : ['pending', 'ready'].includes(row.state) ? `Not run · ${changeLine(one, row.prepared)}` : changeLine(one, row.prepared);
   const duplicates = one.record.duplicates || [];
-  return [...new Set([
+  return joinReasons([...new Set([
     reasonLine(one.personStop || one.decision, row.prepared),
     description && `${description}${duplicates.length ? ` · also ${duplicates.map(ticket => ticket.number).join(', ')}` : ''}`,
     row.message,
@@ -7047,7 +7126,7 @@ function rowWarnings(row) {
     one.exit?.dpNotFound && 'RM not applicable.',
     one.outputs?.warnings,
     row.undoWarning,
-  ].filter(Boolean))].join('; ');
+  ].filter(Boolean))]);
 }
 function rowMail(row) {
   const one = row.one;
@@ -7092,7 +7171,7 @@ function batchTable(rows, signOff = '') {
     const main = [one.record.number, professionalName(one.record), one.record.pageEmail ?? one.record.exportEmail ?? one.record.email, dpName, dpEmail,
       one.record.notification.kind === 'exit' ? 'Exit' : one.record.notification.kind === 'leave' ? 'LOA' : '', status,
       [rowWarnings(row), missing].filter(Boolean).join('; '),
-      one.exit?.dpNotFound ? 'RM not applicable' : proved && duplicates.length ? `Duplicates closed: ${duplicates.map(ticket => ticket.number).join(', ')}.` : ''];
+      one.decision.code === 'taxTalentGroup' ? reasonLine(one.decision) : one.exit?.dpNotFound ? 'RM not applicable' : proved && duplicates.length ? `Duplicates closed: ${duplicates.map(ticket => ticket.number).join(', ')}.` : ''];
     return [main, ...duplicates.map(ticket => [ticket.number, professionalName(one.record), one.record.pageEmail ?? ticket.exportEmail ?? ticket.email, dpName, dpEmail,
       main[5], proved ? `Duplicate of ${one.record.number}: close it` : `${status}; duplicate of ${one.record.number}`,
       main[7], one.exit?.dpNotFound ? 'RM not applicable' : proved ? `Duplicate case of ${one.record.number}. Actioned under ${one.record.number}.` : ''])];
@@ -7197,11 +7276,12 @@ function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupRe
     { name: 'Batch', rows: table, widths: [20, 26, 36, 26, 36, 12, 52, 64, 48], rowHeight: 300 },
     { name: 'Needs attention', rows: needsAttention, widths: [20, 26, 24, 100], rowHeight: 100 },
   ])], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) });
-  if (backupReport?.sourceFile) {
-    const original = backupReport.fileName || backupReport.sourceFile.name || 'Staff Schedule Hours Report.xlsx';
+  for (const report of loadedReports(backupReport).filter(report => report.sourceFile)) {
+    const original = report.fileName || report.sourceFile.name || 'Staff Schedule Hours Report.xlsx';
     const extension = original.match(/\.(xlsx|csv)$/i)?.[0] || '.xlsx';
     const stem = original.slice(0, original.length - extension.length);
-    files.push({ name: `Backup/${safeName(stem)}${extension}`, blob: backupReport.sourceFile });
+    const prefix = Array.isArray(backupReport) ? `${reportKind(report) === 'audit' ? 'Audit' : 'Consulting'} - ` : '';
+    files.push({ name: `Backup/${prefix}${safeName(stem)}${extension}`, blob: report.sourceFile });
   }
   if (runReport) files.push({ name: 'Snooze run report.docx', blob: new Blob([runReportDocx(runReport)], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }) });
   return files;
@@ -7339,13 +7419,13 @@ const TIME_LIMIT_WORDS = 'Not in this run, time limit';
 function estimateBatch(rows, states, left) {
   const budget = Math.max(0, left / 60000 - BATCH_RESERVE_MINUTES);
   const included = [], excluded = [];
-  let minutes = 0, full = false;
+  let minutes = 0;
   rows.forEach((row, index) => {
     const state = states.get(row);
     const cost = state === 'ready' ? CHANGE_MINUTES
       : state === 'nothing' && needsPersonPicture({ ...row, state }) ? OPEN_WITHOUT_CHANGE_MINUTES : NEVER_OPENED_MINUTES;
     if (!cost) return;
-    if (full || minutes + cost > budget) { full = true; excluded.push(index); }
+    if (minutes + cost > budget) excluded.push(index);
     else { included.push(index); minutes += cost; }
   });
   const total = included.length + excluded.length;
@@ -7359,10 +7439,10 @@ __exports.estimateBatch = estimateBatch;
 'use strict';
 const { createSessionClock, PERSON_RESERVE_MS, CONFIRM_RESERVE_MS, SESSION_WORDS } = __require("../screen/session-clock.js");
 const { prepare, apply, restore, recover: recoverBackup } = __require("./work.js");
-const { requireDayReport } = __require("../files/report.js");
+const { requireDayReport, loadedReports } = __require("../files/report.js");
 const { requireFreshReport } = __require("../files/report-time.js");
 const { PageError, setBatchGuard, stopFlagged, waitFor, WAIT, guardReady } = __require("../mysource/dom.js");
-const { sessionExpired, cancelBatchWindows, closeSkippedPerson, batchCover, unlockPage } = __require("../mysource/batch.js");
+const { sessionExpired, cancelBatchWindows, closeSkippedPerson, batchCover, unlockPage, watchConnection, connectionPageReady, CONNECTION_WORDS } = __require("../mysource/batch.js");
 const { todayOf, compareDays, workingDays, usDate } = __require("../rules/dates.js");
 const { compareCopies, copyWindow } = __require("../mysource/copy.js");
 const { openPerson, personIdentity, checkPersonIdentity, waitForPersonIdentity, pageCalm, resumePageReady, requireSchedulePage, SCHEDULE_PAGE_WORDS, IDENTITY_PAUSE_WORDS } = __require("../mysource/schedule.js");
@@ -7435,6 +7515,21 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
   let retrying = false;
   let recordingPicture = false, pictureError = false;
   let filesRevision = 0;
+  let connection = null, connectionIdentity = null, onlinePending = false;
+  const autoResume = () => {
+    if (!onlinePending || batch.active) return;
+    onlinePending = false;
+    if (batch.connectionPaused && !batch.stopRequested && batch.state === 'paused') void batch.resume();
+  };
+  const watchBrowser = () => {
+    connection ||= watchConnection({
+      lost: () => {
+        try { connectionIdentity = observedRow?.prepared?.identity || personIdentity(); }
+        catch (error) { connectionIdentity = { error }; }
+      },
+      online: () => { onlinePending = true; autoResume(); },
+    });
+  };
   const reviewStates = new Map();
   const showTimeLimit = estimate => {
     batch.timeLimit = estimate;
@@ -7557,6 +7652,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
   };
   const guard = probe => {
     if (sessionExpired()) throw new SessionError();
+    connection?.check(checkingResume);
     if (!checkingResume && returned && hiddenIdentity?.error) throw hiddenIdentity.error;
     if (!checkingResume && returned && hiddenIdentity?.name) {
       try { checkPersonIdentity(hiddenIdentity, 'identity check', probe); }
@@ -7583,6 +7679,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     let blocked;
     try { if (requested) await timedRun('screenshot', () => capture(row, { alreadyOpen: !!row.prepared?.identity, ...captureOptions })); }
     catch (error) {
+      if (error.connectionLost) throw error;
       blocked = stopFlagged(error) && error;
       if (error.schedulePage && !error.scheduleRecorded) {
         batch.record(row, { type: 'schedulePage', facts: error.scheduleFacts, person: error.person, stage: error.stage || 'screenshot', operation: captureOptions.operation || 'capture' });
@@ -7608,6 +7705,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
   async function step(fn) {
     await checkedPage();
     try { return await fn(); } catch (error) {
+      if (error.connectionLost) throw error;
       if (error.name !== 'PageError') batch.record(observedRow, { type: 'error', code: reasonCode(error.message) });
       if (error.session || sessionExpired()) { error.session = true; throw error; }
       if (error.schedulePage && !error.identityChanged && !error.session && !error.batchWide && !error.pageBlocked) {
@@ -7633,12 +7731,14 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     }
     return false;
   }
-  async function recover(row) {
+  async function recover(row, restart = false) {
     observedRow = row;
     row.diagnostic.reason = 'changeUnproved'; row.diagnostic.failedStage ||= 'check';
     batch.pendingRestore = row;
-    row.one.run = { state: 'failed', prepared: row.prepared, message: BATCH.pendingRestore };
-    tell(BATCH.pendingRestore);
+    if (!restart) {
+      row.one.run = { state: 'failed', prepared: row.prepared, message: BATCH.pendingRestore };
+      tell(BATCH.pendingRestore);
+    }
     try {
       await checkedPage();
       await cancelBatchWindows();
@@ -7655,12 +7755,20 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
         row.restoreResult.unrestoredDates = [...new Set([...(row.restoreResult.unrestoredDates || []), ...past])];
         row.restoreResult.differences = [...(row.restoreResult.differences || []), ...past.map(date => ({ date, field: 'restore unconfirmed', message: `${date}: restore unconfirmed` }))];
       }
+      if (restart && row.restoreResult.same) {
+        row.diagnostic.recovery = { confirmed: true, window: row.prepared.backup.window, differences: [] };
+        batch.pendingRestore = null; batch.connectionRetry = null;
+        row.state = 'ready'; row.message = ''; delete row.one.run; delete row.byHand;
+        delete row.prepared; wrote = false;
+        return true;
+      }
       row.state = row.restoreResult.same ? 'restored' : 'restoreFailed';
       row.one.run = { state: 'failed', prepared: row.prepared, message: row.restoreResult.same ? BATCH.restored : BATCH.restoreFailed };
       batch.pendingRestore = null;
       await picture(row);
       tell(row.restoreResult.same ? BATCH.restored : BATCH.restoreFailed);
     } catch (error) {
+      if (error.connectionLost) throw error;
       if (error.session || sessionExpired()) { batch.diagnostic.expired = true; batch.state = 'session'; batch.recheckDone = true; tell(BATCH.session); return false; }
       if (error.identityChanged || error.schedulePage || error.batchWide) throw error;
       row.diagnostic.reason = 'restoreUnproved'; row.diagnostic.failedStage = 'restore';
@@ -7675,6 +7783,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
         window: row.prepared?.backup?.window, differences: row.restoreResult?.differences || [], progress: row.restoreProgress };
     try { await checkedPage(); await closeSkippedPerson(); await checkedPage(); }
     catch (error) {
+      if (error.connectionLost) throw error;
       if (error.session || sessionExpired() || error.identityChanged || error.schedulePage || error.batchWide) throw error;
       batch.pagePaused = true; batch.diagnostic.paused = true; batch.state = 'paused';
       batch.emptyBeforeResume = !error.multipleSchedules;
@@ -7692,6 +7801,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     wrote = false;
     batch.active = true;
     batch.state = 'running';
+    watchBrowser();
     progress();
     const releaseRecord = setRunRecorder(event => batch.record(observedRow, event));
     try {
@@ -7700,7 +7810,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       document.addEventListener('visibilitychange', visibility);
       batch.diagnostic.pageInfo = safePageInfo(version);
       await checkedPage();
-      if (batch.pendingRestore && !await recover(batch.pendingRestore)) return;
+      if (batch.pendingRestore && !await recover(batch.pendingRestore, batch.connectionRetry === batch.pendingRestore)) return;
       if (batch.recheckDone) {
         await cancelBatchWindows();
         for (const row of batch.rows.filter(one => one.state === 'done')) {
@@ -7736,7 +7846,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
         const personStarted = Date.now();
         try {
         try {
-        if (row.one.record.subcategory?.site === 'tax' && row.one.personStop?.code === 'taxPartnerMd') row.state = 'ready';
+        if (row.one.record.subcategory?.site === 'tax' && (row.one.personStop?.code === 'taxPartnerMd' || row.state === 'nothing' && ['leaveOver', 'taxPastEnd'].includes(row.one.decision.code))) row.state = 'ready';
         if (row.state === 'ready') {
           tell('');
           checkPlannedDates(row);
@@ -7763,7 +7873,11 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
             } catch (error) {
               row.message = error.message;
               if (wrote) {
-                if (error.identityChanged || error.schedulePage || error.batchWide) { batch.pendingRestore = row; throw error; }
+                if (error.identityChanged || error.schedulePage || error.batchWide || error.connectionLost) {
+                  batch.pendingRestore = row;
+                  if (error.connectionLost) batch.connectionRetry = row;
+                  throw error;
+                }
                 if (!await recover(row)) return;
                 continue;
               }
@@ -7773,6 +7887,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
         }
         if (batch.phase === 'run') await picture(row);
         } catch (error) {
+          if (error.connectionLost) throw error;
           if (row.pictureToTakeByHand && ['done', 'nothing'].includes(row.state) && stopFlagged(error)) throw error;
           if (error.schedulePage) throw error;
           const firstTaxId = error.initialTaxIdUnconfirmed && row.one.record.subcategory?.site === 'tax'
@@ -7831,6 +7946,9 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       if (error.session || sessionExpired()) {
         batch.diagnostic.expired = true;
         batch.state = 'session'; batch.recheckDone = true; tell(BATCH.session);
+      } else if (error.connectionLost) {
+        batch.diagnostic.paused = true; batch.connectionPaused = true; batch.state = 'paused';
+        tell(CONNECTION_WORDS);
       } else if (error.identityChanged) {
         batch.diagnostic.paused = true; batch.identityPaused = true; batch.state = 'paused';
         const f = error.identityFacts, shape = error.identityShape;
@@ -7862,16 +7980,19 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       try { unlock?.(); } finally { unlockPage(); unlock = null; }
       batch.active = false;
       tell();
+      if (['complete', 'failed', 'stopped'].includes(batch.state)) { connection?.close(); connection = null; }
+      else autoResume();
     }
   }
   batch.start = async () => {
     if (batch.state !== 'idle') return;
-    try { requireDayReport(report); requireFreshReport(report, now()); } catch (error) { reportFailure(error); batch.state = 'failed'; tell(error.message); return; }
+    try { if (!loadedReports(report).length) requireDayReport(null); for (const one of loadedReports(report)) { requireDayReport(one); requireFreshReport(one, now()); } } catch (error) { reportFailure(error); batch.state = 'failed'; tell(error.message); return; }
     try { batch.site = siteReader ? siteReader() : 'consulting'; }
     catch (error) { batch.state = 'failed'; tell(error.message); return; }
-    const otherSite = batch.rows.filter(row => (row.one.record.subcategory?.site || 'consulting') !== batch.site);
+    const otherSite = batch.rows.filter(row => (row.one.record.subcategory?.site || 'consulting') !== batch.site || row.one.personStop?.code === 'taxTalentGroup');
     for (const row of otherSite) {
-      row.one.decision = { outcome: 'notHandled', code: 'wrongSite', site: row.one.record.subcategory?.site || 'consulting' };
+      row.one.decision = (row.one.record.subcategory?.site || 'consulting') !== batch.site
+        ? { outcome: 'notHandled', code: 'wrongSite', site: row.one.record.subcategory?.site || 'consulting' } : row.one.personStop;
       delete row.one.personStop;
       excludedRows.push({ ...row, state: 'leftOut', message: reasonLine(row.one.decision) });
     }
@@ -7892,7 +8013,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
   };
   batch.confirm = async () => {
     if (batch.state !== 'ready' || batch.active) return;
-    try { requireFreshReport(report, now()); } catch (error) { reportFailure(error); batch.state = 'failed'; tell(error.message); return; }
+    try { for (const one of loadedReports(report)) requireFreshReport(one, now()); } catch (error) { reportFailure(error); batch.state = 'failed'; tell(error.message); return; }
     const left = clock.left(), current = estimateBatch(batch.rows, reviewStates, left);
     if (left < CONFIRM_RESERVE_MS || current.budget <= 0 || current.total > 0 && current.included.length === 0) {
       showTimeLimit(current); tell(SESSION_WORDS.confirm); return;
@@ -7906,9 +8027,9 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       approvedDates.set(row.one, [plan?.loaStart, plan?.loaEnd, plan?.dnsStart, plan?.dnsEnd].filter(Boolean).map(day => ({ ...day })));
     }
     batch.confirmed = true; batch.phase = 'run'; batch.index = 0;
-    batch.diagnostic.started = Date.now(); batch.diagnostic.reportAge = (now() - report.pullTime.time) / 60000;
+    batch.diagnostic.started = Date.now(); batch.diagnostic.reportAge = Math.max(...loadedReports(report).map(one => (now() - one.pullTime.time) / 60000));
     batch.diagnostic.noAction = noAction;
-    batch.total = batch.rows.filter(row => row.state === 'ready').length;
+    batch.total = batch.rows.filter(row => row.state === 'ready' || needsPersonPicture(row)).length;
     return drive();
   };
   batch.pause = () => { if (batch.active) { batch.pauseRequested = true; tell(BATCH.pausing); } };
@@ -7921,25 +8042,46 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       if (batch.pendingRestore) { batch.pendingRestore.state = 'restoreFailed'; batch.state = 'failed'; tell(BATCH.stopNeedsRestore); }
       else { batch.state = 'stopped'; tell(''); }
       batch.diagnostic.ended = Date.now();
+      connection?.close(); connection = null;
     }
   };
   batch.resume = async () => {
     if (!['paused', 'session'].includes(batch.state) || batch.active) return;
+    if (batch.connectionPaused) {
+      try { connection.beginResume(); }
+      catch { tell(CONNECTION_WORDS); return; }
+    }
     if (clock.left() < PERSON_RESERVE_MS) { tell(SESSION_WORDS.pause); return; }
     if (sessionExpired()) { tell(BATCH.expired); return; }
     batch.active = true; tell();
-    let releaseResume;
+    let releaseResume, releaseConnectionGuard;
     try {
       checkingResume = true;
       releaseResume = lock();
+      if (batch.connectionPaused) releaseConnectionGuard = setBatchGuard(guard);
       await checkedPage();
-      await resumePageReady({ empty: !!batch.emptyBeforeResume });
+      if (batch.connectionPaused) {
+        if (connectionIdentity?.error) throw connectionIdentity.error;
+        await connectionPageReady(connectionIdentity);
+        connection.accept();
+      } else await resumePageReady({ empty: !!batch.emptyBeforeResume });
       const turn = batch.pendingRestore || batch.rows[batch.index];
       if (turn?.prepared?.identity && (batch.pendingRestore || turn.state === 'ready')) await waitForPersonIdentity(turn.prepared.identity);
       returned = false; hiddenIdentity = null; visibleEvent = null;
     }
-    catch (error) { tell(error.message); return; }
-    finally { checkingResume = false; try { releaseResume?.(); } finally { unlockPage(); batch.active = false; tell(); } }
+    catch (error) {
+      if (error.connectionLost) {
+        batch.connectionPaused = true; batch.state = 'paused';
+        queueMicrotask(autoResume);
+      }
+      tell(error.message); return;
+    }
+    finally { checkingResume = false; releaseConnectionGuard?.(); try { releaseResume?.(); } finally { unlockPage(); batch.active = false; tell(); } }
+    if (batch.connectionPaused) {
+      const row = batch.rows[batch.index];
+      if (!batch.pendingRestore && row?.state === 'ready') delete row.prepared;
+      connectionIdentity = null; batch.connectionPaused = false;
+    }
     batch.emptyBeforeResume = false;
     batch.pagePaused = false;
     batch.schedulePaused = false;
@@ -8001,17 +8143,24 @@ const { setRunRecorder, timedRun, reasonCode } = __require("../core/run-records.
 const { REPORT_TIME_WORDS } = __require("../files/report-time.js");
 const { reportTimeLine } = __require("../files/report-time.js");
 const { requireSchedulePage, waitForPersonIdentity, SCHEDULE_PAGE_WORDS } = __require("../mysource/schedule.js");
+const { needsPersonPicture } = __require("../files/batch-outputs.js");
+const { loadedReports, reportKind } = __require("../files/report.js");
+const { reasonLine } = __require("./wording.js");
 function renderBatch(batch, work, box, draw) {
   const rows = batch.rows;
   const listedRows = rows.filter(row => !mailFNoAction(row.one));
+  const picturePending = row => row.state === 'nothing' && needsPersonPicture(row)
+    && !row.one.outputs?.screenshots?.length && !row.pictureToTakeByHand
+    && (!batch.confirmed || rows.indexOf(row) >= (batch.index || 0));
+  const isDone = row => ['done', 'nothing'].includes(row.state) && !picturePending(row);
   work.saved = batch.saved === true || batch.confirmed === false;
-  const ready = rows.filter(row => row.state === 'ready').length;
+  const ready = rows.filter(row => row.state === 'ready' || picturePending(row)).length;
   const byHand = rows.filter(row => row.state === 'skipped' || row.byHand).length;
   const failed = rows.filter(failedRow).length;
-  const done = listedRows.filter(row => ['done', 'nothing'].includes(row.state)).length;
+  const done = listedRows.filter(isDone).length;
   const noAction = (batch.diagnostic?.noAction || 0) + rows.filter(row => mailFNoAction(row.one)).length;
   const undone = rows.filter(row => row.state === 'undone').length;
-  const notRun = rows.filter(row => ['pending', 'ready'].includes(row.state)).length;
+  const notRun = rows.filter(row => ['pending', 'ready'].includes(row.state) || picturePending(row)).length;
   const ended = ['complete', 'stopped', 'failed'].includes(batch.state) && !batch.active;
   const running = batch.phase === 'run' && !ended;
   work.setScreenTitle?.('');
@@ -8032,11 +8181,11 @@ function renderBatch(batch, work, box, draw) {
     .flatMap(([text, tone], i) => [...(i ? [el('span', { class: 'c-sep' }, '·')] : []), el('span', { class: tone || '' }, text)]));
   if (running) {
     if (batch.state === 'running' && batch.stallMessage) box.append(el('div', { class: 'warn', role: 'status' }, batch.stallMessage));
-    const completed = rows.filter(row => row.toDo ? !['ready', 'pending'].includes(row.state) : row.state === 'done' || failedRow(row) && row.prepared).length;
+    const completed = rows.filter(row => !picturePending(row) && (row.toDo ? !['ready', 'pending'].includes(row.state) : row.state === 'done' || row.state === 'nothing' && needsPersonPicture(row) || failedRow(row) && row.prepared)).length;
     const total = batch.total || ready + completed;
     const current = Number.isInteger(batch.displayIndex) ? rows[batch.displayIndex]
-      : rows[batch.index]?.state === 'ready' ? rows[batch.index] : rows.find(row => row.state === 'ready');
-    const doneSoFar = listedRows.filter(row => ['done', 'nothing'].includes(row.state)).length;
+      : rows[batch.index]?.state === 'ready' || picturePending(rows[batch.index] || {}) ? rows[batch.index] : rows.find(row => row.state === 'ready' || picturePending(row));
+    const doneSoFar = listedRows.filter(isDone).length;
     if (current) {
       const text = runningText(current);
       box.append(el('div', { class: 'status', role: 'status' }, text.person), el('div', { class: 'run-now' }, text.dates));
@@ -8109,6 +8258,11 @@ function renderBatch(batch, work, box, draw) {
     const list = box.querySelector('.undo-list');
     if (list) list.scrollTop = undoScroll;
   } else {
+    for (const row of (batch.outputRows || rows).filter(row => (row.one.personStop || row.one.decision).code === 'bothReports' || row.one.record?.subcategory?.site === 'tax'
+      && ['taxTalentGroup', 'taxPartialLoa', 'taxPastEnd', 'leaveOver'].includes((row.one.personStop || row.one.decision).code))) {
+      box.append(el('div', { class: 'person-row' }, el('div', { class: 'person-name' }, personName(row.one)),
+        el('div', { class: 'reason' }, reasonLine(row.one.personStop || row.one.decision))));
+    }
     for (const row of listedRows.filter(row => row.state === 'ready' && row.one.reportHint)) {
       box.append(el('div', { class: 'person-row' }, el('div', { class: 'person-name' }, personName(row.one)),
         el('div', { class: 'reason' }, row.one.reportHint)));
@@ -8130,7 +8284,8 @@ function renderBatch(batch, work, box, draw) {
     };
     name.addEventListener('input', () => { work.signOff = name.value; work.refreshClockControls(); });
     work.refreshClockControls();
-    if (Number.isFinite(work.reportPullTime)) box.append(el('div', { class: 'dates report-use-by' }, reportTimeLine(work.reportPullTime)));
+    if (work.reportTimes) for (const one of work.reportTimes) box.append(el('div', { class: 'dates report-use-by' }, one));
+    else if (Number.isFinite(work.reportPullTime)) box.append(el('div', { class: 'dates report-use-by' }, reportTimeLine(work.reportPullTime)));
     box.append(el('div', { class: 'buttons review-actions' }, button('Back', 'grey', () => work.backToFiles?.(), batch.active || work.busy), confirm), clockWarning);
     if (['paused', 'session'].includes(batch.state)) {
       const message = batch.pauseMessage || batch.message || (batch.state === 'session' ? BATCH.session : '');
@@ -8254,6 +8409,7 @@ function newBatchPopup(work,onDiscard=()=>work.newBatch?.()) {
 }
 function batchControls(cases, report, work, redrawPeople = () => {}, options = {}) {
   work.reportPullTime = report?.pullTime?.time;
+  work.reportTimes = Array.isArray(report) ? loadedReports(report).filter(one => Number.isFinite(one.pullTime?.time)).map(one => `${reportKind(one) === 'audit' ? 'Audit' : 'Consulting'} · ${reportTimeLine(one.pullTime.time)}`) : null;
   const box = el('div', { class: 'batch' });
   let batch;
   let releaseCover;
@@ -8539,6 +8695,7 @@ function planTaxWeeks({ plan, rows, today, greyedWeeks = [] }) {
       remove: whole ? entries.filter(row => kindOf(row) !== 'holiday') : [],
     });
   }
+  if (weeks.some(week => rows.some(row => kindOf(row) === 'loa' && sameWeek(row.day, week.monday) && compareDays(row.day, today) >= 0 && compareDays(row.day, week.start) < 0))) return stopped('byHand', 'taxPartialLoa');
   return { outcome: 'report', code: 'taxWeeks', weeks, kept,
     holidays: weeks.flatMap(week => week.holidays),
     partialWeeks: weeks.filter(week => week.lowerClients.length).map(week => week.monday) };
@@ -8721,7 +8878,12 @@ async function prepareAuditReadOnly(one, today, step) {
   if (scope) return { stop: reasonLine(scope), reasonCode: scope.code };
   rememberPageName(one.record, await step(() => openPerson(one.record.email, one.record.person.professional, one.record, { today, termDate: one.record.person.termDate })));
   const identity = personIdentity();
-  const copy = await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => copyWindow({ start: today, end: today }, { future: true })));
+  let copy;
+  if (one.record.notification.kind === 'leave') {
+    copy = await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => copyWindow({ start: today, end: today }, { future: true })));
+  } else {
+    await requirePersonIdentity(identity);
+  }
   const auditAlready = one.record.notification.kind === 'leave' && auditLoaInPlace(copy.days, one.decision.plan);
   return { nothing: auditAlready ? 'A&A LOA already in place; no schedule change.' : 'A&A: no schedule change.', auditAlready, identity, copy,
     checks: [['✓', 'Schedule read only; nothing changed', '']] };
@@ -9300,9 +9462,9 @@ async function prepareTax(one, version, today, { step = fn => fn() } = {}) {
     one.personStop = { outcome: 'noReport', code: 'taxPartnerMd' };
     return { nothing: reasonLine(one.personStop), code: 'taxPartnerMd', identity, checks: [] };
   }
-  const plan = one.decision.plan;
+  const plan = one.decision.plan || (one.decision.code === 'leaveOver' ? { action: 'add', loaStart: one.decision.start, loaEnd: one.decision.end } : null);
   if (!plan || plan.action !== 'add') return { stop: 'Unsupported Tax schedule action. Nothing was changed.' };
-  const start = mondayOf(today), end = addDays(plan.loaEnd, 56);
+  const start = mondayOf(today), end = addDays(compareDays(plan.loaEnd, today) < 0 ? today : plan.loaEnd, 56);
   const copy = await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => copyWindow({ start, end }, { future: true })));
   const reportEnd = one.slice.reportEnd || reportWindow(today).end;
   const source = one.slice.backupEntries ?? one.slice.entries;
@@ -9313,6 +9475,7 @@ async function prepareTax(one, version, today, { step = fn => fn() } = {}) {
     reasonCode: 'pageReportMismatch', skipReason: `Schedule differs from the Staff Schedule Hours Report: ${differences[0].message}; nothing changed` };
   if (!compareCopies({ days: report.filter(row => compareDays(row.day, today) < 0) }, { days: copy.days.filter(row => compareDays(row.day, today) < 0 && compareDays(row.day, reportEnd) <= 0) }).same) return { stop: 'This week’s past Tax entries cannot be paired with the report for an hours-only restore. Nothing was changed; By hand.' };
   for (const row of copy.days) if (!row.client || !row.day || !Number.isFinite(row.hours) || row.hours <= 0 || !row.id) return { stop: 'A Tax schedule row cannot be backed up or read completely. Nothing was changed.' };
+  if (one.decision.code === 'leaveOver') return { nothing: reasonLine(one.decision), code: 'leaveOver', identity, copy, checks: [] };
   const proposal = planTaxWeeks({ plan, today, rows: copy.days.map(row => {
     const kind = entryKind(row);
     return { ...row, kind: ['loa', 'holiday', 'dns'].includes(kind) ? kind : 'client' };
@@ -9573,12 +9736,105 @@ function mountRestorePanel(people, work, body, onBack) {
 __exports.restoreReportButton = restoreReportButton;
 __exports.mountRestorePanel = mountRestorePanel;
 },
+"run/live-connection.js": function (__require, __exports, document, window) {
+'use strict';
+const { PageError, setConnectionGuard } = __require("../mysource/dom.js");
+const { watchConnection, connectionPageReady, CONNECTION_WORDS, sessionExpired } = __require("../mysource/batch.js");
+const { personIdentity, checkPersonIdentity, requireSchedulePage, IDENTITY_PAUSE_WORDS } = __require("../mysource/schedule.js");
+const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
+async function withLiveConnection(options, initialPage, run) {
+  if (!initialPage.restartConnection) return run(options, initialPage);
+  let page = initialPage, result = null, identity = null, resuming = false;
+  let resolveResume = null, busy = false, onlinePending = false;
+  const history = [];
+  let previousWrites = 0, previousEvents = [];
+  const notify = () => options.onUpdate?.(result);
+  const connection = watchConnection({
+    lost() {
+      try { identity = personIdentity(); }
+      catch (error) { identity = { error }; }
+    },
+    online() { onlinePending = true; if (resolveResume) void resume(); },
+  });
+  const release = setConnectionGuard(probe => {
+    connection.check(resuming);
+    if (resuming) {
+      if (sessionExpired()) throw Object.assign(new PageError('Session expired.', { record: false }), { session: true });
+      requireSchedulePage(probe);
+      if (identity?.name) checkPersonIdentity(identity, 'identity check', probe);
+    }
+  });
+  async function resume() {
+    if (!resolveResume || busy) return false;
+    busy = true; resuming = true; onlinePending = false;
+    try {
+      connection.beginResume();
+      if (identity?.error) throw identity.error;
+      await connectionPageReady(identity);
+      const recoveryResult = { ...result, state: 'paused' };
+      const recovery = beginLiveDiagnostics(recoveryResult, page, options.assignPeriod, options.today);
+      recovery.cleanup();
+      let cleanup;
+      try { cleanup = await page.connectionCleanup(() => { result.writes++; }); }
+      finally {
+        recovery.finish();
+        result.diagnostic.events.push(...recoveryResult.diagnostic.events);
+      }
+      result.connectionRecovery = cleanup;
+      if (!['empty', 'notNeeded'].includes(cleanup)) {
+        result.cleanup = 'unconfirmed';
+        result.message = 'Cleanup UNCONFIRMED. Test entries may remain.';
+        return false;
+      }
+      result.cleanup = cleanup;
+      result.outstanding = [];
+      await connectionPageReady(identity);
+      connection.accept();
+      const done = resolveResume; resolveResume = null; done();
+      return true;
+    } catch (error) {
+      result.message = error.session ? 'MySource session expired. Sign in again in this tab, then press Resume.'
+        : error.identityChanged ? IDENTITY_PAUSE_WORDS : error.connectionLost ? CONNECTION_WORDS : error.message;
+      return false;
+    } finally { busy = false; resuming = false; notify(); }
+  }
+  try {
+    while (true) {
+      try {
+        return await run({ ...options, onUpdate(value) {
+          if (value !== result) {
+            value.writes += previousWrites;
+            value.diagnostic.events.unshift(...previousEvents);
+          }
+          result = value;
+          if (history.length) result.connectionHistory = history;
+          if (value.state !== 'paused') options.onUpdate?.(value);
+        } }, page);
+      } catch (error) {
+        if (!error.connectionLost || !result) throw error;
+        result.state = 'paused'; result.message = CONNECTION_WORDS;
+        Object.defineProperty(result, 'resume', { value: resume, configurable: true });
+        const resumed = new Promise(resolve => { resolveResume = resolve; });
+        notify();
+        if (onlinePending) void resume();
+        await resumed;
+        if (result.connectionReturnState) { result.state = result.connectionReturnState; return result; }
+        history.push({ steps: result.steps, writes: result.writes, cleanup: result.connectionRecovery, diagnostic: result.diagnostic });
+        previousWrites = result.writes; previousEvents = result.diagnostic.events;
+        page = page.restartConnection(); identity = null;
+      }
+    }
+  } finally { release(); connection.close(); }
+}
+__exports.withLiveConnection = withLiveConnection;
+},
 "run/live-test.js": function (__require, __exports, document, window) {
 'use strict';
 const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { NOTE_STAGE_EXITS, isNoteStageRefusal } = __require("../mysource/note-stage.js");
 const { LIVE_TEST_PARTS, testPart, TAX_LIVE_STEPS, SMALL_LIVE_STEPS, taxLiveReport } = __require("./live-proof.js");
 const { runTaxLiveTest } = __require("./tax-live-test.js");
+const { withLiveConnection } = __require("./live-connection.js");
 const { runAuditLiveTest, runSmallConsultingTest, AUDIT_LIVE_STEPS, auditLiveReport } = __require("./audit-live-test.js");
 const { GROUP_TITLES, GROUP_PROOFS, runLiveGroups } = __require("./live-groups.js");
 const { addDays, compareDays, readIsoDay, dayFromParts, todayOf, usDate } = __require("../rules/dates.js");
@@ -9661,10 +9917,14 @@ function liveTimingSummary(events) {
   const sum = rows => rows.every(row => row.seconds !== null) ? Math.round(rows.reduce((sum,row) => sum + row.seconds, 0) * 100) / 100 : null;
   return { waits, saves, waitSeconds: sum(waits), saveSeconds: sum(saves) };
 }
-async function runLiveTest({ email, week, length = 'year', through, version, today = todayOf(), onUpdate = () => {}, mode = 'consulting', assignPeriod = 'unknown', small = false }, page) {
-  if (small && mode !== 'tax') return runSmallConsultingTest({ email, version, today, onUpdate, assignPeriod }, page);
-  if (mode === 'audit') return runAuditLiveTest({ email, version, today, onUpdate, assignPeriod }, page);
-  if (mode === 'tax') return runTaxLiveTest({ email, version, today, onUpdate, assignPeriod, small }, page);
+async function runLiveTest(options, page) {
+  const { mode = 'consulting', small = false } = options;
+  if (small && mode !== 'tax') return runSmallConsultingTest(options, page);
+  if (mode === 'audit') return runAuditLiveTest(options, page);
+  if (mode === 'tax') return runTaxLiveTest(options, page);
+  return withLiveConnection(options, page, runLongLiveTest);
+}
+async function runLongLiveTest({ email, week, length = 'year', through, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
   const runStarted = Date.now();
   const window = testPeriod(week, length, today, through);
   if (!String(email || '').trim()) throw new Error('Enter the professional email.');
@@ -9708,6 +9968,7 @@ async function runLiveTest({ email, week, length = 'year', through, version, tod
     const started = Date.now();
     try { const value = await action(); current.state = value?.notExercised ? 'notExercised' : 'passed'; return value; }
     catch (error) {
+      if (error.connectionLost) { result.state = 'paused'; throw error; }
       if (current.group && ['open', 'empty', 'editable'].includes(error.liveStep)) current.id = error.liveStep;
       if (id === 'dateGuard' && error.guardEvidence) result.dateGuard = error.guardEvidence;
       if (id === 'bDns') current.notExercised = true;
@@ -9784,13 +10045,14 @@ async function runLiveTest({ email, week, length = 'year', through, version, tod
     await runLiveGroups({ page, window, email: String(email).trim(), result, step, known: () => known, confirm, observe, write: onWrite, stage, proof });
     result.cleanup = 'empty'; result.state = 'complete';
   } catch (error) {
+    if (error.connectionLost) throw error;
     diagnostic.fail(error, current?.id); diagnostic.cleanup();
     result.state = 'failed'; result.code = error.identityChanged ? 'identityChanged' : error.session ? 'sessionExpired' : reasonCode(error.message);
     if (!result.writes) result.cleanup = 'notNeeded';
     if (result.writes) result.cleanup = 'unconfirmed';
     if (result.writes && !uncertainWrite && known && !error.identityChanged && !error.session && !error.pageBlocked) {
       try { await step('recovery', ()=>testPart('Cleanup unconfirmed.',clear)); result.cleanup = 'empty'; }
-      catch (cleanupError) { diagnostic.fail(cleanupError,'recovery'); result.cleanup = 'unconfirmed'; }
+      catch (cleanupError) { if (cleanupError.connectionLost) { result.connectionReturnState = 'failed'; result.state = 'paused'; throw cleanupError; } diagnostic.fail(cleanupError,'recovery'); result.cleanup = 'unconfirmed'; }
     }
   } finally {
     try { result.controls = page.observe(); } catch { result.observationUnavailable = true; }
@@ -9838,7 +10100,9 @@ const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { addressCount } = __require("../rules/prepare.js");
 const { todayOf, usDate } = __require("../rules/dates.js");
 const { TAX_LIVE_STEPS, SMALL_TAX_STEPS, TAX_LIVE_FINDINGS, taxTestPeriod } = __require("./live-proof.js");
-async function runTaxLiveTest({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown', small = false }, page) {
+const { withLiveConnection } = __require("./live-connection.js");
+const runTaxLiveTest = (options, page) => withLiveConnection(options, page, runTaxRecorded);
+async function runTaxRecorded({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown', small = false }, page) {
   const window = taxTestPeriod(today, { small });
   if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
   const result = { kind: 'Snooze live test 1', mode: 'tax', version, length: small ? 'twelveWeeks' : 'month', design: small ? 'tax5' : 'tax8',
@@ -9861,14 +10125,15 @@ async function runTaxLiveTest({ email, version, today = todayOf(), onUpdate = ()
         const value = await actions[index]();
         step.state = value?.notExercised ? 'notExercised' : 'passed';
         step.findings = (value?.findings || []).filter(word => TAX_LIVE_FINDINGS.has(word));
-      } catch (error) { diagnostic.fail(error, step.id); step.state = 'failed'; step.part = (small ? SMALL_TAX_STEPS : TAX_LIVE_STEPS)[step.id]; throw error; }
+      } catch (error) { if (error.connectionLost) { result.state = 'paused'; throw error; } diagnostic.fail(error, step.id); step.state = 'failed'; step.part = (small ? SMALL_TAX_STEPS : TAX_LIVE_STEPS)[step.id]; throw error; }
       onUpdate(result);
     }
     result.state = 'complete'; result.cleanup = 'empty';
   } catch (error) {
+    if (error.connectionLost) throw error;
     result.state = 'failed'; diagnostic.cleanup();
     try { result.cleanup = await page.taxCleanup(write, error); }
-    catch (cleanupError) { diagnostic.fail(cleanupError,'recovery'); result.cleanup = 'unconfirmed'; }
+    catch (cleanupError) { if (cleanupError.connectionLost) { result.connectionReturnState = 'failed'; result.state = 'paused'; throw cleanupError; } diagnostic.fail(cleanupError,'recovery'); result.cleanup = 'unconfirmed'; }
   } finally {
     page.taxFinish?.(); diagnostic.finish(); onUpdate(result);
   }
@@ -9882,7 +10147,9 @@ const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { addressCount } = __require("../rules/prepare.js");
 const { compareDays, todayOf, usDate } = __require("../rules/dates.js");
 const { SMALL_LIVE_STEPS, smallTestPeriod } = __require("./live-proof.js");
-async function runSmallConsultingTest({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
+const { withLiveConnection } = __require("./live-connection.js");
+const runSmallConsultingTest = (options, page) => withLiveConnection(options, page, runSmallConsultingRecorded);
+async function runSmallConsultingRecorded({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
   const window = smallTestPeriod(today);
   if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
   const result = { kind: 'Snooze live test 1', mode: 'consulting', version, design: 'small7', length: 'twelveWeeks',
@@ -9901,15 +10168,16 @@ async function runSmallConsultingTest({ email, version, today = todayOf(), onUpd
     for (let index = 0; index < actions.length; index++) {
       const step = result.steps[index]; step.state = 'running'; page.setStep?.(step.id); onUpdate(result);
       try { Object.assign(step, await actions[index]()); step.state = 'passed'; }
-      catch (error) { step.state = 'failed'; step.part = SMALL_LIVE_STEPS[step.id]; diagnostic.fail(error, step.id); throw error; }
+      catch (error) { if (error.connectionLost) { result.state = 'paused'; throw error; } step.state = 'failed'; step.part = SMALL_LIVE_STEPS[step.id]; diagnostic.fail(error, step.id); throw error; }
       finally { page.finishStep?.(); onUpdate(result); }
     }
     result.state = 'complete'; result.cleanup = 'empty';
   } catch (error) {
+    if (error.connectionLost) throw error;
     if (!result.diagnostic.stop) diagnostic.fail(error, result.steps.find(s => s.state === 'running')?.id || 'smallOpen');
     result.state = 'failed'; diagnostic.cleanup();
     try { result.cleanup = await page.auditCleanup(write, error); }
-    catch (cleanupError) { diagnostic.fail(cleanupError, 'recovery'); result.cleanup = 'unconfirmed'; }
+    catch (cleanupError) { if (cleanupError.connectionLost) { result.connectionReturnState = 'failed'; result.state = 'paused'; throw cleanupError; } diagnostic.fail(cleanupError, 'recovery'); result.cleanup = 'unconfirmed'; }
   } finally {
     result.outstanding = page.auditOutstanding(result.cleanup); release?.(); diagnostic.finish(); onUpdate(result);
   }
@@ -9929,7 +10197,8 @@ function auditTestPeriod(today = todayOf()) {
   if (compareDays(window.start, today) <= 0) throw new Error('The A&A test period must still be in the future.');
   return window;
 }
-async function runAuditLiveTest({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
+const runAuditLiveTest = (options, page) => withLiveConnection(options, page, runAuditRecorded);
+async function runAuditRecorded({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
   const window = auditTestPeriod(today);
   if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
   const result = { kind: 'Snooze live test 1', mode: 'audit', version, design: 'audit7', length: 'twoWeeks',
@@ -9949,15 +10218,16 @@ async function runAuditLiveTest({ email, version, today = todayOf(), onUpdate = 
     for (let index = 0; index < actions.length; index++) {
       const step = result.steps[index]; step.state = 'running'; page.setStep?.(step.id); onUpdate(result);
       try { Object.assign(step, await actions[index]()); step.state = 'passed'; }
-      catch (error) { diagnostic.fail(error, step.id); step.state = 'failed'; throw error; }
+      catch (error) { if (error.connectionLost) { result.state = 'paused'; throw error; } diagnostic.fail(error, step.id); step.state = 'failed'; throw error; }
       finally { page.finishStep?.(); onUpdate(result); }
     }
     result.state = 'complete'; result.cleanup = 'empty';
   } catch (error) {
+    if (error.connectionLost) throw error;
     if (!result.diagnostic.stop) diagnostic.fail(error, result.steps.find(s=>s.state==='running')?.id || result.steps[0].id);
     result.state = 'failed'; diagnostic.cleanup();
     try { result.cleanup = await page.auditCleanup(write, error); }
-    catch (cleanupError) { diagnostic.fail(cleanupError,'recovery'); result.cleanup = 'unconfirmed'; }
+    catch (cleanupError) { if (cleanupError.connectionLost) { result.connectionReturnState = 'failed'; result.state = 'paused'; throw cleanupError; } diagnostic.fail(cleanupError,'recovery'); result.cleanup = 'unconfirmed'; }
   } finally {
     result.outstanding = page.auditOutstanding(result.cleanup); release?.(); diagnostic.finish(); onUpdate(result);
   }
@@ -10443,6 +10713,9 @@ function liveTestPage(options = {}) {
       });
     };
   }
+  page.restartConnection = () => liveTestPage(options);
+  page.connectionCleanup = write => options.mode === 'tax' ? page.taxCleanup(write, {})
+    : page.auditCleanup ? page.auditCleanup(write, {}) : page.clearForConnection(write);
   return page;
 }
 function createLiveTestPage({ today = todayOf(), mode = 'consulting', small = false } = {}) {
@@ -10530,6 +10803,16 @@ function createLiveTestPage({ today = todayOf(), mode = 'consulting', small = fa
       await timedRun('move calendar', () => showDate(window.start, { cellProof: true })); await checked();
     },
     read, assertSame,
+    async clearForConnection(write) {
+      if (!scope || !identity) return 'notNeeded';
+      const actual = await read(scope);
+      if (!actual.days.length) return 'empty';
+      if (!verifiedOwnership) return 'unconfirmed';
+      try { await assertSame(verifiedOwnership, scope); }
+      catch (error) { if (error.identityChanged || error.session || error.connectionLost) throw error; return 'unconfirmed'; }
+      await this.clear(verifiedOwnership, scope, write);
+      return (await read(scope)).days.length ? 'unconfirmed' : 'empty';
+    },
     async editable(window) {
       await bounded(window); const text = String(scheduleFacts().termDate || '').trim();
       const term = text ? termDayOf(text) : null;
@@ -12024,6 +12307,10 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
         if (result.cleanup === 'unconfirmed') for (const row of result.outstanding || []) box.append(el('div', { class: 'restore-warning' }, `${row.date}: ${row.rows === null ? 'Unconfirmed' : row.rows} rows`));
       }
     }
+    if (result?.state === 'paused') {
+      box.append(el('div', { class: 'restore-warning', role: 'status' }, result.message));
+      box.append(el('button', { class: 'amber', onclick: () => result.resume?.() }, 'Resume'));
+    }
     if (notice) box.append(el('div', { class: 'restore-warning', role: 'status' }, notice));
     const buttons = el('div', { class: 'buttons' }, back, mode !== 'consulting' && result && !active ? downloadButton : go);
     if (mode !== 'consulting' && result && !active) buttons.append(logButton);
@@ -12293,7 +12580,7 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
       recordRun({ type:'stop', ...failure, result:'failed' });
     },
     cleanup() { pending.length = 0; forcedStep = 'recovery'; recordRun({type:'cleanup'}); },
-    finish() { data.finish = snapshot(); recordRun({type:'finish', result:result.state === 'complete' ? 'passed' : 'failed'}); release(); },
+    finish() { data.finish = snapshot(); if (result.state !== 'paused') recordRun({type:'finish', result:result.state === 'complete' ? 'passed' : 'failed'}); release(); },
   };
 }
 function cleanPage(page) {
@@ -12736,7 +13023,7 @@ function greetingName(name) {
   const [last, first] = text.split(',').map(part => part.trim());
   return first ? first.split(/\s+/)[0] : last;
 }
-const subjectLine = (ticket, name) => `${ticket} Deployment RMIS Request - System Updates for ${name}`;
+const subjectLine = (ticket, name) => `${ticket} - Deployment RMIS Request - System Updates for ${name}`;
 const ATTACHED = {
   withReport: 'Please find the screenshot and the Staff Schedule Hours Report attached.',
   noReport: 'Please find the screenshot attached.',
@@ -13609,10 +13896,11 @@ const { COLOURS } = __require("../family/look.js");
 const { createLeaveWarning } = __require("../family/leave-warning.js");
 const { createSessionClock, paintClock } = __require("./session-clock.js");
 const { SN_COLUMNS, readTable } = __require("../servicenow/files.js");
-const { todayOf, compareDays, addDays } = __require("../rules/dates.js");
+const { todayOf, compareDays, addDays, mondayOf } = __require("../rules/dates.js");
 const { sortCases } = __require("../servicenow/sort.js");
 const { reportPull } = __require("../files/groups.js");
 const { checkPerson, termDayOf } = __require("../rules/shared.js");
+const { planTaxWeeks } = __require("../rules/tax-weeks.js");
 const { decideExit } = __require("../rules/exit.js");
 const { entriesToAdd } = __require("../mysource/copy.js");
 const { reportDays } = __require("../run/backup.js");
@@ -13620,7 +13908,8 @@ const { alreadyAdded } = __require("../run/work.js");
 const { DNS_CLIENT, LOA_CLIENT } = __require("../mysource/checks.js");
 const { leavePeriod, leaveRuns } = __require("../rules/leaves.js");
 const { valueKey } = __require("../rules/prepare.js");
-const { personSlice, readReport } = __require("../files/report.js");
+const { personSlice, readReport, loadedReports, reportHasPerson, reportKind, addLoadedReport } = __require("../files/report.js");
+const { readSite } = __require("../mysource/site.js");
 const { el, wrongPageNotice } = __require("./ui.js");
 const { isSchedulePage, SCHEDULE_PAGE_WORDS } = __require("../mysource/schedule.js");
 const { safePageInfo } = __require("../mysource/pageinfo.js");
@@ -13711,12 +14000,15 @@ function showLoad(body, sorted, onReport, work, { onTickets = () => {}, report =
   const exit = actionable.filter(one => one.record.notification.kind === 'exit').length;
   const unknown = actionable.filter(one => !['leave', 'exit'].includes(one.record.notification.kind)).length;
   const noAction = cases.filter(one => one.decision.outcome === 'notHandled' || mailFNoAction(one)).length;
-  const pull = reportPull(actionable.filter(one => one.record.email), todayOf());
   const duplicates = cases.reduce((count, one) => count + (one.record.duplicates?.length || 0), 0);
   const ticketLine = fileLine(`${cases.length + duplicates} tickets: ${loa} LOA · ${exit} Exit${unknown ? ` · ${unknown} by hand` : ''} · ${noAction} no action${duplicates ? ` · ${duplicates} duplicates` : ''}`, onTickets, work);
   body.replaceChildren(ticketLine);
-  if (report) body.append(fileLine(reportTimeLine(report.pullTime.time), file => onReport(file, actionable, pull), work));
-  else body.append(dropArea('Drop Staff Schedule Hours Report · max 2 h old', file => { if (!work.busy) return onReport(file, actionable, pull); }));
+  if (Array.isArray(report)) {
+    for (const one of report) body.append(fileLine(`${reportKind(one) === 'audit' ? 'Audit' : 'Consulting'} · ${reportTimeLine(one.pullTime.time)}`, file => onReport(file, reportKind(one)), work));
+    if (report.length < 2) body.append(dropArea(`Drop ${reportKind(report[0]) === 'audit' ? 'Consulting' : 'Audit'} Staff Schedule Hours Report · max 2 h old`, file => { if (!work.busy) return onReport(file); }));
+  }
+  else if (report) body.append(fileLine(reportTimeLine(report.pullTime.time), file => onReport(file), work));
+  else body.append(dropArea('Drop Staff Schedule Hours Report · max 2 h old', file => { if (!work.busy) return onReport(file); }));
 }
 function fileLine(label, receive, work) {
   const input = el('input', { type: 'file', accept: '.csv,.xlsx', hidden: true });
@@ -13741,8 +14033,16 @@ function dropArea(label, receive) {
   drop.addEventListener('drop', event => { event.preventDefault(); read(event.dataTransfer.files[0]); });
   return el('div', { class: 'drop-wrap' }, drop, input);
 }
-function attachReport(cases, report, pull) {
+function attachReport(cases, input, pull) {
   for (const one of cases.filter(one => one.decision.outcome === 'report' || ['exitNoLwd', 'leaveOver'].includes(one.decision.code))) {
+    const reports = loadedReports(input);
+    const matches = reports.filter(report => reportHasPerson(report, one.record.email));
+    if (matches.length > 1) {
+      one.slice = { status: 'bothReports' };
+      one.personStop = { outcome: 'byHand', code: 'bothReports' };
+      continue;
+    }
+    const report = matches[0] || reports[0];
     const wanted = { ...(one.decision.plan?.window || { start: pull.start, end: pull.end }) };
     const reportEnd = report.days?.at(-1) || pull.end;
     if (one.decision.plan?.action === 'dns') wanted.end = pull.end;
@@ -13764,6 +14064,11 @@ function attachReport(cases, report, pull) {
       if (one.record.subcategory?.business === 'audit' && one.slice.status === 'ready') one.personStop = checkPerson({ ...one.record.person, resourceManager: one.slice.resourceManager }, one.decision);
     }
     delete one.reportHint;
+    if (one.record.subcategory?.site === 'tax' && !one.personStop && one.slice.status === 'ready' && one.slice.mode === 'day' && one.decision.plan?.action === 'add') {
+      const proposal = planTaxWeeks({ plan: one.decision.plan, today: todayOf(), rows: reportDays({ ...one.slice, entries: one.slice.backupEntries }, { start: mondayOf(todayOf()), end: reportEnd }) });
+      if (proposal.code === 'taxPastEnd') one.decision = { ...one.decision, outcome: 'noReport', code: proposal.code };
+      if (proposal.code === 'taxPartialLoa') one.personStop = { outcome: 'byHand', code: proposal.code };
+    }
     if (one.record.subcategory?.site === 'tax' || one.slice.site === 'tax' || one.personStop || one.slice.status !== 'ready' || one.slice.mode !== 'day'
       || !['add', 'dns', 'clearClients'].includes(one.decision.plan?.action)) continue;
     const plan = one.decision.plan;
@@ -13836,13 +14141,14 @@ function start(version) {
     delete work.host.dataset.batchReserved;
     for (const listener of work.listeners) listener();
   };
-  const loadReport = async file => {
+  const loadReport = async (file, replace = null) => {
     const read = beginRead(); if (!read) return;
     try {
       const next = await readReport(file);
       if (!currentRead(read)) return;
       requireFreshReport(next);
-      data = next; work.staffReport = next; rebuild();
+      const loaded = addLoadedReport(data, next, readSite(), replace);
+      data = loaded; work.staffReport = loaded; rebuild();
     } catch (error) { if (currentRead(read)) errorLine(error.message); }
     finally { endRead(read); }
   };
