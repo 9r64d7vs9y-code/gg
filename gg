@@ -1,50 +1,47 @@
 /*
- * Snooze Find Assignments labels check — read-only (Claude, 2026-10-29).
- * For the A&A "Clients" fault. On Consulting MySource > Schedule > Calendar
- * view, open an A&A LOA person's schedule by hand, right-click an entry and
- * choose Find Assignments, change nothing, then paste this into the console.
- * It clicks nothing and changes nothing. It prints the form's labels and box
- * types only, never a value; option words only for period/view-type boxes.
+ * Snooze Find anchor check — read-only (Claude, 2026-10-30).
+ * For the Exit on leave whose Find still refused ("no proved client entry or
+ * DNS entry in the current week") with the LOA-anchor snippet. On Consulting
+ * MySource > Schedule > Calendar view, open that person's schedule by hand,
+ * change nothing, then paste this into the console. It clicks nothing and
+ * changes nothing. For each entry tile in this week it prints what Snooze
+ * reads from it: the tile's own words (only LOA / DNS / Holiday words are
+ * shown; a client shows as "client" or "other"), its dates and where it sits.
  * The result is also put on the clipboard (copy) to paste back to Claude.
  */
 (() => {
   const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
-  const words = node => (node.textContent || '').replace(/\s+/g, ' ').trim();
-  const mask = id => id ? id.replace(/\d+/g, '#') : null;
-  const modals = [...document.querySelectorAll('.modal')].filter(shown);
-  const modal = modals.find(node => /Find Assignments/i.test(words(node.querySelector('.modal-title, .modal-header') || node)));
-  if (!modal) { console.log(`No open Find Assignments window found (${modals.length} open windows).`); return; }
-  const forms = [...modal.querySelectorAll('form, .js-dynamic-form')];
-  const control = label => {
-    const byFor = label.htmlFor && document.getElementById(label.htmlFor);
-    if (byFor) return { node: byFor, how: 'for' };
-    const row = label.closest('.dynamic-form-row, .form-group, .mb-3') || label.parentElement;
-    const node = row && row.querySelector('select, input:not([type=hidden]), textarea');
-    return node ? { node, how: 'row' } : { node: null, how: 'none' };
-  };
-  const optionsSafe = /period|view|type|week|date|status/i;
-  const labels = [...modal.querySelectorAll('label')].map(label => {
-    const text = words(label), clean = text.replace(/[*?]/g, '').trim();
-    const { node, how } = control(label);
-    const info = { label: clean, raw: text === clean ? undefined : text, shown: shown(label), found: how };
-    if (node) Object.assign(info, {
-      box: node.tagName.toLowerCase() + (node.type && node.tagName !== 'SELECT' ? `[${node.type}]` : ''),
-      id: mask(node.id), multiple: node.multiple || undefined, disabled: node.disabled || undefined,
-      boxShown: shown(node) || (node.nextElementSibling && shown(node.nextElementSibling)) || false,
-      options: node.tagName === 'SELECT' ? node.options.length : undefined,
-      optionWords: node.tagName === 'SELECT' && optionsSafe.test(clean) && node.options.length <= 12 ? [...node.options].map(words) : undefined,
-    });
-    return info;
+  const own = node => [...node.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').replace(/\s+/g, ' ').trim();
+  const all = node => (node.textContent || '').replace(/\s+/g, ' ').trim();
+  const safe = text => /leave of absence|\(loa\)|do not schedule|\(dns\)|holiday|\(hol\)/i.test(text) ? text.slice(0, 40)
+    : /^[^:]+:\s*\d+$/.test(text) ? 'client (name: number)' : text ? 'other words' : '(none)';
+  const iso = value => /^\d{4}-\d{2}-\d{2}/.test(value || '') ? value.slice(0, 10) : value || null;
+  const todayCell = document.querySelector('td.fc-today[data-date], td.fc-day.fc-today');
+  const today = new Date(); const monday = new Date(today); monday.setDate(today.getDate() - ((today.getDay() + 6) % 7));
+  const day = d => d.toISOString().slice(0, 10);
+  const weekStart = day(new Date(Date.UTC(monday.getFullYear(), monday.getMonth(), monday.getDate())));
+  const weekEnd = day(new Date(Date.UTC(monday.getFullYear(), monday.getMonth(), monday.getDate() + 6)));
+  const views = [...document.querySelectorAll('.fc-view')];
+  const tiles = [...document.querySelectorAll('.fc-event')].map(tile => {
+    const cell = tile.closest('td.fc-day[data-date], td[data-date]');
+    const date = iso(tile.getAttribute('data-date')) || iso(cell?.getAttribute('data-date'));
+    return {
+      ownWords: safe(own(tile)), allWords: safe(all(tile).replace(/^[\d.]+h\s*/, '').replace(/\s*JC:.*$/, '')),
+      tileDate: iso(tile.getAttribute('data-date')), cellDate: iso(cell?.getAttribute('data-date')), date,
+      thisWeek: !!date && date >= weekStart && date <= weekEnd,
+      shown: shown(tile), inFcView: !!tile.closest('.fc-view'), inControl: !!tile.closest('[id^="controlCalendar_"]'),
+      fcIndex: [...document.querySelectorAll('.fc')].indexOf(tile.closest('.fc')),
+      classes: [...tile.classList].filter(c => !/\d{3,}/.test(c)).join(' '),
+    };
   });
   const result = {
-    probe: 'find-labels 2026-10-29',
-    windowTitle: words(modal.querySelector('.modal-title') || modal).slice(0, 40),
-    forms: forms.map(form => ({ id: mask(form.id), class: [...form.classList].join('.'), shown: shown(form) })),
-    labels,
-    exactClients: labels.filter(item => item.label.toLowerCase() === 'clients').length,
-    anyClient: labels.filter(item => /client/i.test(item.label)).map(item => item.label),
+    probe: 'find-anchor 2026-10-30', weekStart, weekEnd,
+    todayCell: todayCell ? iso(todayCell.getAttribute('data-date')) : null,
+    fcCount: document.querySelectorAll('.fc').length, viewCount: views.length,
+    viewsShown: views.map(shown), dayCells: document.querySelectorAll('td.fc-day[data-date]').length,
+    tilesTotal: tiles.length, thisWeek: tiles.filter(t => t.thisWeek), firstOthers: tiles.filter(t => !t.thisWeek).slice(0, 3),
   };
-  const out = JSON.stringify(result, null, 1);
-  console.log(out);
-  try { copy(out); console.log('Copied to the clipboard.'); } catch { console.log('Copy it from above.'); }
+  const text = JSON.stringify(result, null, 1);
+  console.log(text);
+  try { copy(text); console.log('Copied to the clipboard.'); } catch { /* copy() exists only in the DevTools console */ }
 })();
