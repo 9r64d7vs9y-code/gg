@@ -3584,6 +3584,7 @@ __exports.preflightFormIdentity = preflightFormIdentity;
 'use strict';
 const { isTaxPage, hasReadSite, readSite } = __require("./site.js");
 const { findTaxAssignments } = __require("./tax-page.js");
+const { readScheduleTile } = __require("./tiles.js");
 const { timedRun } = __require("../core/run-records.js");
 const { retirePreflightForm } = __require("./preflight-form.js");
 const { usDate, readIsoDay, compareDays, sameDay, todayOf, mondayOf, addDays } = __require("../rules/dates.js");
@@ -4152,11 +4153,18 @@ async function openPeriods() {
   const settings = [...document.querySelectorAll('button.fc-settings-button')].find(shown);
   if (!settings) throw new PageError('The ⋮ settings button was not found.');
   await click(settings);
-  const item = await waitFor(() => [...document.querySelectorAll('.dropdown-menu a, .dropdown-menu button, .dropdown-menu li, .dropdown-item')]
-    .find(node => shown(node) && sameText(text(node), 'No. of Periods')), '"No. of Periods" in the ⋮ menu');
+  const item = await waitFor(() => {
+    const matches = [...document.querySelectorAll('.dropdown-menu a, .dropdown-menu button, .dropdown-menu li, .dropdown-item')]
+      .filter(node => shown(node) && sameText(text(node), 'No. of Periods'));
+    return matches.find(node => !matches.some(inner => inner !== node && node.contains(inner)));
+  }, '"No. of Periods" in the ⋮ menu');
   const before = new Set([...document.querySelectorAll('.modal, [role=dialog]')].filter(shown));
   await click(item);
-  const dialog = await settled(await waitFor(() => [...document.querySelectorAll('.modal, [role=dialog]')].find(node => shown(node) && !before.has(node)), 'the No. of Periods window'));
+  const opened = await waitFor(() => [...document.querySelectorAll('.modal, [role=dialog]')].find(node => shown(node) && !before.has(node)), 'the No. of Periods window').catch(error => {
+    if (stopFlagged(error) || !error.timeout) throw error;
+    throw Object.assign(new PageError('The No. of Periods window did not open. Nothing was changed.'), { timeout: true, late: error.late });
+  });
+  const dialog = await settled(opened);
   const select = dialog.querySelector('select');
   const input = select ? null : dialog.querySelector('input[type=number], input[type=text]');
   if (!select && !input) throw new PageError('The No. of Periods window has no list or box Snooze knows.');
@@ -4372,7 +4380,6 @@ async function findRoute() {
 }
 const dnsFindAnchor = client => sameText(client, DNS_CLIENT);
 const loaFindAnchor = client => sameText(client, LOA_CLIENT);
-const tileClient = entry => [...entry.childNodes].filter(node => node.nodeType === 3).map(node => node.textContent).join(' ').trim();
 function currentWeekFindSpots(today) {
   const view = calendarView();
   const root = view?.closest('.staff-calendar-wrapper');
@@ -4380,19 +4387,17 @@ function currentWeekFindSpots(today) {
   if (!root || names.length !== 1 || !root.contains(names[0])) throw new PageError('Find Assignments has no proved Professional calendar. Nothing was changed; By hand.');
   const monday = mondayOf(today);
   const datedCells = [...view.querySelectorAll('td.fc-day[data-date]')].filter(shown);
-  return [...root.querySelectorAll('.fc-event')].filter(isScheduleContent).filter(shown).filter(entry => {
-    const cell = entry.closest('td.fc-day[data-date]');
-    if (entry.closest('.fc') !== view.closest('.fc')) return false;
-    if (entry.closest('.fc-view') && entry.closest('.fc-view') !== view) return false;
-    const day = readIsoDay(entry.getAttribute('data-date') || cell?.getAttribute('data-date') || '');
-    if (entry.hasAttribute('data-date') && cell && entry.getAttribute('data-date') !== cell.getAttribute('data-date')) return false;
-    const clientText = tileClient(entry);
+  return [...root.querySelectorAll('.fc-event')].filter(isScheduleContent).filter(shown).map(entry => {
+    const read = readScheduleTile(entry, view);
+    if (!read.day && !read.legacy) throw new PageError("A calendar tile's week could not be read and proved. Nothing was read or changed; By hand.");
+    return { cell: entry, entry: true, ...read };
+  }).filter(({ day, client: clientText }) => {
     return day && compareDays(day, monday) >= 0 && compareDays(day, addDays(monday, 6)) <= 0
       && datedCells.some(cell => {
         const date = readIsoDay(cell.getAttribute('data-date'));
         return date && sameDay(date, mondayOf(day));
       }) && (/^[^:]+:\s*\d+$/.test(clientText) || dnsFindAnchor(clientText) || loaFindAnchor(clientText));
-  }).map(cell => ({ cell, entry: true }));
+  });
 }
 async function proveFindReopenAfter(removed) {
   const { greyed, today } = await findRoute();
@@ -4400,7 +4405,7 @@ async function proveFindReopenAfter(removed) {
   const edit = await findAssignments({ start: mondayOf(today), end: addDays(mondayOf(today), 6) });
   let retained;
   try {
-    const dated = currentWeekFindSpots(today).map(spot => tileClient(spot.cell));
+    const dated = currentWeekFindSpots(today).map(spot => spot.client);
     const datedDns = dated.some(dnsFindAnchor), datedLoa = dated.some(loaFindAnchor);
     retained = (await readEditTable(edit)).some(row => (/:\s*\d+\b/.test(row.client) || dnsFindAnchor(row.client) && datedDns || loaFindAnchor(row.client) && datedLoa)
       && !removed.some(old => old.id === row.id || old.date === row.date && sameText(old.client, row.client) && sameText(old.wbs, row.wbs)));
@@ -4444,8 +4449,8 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
   const { greyed, today } = await findRoute();
   let spots = greyed ? currentWeekFindSpots(today) : emptySpots();
   if (greyed) {
-    const clients = spots.filter(spot => !dnsFindAnchor(tileClient(spot.cell)) && !loaFindAnchor(tileClient(spot.cell)));
-    const dns = spots.filter(spot => dnsFindAnchor(tileClient(spot.cell)));
+    const clients = spots.filter(spot => !dnsFindAnchor(spot.client) && !loaFindAnchor(spot.client));
+    const dns = spots.filter(spot => dnsFindAnchor(spot.client));
     spots = clients.length ? clients : dns.length ? dns : spots;
   }
   if (!spots.length) throw new PageError('Find Assignments has no proved client entry or DNS entry in the current week. Nothing was read or changed; By hand.');
@@ -4614,18 +4619,17 @@ function displayedTableRowCount(edit) {
   return [from, to, total].every(Number.isSafeInteger) && from === (total ? 1 : 0) && to === total ? total : null;
 }
 function proveCalendarRows(rows, range) {
+  const view = calendarView();
   for (const tile of tilesOnScreen()) {
-    const cell = tile.closest('td.fc-day[data-date]');
-    const day = readIsoDay(tile.getAttribute('data-date') || cell?.getAttribute('data-date') || '');
+    const { day, client, hours, legacy } = readScheduleTile(tile, view);
+    if (!day && !legacy) throw futureReadRefusal("A calendar tile's week could not be read and proved.");
     if (!day || compareDays(day, range.start) < 0) continue;
-    const client = tileClient(tile);
     if (range.clients && !range.clients.some(wanted => sameText(wanted, client))) continue;
     const matching = rows.filter(row => {
       const date = termDayOf(row.date);
       return date && sameText(row.client, client) && sameDay(mondayOf(date), mondayOf(day));
     });
-    const hours = text(tile.querySelector('.field-value')).match(/^(\d+(?:\.\d+)?)h$/);
-    if (!matching.length || hours && sameDay(day, mondayOf(day)) && matching.reduce((sum, row) => sum + row.hours, 0) + 0.001 < Number(hours[1])) {
+    if (!matching.length || hours !== null && sameDay(day, mondayOf(day)) && matching.reduce((sum, row) => sum + row.hours, 0) + 0.001 < hours) {
       throw futureReadRefusal('The calendar shows an assignment missing from the future table.');
     }
   }
@@ -4716,6 +4720,75 @@ __exports.openRowNotes = openRowNotes;
 __exports.readRowNote = readRowNote;
 __exports.openPerson = openPerson;
 __exports.readEditTable = readEditTable;
+},
+"mysource/tiles.js": function (__require, __exports, document, window) {
+'use strict';
+const { readIsoDay, sameDay } = __require("../rules/dates.js");
+const { sameText, text } = __require("./dom.js");
+function gridColumn(target) {
+  const table = target.closest('table');
+  if (!table) return null;
+  const rows = [...table.querySelectorAll(':scope > tbody > tr, :scope > tr')];
+  const taken = [];
+  for (let r = 0; r < rows.length; r++) {
+    let col = 0;
+    for (const cell of rows[r].children) {
+      while (taken[r]?.[col]) col++;
+      const across = cell.colSpan, down = cell.rowSpan;
+      if (!Number.isInteger(across) || across < 1 || !Number.isInteger(down) || down < 1) return null;
+      if (cell === target) return across === 1 ? col : null;
+      for (let dr = 0; dr < Math.min(down, rows.length - r); dr++) {
+        for (let dc = 0; dc < across; dc++) (taken[r + dr] ||= [])[col + dc] = true;
+      }
+      col += across;
+    }
+  }
+  return null;
+}
+function eventDay(value) {
+  try {
+    if (typeof value?.format === 'function') return readIsoDay(value.format('YYYY-MM-DD'));
+    if (Object.prototype.toString.call(value) === '[object Date]') return readIsoDay(value.toISOString().slice(0, 10));
+    return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}(?:$|T)/.test(value) ? readIsoDay(value.slice(0, 10)) : null;
+  } catch { return null; }
+}
+function readScheduleTile(tile, view) {
+  const fields = [...tile.querySelectorAll('.field')];
+  const labelled = fields.some(field => field.querySelector('.field-label'));
+  const value = label => {
+    const matches = fields.filter(field => sameText(text(field.querySelector('.field-label')).replace(/:$/, ''), label));
+    return matches.length === 1 ? text(matches[0].querySelector('.field-value')) : '';
+  };
+  const client = labelled ? value('Name') : [...tile.childNodes].filter(node => node.nodeType === 3).map(node => node.textContent).join(' ').trim();
+  const hours = (labelled ? value('Hours') : text(tile.querySelector('.field-value'))).match(/^(\d+(?:\.\d+)?)h$/);
+  const skeleton = tile.closest('.fc-content-skeleton');
+  const result = { client, hours: hours ? Number(hours[1]) : null, day: null, legacy: !skeleton };
+  if (!view || tile.closest('.fc') !== view.closest('.fc') || tile.closest('.fc-view') && tile.closest('.fc-view') !== view) return result;
+  if (!skeleton) {
+    const cell = tile.closest('td.fc-day[data-date]');
+    if (tile.hasAttribute('data-date') && cell && tile.getAttribute('data-date') !== cell.getAttribute('data-date')) return result;
+    result.day = readIsoDay(tile.getAttribute('data-date') || cell?.getAttribute('data-date') || '');
+    return result;
+  }
+  if (!view.matches('.fc-weeklyTimeline-view') || tile.closest('.fc-view') !== view) return result;
+  const row = tile.closest('.fc-row.fc-week'), cell = tile.closest('td.fc-event-container');
+  if (!row || !cell || cell.closest('.fc-content-skeleton') !== skeleton) return result;
+  const dates = [...row.querySelectorAll('.fc-bg td.fc-day')].filter(node => node.closest('.fc-row') === row);
+  const col = gridColumn(cell);
+  if (col === null || col >= dates.length) return result;
+  const day = readIsoDay(dates[col].getAttribute('data-date') || '');
+  if (!day) return result;
+  try {
+    const jq = tile.ownerDocument.defaultView.jQuery;
+    if (typeof jq !== 'function') return result;
+    const data = jq(tile), seg = data.data('fcSeg'), event = data.data('event');
+    const start = eventDay(event?.start);
+    if (seg?.leftCol !== col || seg?.rightCol !== col || !start || !sameDay(day, start)) return result;
+  } catch { return result; }
+  result.day = day;
+  return result;
+}
+__exports.readScheduleTile = readScheduleTile;
 },
 "mysource/editability.js": function (__require, __exports, document, window) {
 'use strict';
@@ -10563,6 +10636,7 @@ function taxLiveReport(result) {
     steps: Object.entries(result.design === 'tax5' ? SMALL_TAX_STEPS : TAX_LIVE_STEPS).map(([id, title], index) => {
       const step = result.steps?.find(step => step.id === id);
       return { step: index + 1, title, result: states[step?.state] || 'not exercised',
+        ...(step?.state === 'failed' && step.reasonName === 'periodsWindowMissing' ? { reason: 'The No. of Periods window did not open.' } : {}),
         findings: (step?.findings || []).filter(word => TAX_LIVE_FINDINGS.has(word)) };
     }) }, null, 2);
 }
@@ -12432,6 +12506,7 @@ const reasons = [
   ['rowDidNotLeave', /staged row removal|prepared LOA row removal/],
   ['submitRefused', /save and close|refused it|Submit button|enabled Submit/],
   ['periodsWindowStuck', /No\. of Periods.*(?:close|finish)|(?:close|finish).*No\. of Periods/],
+  ['periodsWindowMissing', /No\. of Periods window did not open/],
   ['periodsUnreadable', /No\. of Periods/],
   ['findTableSlow', /Edit Assignment table.*(?:within|loading)|Find Assignments.*within/],
   ['findDatesChanged', /Find Assignments did not keep the dates/],
@@ -13093,41 +13168,43 @@ function mailText(one, mail, { dpName = '', dpEmail = '', signOff = '' } = {}) {
     missing: [!greeting && (rmNotApplicable ? 'RM not applicable' : 'the Resource Manager'), greeting && !dpEmail.trim() && 'Resource Manager email missing: add the recipient before sending', !signOff.trim() && 'your name for mail sign-off', mail.needsDeletionReview && "mail B's deletion statement (Snooze made no schedule change)"].filter(Boolean),
   };
 }
-const AUDIT_LOA_ASK = "We have received the ELE notification below for the professional's Leave of Absence. As per the Audit process, we update the LOA only with your approval. Kindly let us know if the LOA should be updated for the dates below and the scheduled hours in that period removed. Please find the screenshot of the current schedule attached.";
+const AUDIT_LOA_ASK = "We have received the ELE notification below for this professional's Leave of Absence. As per the Audit process, we update the LOA only with your approval. Please let us know if we should add the LOA for the dates below and remove the scheduled hours in that period.";
 function chooseAuditMail(one, worked) {
   if (one.personStop?.code === 'auditMissingDp') return { template: 'AAMissingDp', attachReport: false, paragraphs: [
-    'I hope you are doing well.',
-    'I am reaching out to inform you that this profile in MySource does not have a Deployment Professional aligned. As per the instructions received from A&A Deployment Leadership, we are forwarding this update to you for further action.',
-    'If you require any additional information, please let us know.',
+    'This profile in MySource does not have a Deployment Professional aligned. As per the instructions from A&A Deployment Leadership, we are forwarding this to you for further action.',
+    'Please reach out if you need any more information.',
   ] };
   if (one.personStop || ['byHand', 'notHandled'].includes(one.decision.outcome) || !worked) return null;
   if (one.record.notification.kind === 'leave') return { template: 'AALoaAsk', attachReport: false,
-    paragraphs: ['Greetings!', AUDIT_LOA_ASK] };
+    paragraphs: [AUDIT_LOA_ASK, 'Please find the screenshot of the current schedule attached. Please reach out if there are any further changes.'] };
   const audit = one.decision.audit;
   if (!audit?.region) return null;
   const date = usDate(audit.from);
-  const paragraphs = {
-    1: [audit.region === 'USI'
-      ? "We have received notification regarding the practitioner's exit. Could you please confirm Last working date for the Professional? Also, kindly advise if we need to create any requirements for the Professional. If so, please find the attached template and fill in the necessary details. Once you confirm the last working day and the requirements, we will create the requirements, remove the scheduled hours after the last working day and add Do Not Schedule (DNS) to the schedule."
-      : "We have received notification regarding the practitioner's exit. Could you please confirm the exit date for the practitioner. Also, kindly advise if we need to create any requirements for the practitioner. If so, please find the attached template and fill in the necessary details. Once you confirm the last working day and the requirements, we will create the requirements, remove the scheduled hours after the last working day and add Do Not Schedule (DNS) to the schedule.", 'Thank you for your support.'],
-    2: [`We have received the notification regarding the Professional's exit. Could you please confirm Last working date for the Professional? However, we have noted that there is no client time scheduled beyond the ${date}. Please find the attached screenshot for your reference. Kindly let us know if any further action is required from our end. Once you confirm the last working day, we will add Do Not Schedule (DNS) to the schedule after it.`, 'Thank you.'],
-    3: [`We have received notification regarding the practitioner's exit. Kindly advise if we need to create any requirements for the practitioner after the last working day (${date}). If so, please find the attached template and fill in the necessary details. Once you confirm, we will create the requirements, remove the scheduled hours after the last working day (${date}) and add Do Not Schedule (DNS) to the schedule.`, 'Thank you for your support.'],
-    4: [`We have received notification regarding the practitioner's exit. However, we have noted that there is no client time scheduled beyond the ${date}. Hence, we have scheduled Do Not Schedule (DNS) post the LWD. Please find the attached screenshot for your reference. Kindly let us know if any further action is required from our end.`,
-      ...(one.exit?.greyed ? ['We are unable to add DNS to the schedule as the schedule is greyed out.'] : [])],
+  const middle = {
+    1: 'Please confirm the last working day, and let us know if any requirements should be created; if so, please fill in the attached template. Once you confirm, we will create the requirements, remove the scheduled hours after the last working day and add Do Not Schedule (DNS).',
+    2: `There is no client time scheduled after ${date}. Please confirm the last working day, and we will add Do Not Schedule (DNS) after it.`,
+    3: `The last working day is ${date}, and there is client time scheduled after it. Please let us know if any requirements should be created; if so, please fill in the attached template. Once you confirm, we will create the requirements, remove the scheduled hours after ${date} and add Do Not Schedule (DNS).`,
+    4: `There was no client time scheduled after ${date}, so we have added Do Not Schedule (DNS) after the last working day.`,
   }[audit.template];
-  return paragraphs ? { template: `AA${audit.template}`, attachReport: false, attachTemplate: [1, 3].includes(audit.template), paragraphs: ['I hope you are doing well.', ...paragraphs] } : null;
+  const attachTemplate = [1, 3].includes(audit.template);
+  return middle ? { template: `AA${audit.template}`, attachReport: false, attachTemplate, paragraphs: [
+    `We have received the notification below about this professional's exit. ${middle}`,
+    ...(audit.template === 4 && one.exit?.greyed ? ['DNS could not be added where the schedule is greyed out.'] : []),
+    attachTemplate ? 'Please find the template and the screenshot attached. Please reach out if there are any further changes.'
+      : 'Please find the screenshot attached. Please reach out if any further action is needed.',
+  ] } : null;
 }
 function auditMailText(one, mail, { dpName, signOff }) {
   const record = one.record, name = professionalName(record), email = record.exportEmail ?? record.email;
   const greeting = greetingName(dpName), missingDp = mail.template === 'AAMissingDp';
   const date = field => record.notification.dates[field] ? usDate(record.notification.dates[field]) : '';
   const exit = /^AA[1-4]$/.test(mail.template);
-  const details = exit ? [`${name} – ${email}`, `Date of Resignation: ${date('resignation')}`, `Planned Last Working Day: ${date('lastWorkingDay')}`]
-    : ['LOA Details:', `Professional Name: ${name}`, `Mail ID: ${email}`, `Leave Start Date: ${date('start')}`, `Leave End Date: ${date('end')}`];
+  const details = exit ? ['Exit Details:', `Mail ID: ${email}`, `Date of Resignation: ${date('resignation')}`, `Planned Last Working Day: ${date('lastWorkingDay')}`]
+    : ['LOA Details:', `Mail ID: ${email}`, `Leave Start Date: ${date('start')}`, `Leave End Date: ${date('end')}`];
   const nameOnly = signOff.trim().replace(/^(?:thank you!?|thanks & regards,?|regards,?)\s*\n/i, '').trim();
   const body = missingDp ? ['Hi <POC Name>,', '', ...mail.paragraphs.flatMap((p, i) => [p, '',
-    ...(i === 1 ? [`Professional Name: ${name}`, `Mail ID: ${email}`, ''] : [])]), 'Regards,', nameOnly || '<Your Name>'].join('\n')
-    : [`Hi ${greeting || '<Deployment Professional Name>'},`, '', ...mail.paragraphs.flatMap(p => [p, '']), ...details, '', exit ? 'Thanks & Regards,' : 'Thank You!', nameOnly || '<Your Name>'].join('\n');
+    ...(i === 0 ? [`Mail ID: ${email}`, ''] : [])]), 'Regards,', nameOnly || '<Your Name>'].join('\n')
+    : [`Hi ${greeting || '<Deployment Professional Name>'},`, '', ...mail.paragraphs.flatMap(p => [p, '']), ...details, '', 'Regards,', nameOnly || '<Your Name>'].join('\n');
   return { to: missingDp ? '' : greeting ? dpName : '', subject: subjectLine(record.number, name), body, copyBody: body,
     missing: [missingDp && 'the mail recipient', !missingDp && !greeting && 'the Resource Manager', !nameOnly && 'your name for mail sign-off'].filter(Boolean) };
 }
@@ -13936,7 +14013,6 @@ const COMPACT_STYLE = `
 .head{height:30px;display:flex;align-items:center;gap:8px;padding:0 10px;background:${COLOURS.header};border-bottom:1px solid ${COLOURS.divider};cursor:move;touch-action:none}.title{font-weight:700;flex:1}.counter{font-variant-numeric:tabular-nums;color:${COLOURS.muted};font-size:11px;font-weight:500}.body{padding:12px;display:grid;gap:10px}.batch{display:grid;gap:10px}
 button{font:bold 13px system-ui,sans-serif;border:0;border-radius:8px;padding:8px 10px;cursor:pointer;color:${COLOURS.text};background:${COLOURS.grey}}button:hover:not(:disabled){filter:brightness(1.1);transform:translateY(-1px)}button:active:not(:disabled){transform:scale(.98)}button:disabled{opacity:.5;cursor:default}button:focus-visible,summary:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid ${COLOURS.selection};outline-offset:2px}.head button{font:16px system-ui;padding:0 3px;background:none;height:26px}.file-line{display:flex;align-items:center;gap:4px;white-space:nowrap;font-size:12px}.file-line>span{flex:1}.change{font-size:11px;font-weight:600;color:${COLOURS.text};background:${COLOURS.surface};border:1px solid ${COLOURS.grey};border-radius:6px;padding:3px 9px}.start-files{display:grid;gap:10px}
 .green{background:${COLOURS.green};color:${COLOURS.page}}.blue{background:${COLOURS.blue};color:${COLOURS.page}}.amber{background:${COLOURS.amber};color:${COLOURS.page}}.grey,.undo{background:${COLOURS.grey}}.buttons{display:flex;gap:8px}.buttons>button{flex:1}.counts{white-space:nowrap}.drop{padding:14px 8px;border:1px dashed ${COLOURS.grey};border-radius:8px;background:${COLOURS.surface};text-align:center;font-weight:400;width:100%}summary{cursor:pointer;list-style:none;padding:8px 0}summary::-webkit-details-marker{display:none}.package-check summary::before{content:'\\25b6';display:inline-block;width:14px}.package-check[open] summary::before{content:'\\25bc'}.person-row{position:relative;padding:8px 0;border-top:1px solid ${COLOURS.divider}}.person-name{overflow-wrap:anywhere;font-weight:600;padding-right:48px}.reason,.dates{color:${COLOURS.muted}}.failed{color:${COLOURS.redText};overflow-wrap:anywhere}.warn{color:${COLOURS.amber};overflow-wrap:anywhere}.undo{position:absolute;right:0;top:8px;font-size:11px;padding:4px 6px;color:${COLOURS.muted}}.progress{height:3px;background:${COLOURS.divider};border-radius:2px;overflow:hidden}.progress>div{height:100%;background:${COLOURS.green}}.running-person{background:${COLOURS.surface};border:1px solid ${COLOURS.divider};border-radius:8px;padding:10px}.dates{margin-top:4px}textarea,input{background:${COLOURS.surface};color:${COLOURS.text};border:1px solid ${COLOURS.grey};border-radius:6px;padding:6px;font:inherit;width:100%}.popup-shade{position:fixed;inset:0;display:grid;place-items:center;background:rgba(0,0,0,0.4666666666666667);z-index:2147483647}.popup{width:340px;max-width:calc(100vw - 32px);padding:16px;background:${COLOURS.surface};color:${COLOURS.text};border:1px solid ${COLOURS.grey};border-radius:10px;font:13px/1.45 system-ui;box-shadow:0 8px 28px rgba(0,0,0,0.4666666666666667)}.popup-title{font-weight:700;margin-bottom:8px}.popup .buttons{margin-top:16px}
-/* Yoink's look, measured from Yoink's own panel (Dre, 2026-10-06): DESIGN.md says Yoink is the reference. */
 .panel{width:360px;border-radius:14px;box-shadow:0 12px 36px rgba(0,0,0,.5);font:13px/1.5 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
 .head{padding:0 6px 0 12px}.title{font-size:12px;font-weight:600;letter-spacing:.01em}
 .head button{width:24px;height:24px;padding:0;border-radius:6px;display:grid;place-items:center;font-size:14px;line-height:1;color:${COLOURS.muted};background:transparent}.head button:hover:not(:disabled){background:${COLOURS.divider};color:${COLOURS.text};filter:none;transform:none;box-shadow:none}
