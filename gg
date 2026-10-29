@@ -1,33 +1,50 @@
 /*
- * Snooze Tax identity probe 2 — read-only. Same place as probe 1: Tax
- * MySource, Schedule, Staff tab, the test person's schedule open by hand.
- * Clicks nothing, saves nothing, sends nothing. Prints only yes/no and counts,
- * never an id, name or link. Copy the lines it prints.
+ * Snooze Find Assignments labels check — read-only (Claude, 2026-10-29).
+ * For the A&A "Clients" fault. On Consulting MySource > Schedule > Calendar
+ * view, open an A&A LOA person's schedule by hand, right-click an entry and
+ * choose Find Assignments, change nothing, then paste this into the console.
+ * It clicks nothing and changes nothing. It prints the form's labels and box
+ * types only, never a value; option words only for period/view-type boxes.
+ * The result is also put on the clipboard (copy) to paste back to Claude.
  */
 (() => {
-  const out = [];
-  const wrapper = document.querySelector('.staff-calendar-wrapper');
-  if (!wrapper) { console.log('no .staff-calendar-wrapper'); return; }
-  const shown = node => !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
-  const has = (text, id) => new RegExp(`(?:^|\\D)${id}(?:\\D|$)`).test(text || '');
-  const marks = [...wrapper.querySelectorAll('[data-entity-id]')];
-  const ids = marks.map(node => node.getAttribute('data-entity-id'));
-  out.push(`id marks: ${marks.length}, shown: ${marks.filter(shown).length}, all the same id: ${new Set(ids).size === 1}`);
-  marks.forEach((node, i) => out.push(`  mark ${i + 1}: shown=${shown(node)} inside .fc=${!!node.closest('.fc')} inside #controlCalendar_staff=${!!node.closest('#controlCalendar_staff')} same row as the name link=${!!node.parentElement?.querySelector(':scope > span > a')}`));
-  const id = ids[0];
-  if (!id) { console.log(out.join('\n')); return; }
-  // The name link and list icon in the header row, and the two calendars' record ids.
-  const close = [...wrapper.querySelectorAll('a')].find(a => a.querySelector('i.fa-times') && shown(a));
-  const row = close?.parentElement;
-  const nameLink = row?.querySelector(':scope > span > a');
-  const listIcon = row?.querySelector(':scope > a.schedule-icon');
-  out.push(`name link found: ${!!nameLink}, its link carries the id: ${has(nameLink?.getAttribute('href'), id)}`);
-  out.push(`list icon found: ${!!listIcon}, its link carries the id: ${has(listIcon?.getAttribute('href'), id)}`);
-  out.push(`shown id mark in the name row: ${!!row && [...row.querySelectorAll('[data-entity-id]')].filter(shown).length}`);
-  const calendars = [...wrapper.querySelectorAll('[data-record-id]')];
-  calendars.forEach((node, i) => out.push(`  calendar ${i + 1}: shown=${shown(node)} size=${node.offsetWidth}x${node.offsetHeight} record id equals the id: ${node.getAttribute('data-record-id') === id}`));
-  // Does the id appear anywhere else on the page, outside this person's schedule?
-  const elsewhere = [...document.querySelectorAll('[data-entity-id]')].filter(node => !wrapper.contains(node));
-  out.push(`id marks outside the schedule: ${elsewhere.length}, with the same id: ${elsewhere.filter(node => node.getAttribute('data-entity-id') === id).length}`);
-  console.log(out.join('\n'));
+  const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
+  const words = node => (node.textContent || '').replace(/\s+/g, ' ').trim();
+  const mask = id => id ? id.replace(/\d+/g, '#') : null;
+  const modals = [...document.querySelectorAll('.modal')].filter(shown);
+  const modal = modals.find(node => /Find Assignments/i.test(words(node.querySelector('.modal-title, .modal-header') || node)));
+  if (!modal) { console.log(`No open Find Assignments window found (${modals.length} open windows).`); return; }
+  const forms = [...modal.querySelectorAll('form, .js-dynamic-form')];
+  const control = label => {
+    const byFor = label.htmlFor && document.getElementById(label.htmlFor);
+    if (byFor) return { node: byFor, how: 'for' };
+    const row = label.closest('.dynamic-form-row, .form-group, .mb-3') || label.parentElement;
+    const node = row && row.querySelector('select, input:not([type=hidden]), textarea');
+    return node ? { node, how: 'row' } : { node: null, how: 'none' };
+  };
+  const optionsSafe = /period|view|type|week|date|status/i;
+  const labels = [...modal.querySelectorAll('label')].map(label => {
+    const text = words(label), clean = text.replace(/[*?]/g, '').trim();
+    const { node, how } = control(label);
+    const info = { label: clean, raw: text === clean ? undefined : text, shown: shown(label), found: how };
+    if (node) Object.assign(info, {
+      box: node.tagName.toLowerCase() + (node.type && node.tagName !== 'SELECT' ? `[${node.type}]` : ''),
+      id: mask(node.id), multiple: node.multiple || undefined, disabled: node.disabled || undefined,
+      boxShown: shown(node) || (node.nextElementSibling && shown(node.nextElementSibling)) || false,
+      options: node.tagName === 'SELECT' ? node.options.length : undefined,
+      optionWords: node.tagName === 'SELECT' && optionsSafe.test(clean) && node.options.length <= 12 ? [...node.options].map(words) : undefined,
+    });
+    return info;
+  });
+  const result = {
+    probe: 'find-labels 2026-10-29',
+    windowTitle: words(modal.querySelector('.modal-title') || modal).slice(0, 40),
+    forms: forms.map(form => ({ id: mask(form.id), class: [...form.classList].join('.'), shown: shown(form) })),
+    labels,
+    exactClients: labels.filter(item => item.label.toLowerCase() === 'clients').length,
+    anyClient: labels.filter(item => /client/i.test(item.label)).map(item => item.label),
+  };
+  const out = JSON.stringify(result, null, 1);
+  console.log(out);
+  try { copy(out); console.log('Copied to the clipboard.'); } catch { console.log('Copy it from above.'); }
 })();
