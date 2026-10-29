@@ -2928,7 +2928,7 @@ function reasonLine(decision, prepared = null) {
     case 'exitUsiLwd': return 'USI Exit with a last working day → by hand; no schedule action.';
     case 'auditUsiLwd': return 'A&A USI exit with a last working day: not in the SOP';
     case 'auditMissingDp': return 'A&A Deployment Professional missing → by hand; no schedule action.';
-    case 'auditLoa': return prepared?.auditAlready ? 'A&A LOA already in place; no schedule change.' : "A&A LOA → ask the Deployment Professional; no schedule change.";
+    case 'auditLoa': return "A&A LOA → ask the Deployment Professional; no schedule change.";
     case 'auditExit': return `A&A Exit → mail ${decision.audit.template}; no schedule change.`;
     case 'exitNoLwdUs': return '✗ US professional with no last working day → by hand; no schedule action.';
     case 'exitNoLwdRegion': return !decision.region.trim() ? 'No Region on the Staff Schedule Hours Report (expected US - USI or US - US) → by hand' : `Region "${decision.region}" not recognised (expected US - USI or US - US) → by hand`;
@@ -3591,7 +3591,7 @@ const { termDayOf } = __require("../rules/shared.js");
 const { emailKey, emailFormKey } = __require("../rules/prepare.js");
 const { findByEmail } = __require("../family/email.js");
 const { recordRun, observeRun } = __require("../core/run-records.js");
-const { DNS_CLIENT } = __require("./checks.js");
+const { DNS_CLIENT, LOA_CLIENT } = __require("./checks.js");
 const { PageError, WAIT, activeGuardProbe, probeStyleReader, chooseInSelect2, click, closeWindow, describe, fieldByLabel, guardReady, guarded, keepFlags, cleanupAfter, rightClick, sameText, setChecked, settled, shown, shownUsing, stopFlagged, text, typeInto, waitFor, withPersonGuard } = __require("./dom.js");
 const SEARCH_SELECT = 'select[id^="ScheduleAddForm_Staff_Form_field_"]';
 const CALENDAR_VIEW = '.fc-view';
@@ -4371,6 +4371,7 @@ async function findRoute() {
   return { today, greyed: !!term && !sameDay(term, { y: 9999, m: 12, d: 31 }) && compareDays(today, term) >= 0 };
 }
 const dnsFindAnchor = client => sameText(client, DNS_CLIENT);
+const loaFindAnchor = client => sameText(client, LOA_CLIENT);
 const tileClient = entry => [...entry.childNodes].filter(node => node.nodeType === 3).map(node => node.textContent).join(' ').trim();
 function currentWeekFindSpots(today) {
   const view = calendarView();
@@ -4390,7 +4391,7 @@ function currentWeekFindSpots(today) {
       && datedCells.some(cell => {
         const date = readIsoDay(cell.getAttribute('data-date'));
         return date && sameDay(date, mondayOf(day));
-      }) && (/^[^:]+:\s*\d+$/.test(clientText) || dnsFindAnchor(clientText));
+      }) && (/^[^:]+:\s*\d+$/.test(clientText) || dnsFindAnchor(clientText) || loaFindAnchor(clientText));
   }).map(cell => ({ cell, entry: true }));
 }
 async function proveFindReopenAfter(removed) {
@@ -4399,8 +4400,9 @@ async function proveFindReopenAfter(removed) {
   const edit = await findAssignments({ start: mondayOf(today), end: addDays(mondayOf(today), 6) });
   let retained;
   try {
-    const datedDns = currentWeekFindSpots(today).some(spot => dnsFindAnchor(tileClient(spot.cell)));
-    retained = (await readEditTable(edit)).some(row => (/:\s*\d+\b/.test(row.client) || dnsFindAnchor(row.client) && datedDns)
+    const dated = currentWeekFindSpots(today).map(spot => tileClient(spot.cell));
+    const datedDns = dated.some(dnsFindAnchor), datedLoa = dated.some(loaFindAnchor);
+    retained = (await readEditTable(edit)).some(row => (/:\s*\d+\b/.test(row.client) || dnsFindAnchor(row.client) && datedDns || loaFindAnchor(row.client) && datedLoa)
       && !removed.some(old => old.id === row.id || old.date === row.date && sameText(old.client, row.client) && sameText(old.wbs, row.wbs)));
   } finally { await closeEdit(edit); }
   if (!retained) throw new PageError('Find Assignments would lose its current-week client entry or DNS entry after this change. Nothing was changed; By hand.');
@@ -4442,8 +4444,9 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
   const { greyed, today } = await findRoute();
   let spots = greyed ? currentWeekFindSpots(today) : emptySpots();
   if (greyed) {
-    const clients = spots.filter(spot => !dnsFindAnchor(tileClient(spot.cell)));
-    if (clients.length) spots = clients;
+    const clients = spots.filter(spot => !dnsFindAnchor(tileClient(spot.cell)) && !loaFindAnchor(tileClient(spot.cell)));
+    const dns = spots.filter(spot => dnsFindAnchor(tileClient(spot.cell)));
+    spots = clients.length ? clients : dns.length ? dns : spots;
   }
   if (!spots.length) throw new PageError('Find Assignments has no proved client entry or DNS entry in the current week. Nothing was read or changed; By hand.');
   await menuItem(spots, 'Find Assignments');
@@ -4464,7 +4467,7 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
     const to = termDayOf(findDateBox(form, 'End').value.trim());
     const selected = [...fieldByLabel(form, clientsLabel).selectedOptions].filter(option => option.value);
     if (!from || !to || !sameDay(mondayOf(from), mondayOf(today)) || !sameDay(mondayOf(to), mondayOf(today))
-        || compareDays(to, from) < 0 || selected.length !== 1 || !(/^[^:]+:\s*\d+$/.test(text(selected[0])) || dnsFindAnchor(text(selected[0])))) {
+        || compareDays(to, from) < 0 || selected.length !== 1 || !(/^[^:]+:\s*\d+$/.test(text(selected[0])) || dnsFindAnchor(text(selected[0])) || loaFindAnchor(text(selected[0])))) {
       throw new PageError('Find Assignments did not prove its current-week client entry or DNS entry prefill. Nothing was read or changed; By hand.');
     }
   }
@@ -7101,9 +7104,33 @@ async function capturePersonRecorded(row, { identity, operation = 'capture' } = 
   out.warnings = [...new Set(warnings)].join('; ');
 }
 const BATCH_COLUMNS = ['Ticket', 'Name', 'Email', 'Resource Manager name', 'Resource Manager email', 'Kind', 'What was done', 'Warning/failure reason', 'Resolution notes (SN)'];
-const joinReasons = parts => parts.reduce((text, part) => !text ? part : `${text}${/[.!?]$/.test(text) ? ' ' : '; '}${part}`, '');
+function excelRows(rows) {
+  const group = row => ['nothing', 'leftOut', 'undone'].includes(row.state) ? 0 : row.state === 'done' ? 1 : 2;
+  const noLwd = row => row.one.record.notification?.kind === 'exit' && !row.one.record.notification.dates?.lastWorkingDay;
+  const kind = row => row.one.record.subcategory?.site === 'tax' || row.one.slice?.site === 'tax' ? 2 : row.one.record.notification?.kind === 'exit' ? 1 : 0;
+  return [...rows].sort((a, b) => group(a) - group(b)
+    || (group(a) === 0 ? Number(noLwd(b)) - Number(noLwd(a)) : 0)
+    || kind(a) - kind(b)
+    || professionalName(a.one.record).localeCompare(professionalName(b.one.record))
+    || emailKey(a.one.record.email).localeCompare(emailKey(b.one.record.email)));
+}
+const joinReasons = parts => {
+  const seen = new Set();
+  const reasons = parts.map(part => {
+    const pieces = String(part).split(/((?<=[.!?])\s+|;\s*)/);
+    let text = '';
+    for (let i = 0; i < pieces.length; i += 2) {
+      const piece = pieces[i].trim(), key = piece.replace(/[.!?]+$/, '');
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      text += `${text ? pieces[i - 1] : ''}${piece}`;
+    }
+    return text;
+  }).filter(Boolean);
+  return reasons.reduce((text, part) => !text ? part : `${text}${/[.!?]$/.test(text) ? ' ' : '; '}${part}`, '');
+};
 function rowWarnings(row) {
-  if (row.state === 'timeLimit') return row.message;
+  if (row.state === 'timeLimit') return joinReasons([row.message, row.one.reportHint].filter(Boolean));
   const one = row.one;
   const description = row.state === 'undoing' ? 'undoing…' : row.state === 'undone' ? 'undone'
     : row.state === 'skipped' || failedRow(row) ? shortReason(row)
@@ -7112,10 +7139,11 @@ function rowWarnings(row) {
   const duplicates = one.record.duplicates || [];
   return joinReasons([...new Set([
     reasonLine(one.personStop || one.decision, row.prepared),
-    description && `${description}${duplicates.length ? ` · also ${duplicates.map(ticket => ticket.number).join(', ')}` : ''}`,
     row.message,
+    description && `${description}${duplicates.length ? ` · also ${duplicates.map(ticket => ticket.number).join(', ')}` : ''}`,
     row.result?.message,
     row.prepared?.nothing,
+    one.reportHint,
     row.prepared?.replacedOldNote && row.state === 'done' && 'The LOA was already on these dates with an old note; replaced with the new note.',
     row.result?.problems?.join('; '),
     row.prepared?.runs?.length && row.state === 'done' && `The same leave's LOA outside the new dates is removed: ${dayRanges(row.prepared.runs.flatMap(run => run.rows.map(day => day.day)))}.`,
@@ -7146,13 +7174,13 @@ function rowMailText(row, signOff) {
   return mail ? mailText({ ...one, record: { ...one.record, notification } }, mail, { dpName, dpEmail, signOff }) : null;
 }
 function mailsTable(rows, signOff = '') {
-  return [['Ticket', 'To', 'Subject', 'Mail'], ...rows.flatMap(row => {
+  return [['Ticket', 'To', 'Subject', 'Mail'], ...excelRows(rows).flatMap(row => {
     const text = rowMailText(row, signOff);
     return text ? [[row.one.record.number, text.to, text.subject, text.body.trim()]] : [];
   })];
 }
 function batchTable(rows, signOff = '') {
-  return [BATCH_COLUMNS, ...orderedRows(rows).flatMap(row => {
+  return [BATCH_COLUMNS, ...excelRows(rows).flatMap(row => {
     const one = row.one;
     const dpName = one.exit?.dpName || one.slice?.resourceManager || one.record.person.resourceManager || '';
     const dpEmail = one.exit?.dpEmail || one.slice?.resourceManagerEmail || '';
@@ -7249,7 +7277,7 @@ function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupRe
     attachments.set(key, added.map(file => file.name).join('\n'));
     files.push(...added);
   }
-  const tableRows = orderedRows(rows).flatMap(owner => batchTable([owner], signOff).slice(1).map((cells, index) => ({
+  const tableRows = excelRows(rows).flatMap(owner => batchTable([owner], signOff).slice(1).map((cells, index) => ({
     cells, owner, record: index ? owner.one.record.duplicates[index - 1] : owner.one.record,
   })));
   const table = [BATCH_COLUMNS, ...tableRows.map(item => item.cells)];
@@ -7266,7 +7294,7 @@ function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupRe
       [check?.report.reason, check?.picture.reason].filter(Boolean).join('; ')];
   }), ['Batch label', batchLabel, 'Pack version', String(packVersion)]];
   const mailRows = new Map(tableRows.map(({ cells, record }) => [personTicketKey(record), cells]));
-  const attention = rows.filter(row => (['done','nothing'].includes(row.state) && row.one.outputs?.warnings) || outgoing.get(personTicketKey(row.one.record))?.missing.length || row.state === 'skipped' || failedRow(row) || ['ready', 'pending', 'timeLimit'].includes(row.state))
+  const attention = excelRows(rows).filter(row => (['done','nothing'].includes(row.state) && row.one.outputs?.warnings) || outgoing.get(personTicketKey(row.one.record))?.missing.length || row.state === 'skipped' || failedRow(row) || ['ready', 'pending', 'timeLimit'].includes(row.state))
     .sort((a, b) => Number(['restoreFailed', 'undoFailed'].includes(b.state)) - Number(['restoreFailed', 'undoFailed'].includes(a.state)));
   const needsAttention = [['Ticket', 'Person', 'Result', 'Reason'], ...attention.map(row => [row.one.record.number, professionalName(row.one.record),
     ['restoreFailed', 'undoFailed'].includes(row.state) ? 'Restore unconfirmed' : row.state === 'timeLimit' ? row.message : row.state === 'skipped' || failedRow(row) ? 'By hand' : ['done','nothing'].includes(row.state) ? mailRows.get(personTicketKey(row.one.record))?.[6] || 'No schedule change' : 'Not run', mailRows.get(personTicketKey(row.one.record))?.[7] || rowWarnings(row)])];
@@ -8258,15 +8286,6 @@ function renderBatch(batch, work, box, draw) {
     const list = box.querySelector('.undo-list');
     if (list) list.scrollTop = undoScroll;
   } else {
-    for (const row of (batch.outputRows || rows).filter(row => (row.one.personStop || row.one.decision).code === 'bothReports' || row.one.record?.subcategory?.site === 'tax'
-      && ['taxTalentGroup', 'taxPartialLoa', 'taxPastEnd', 'leaveOver'].includes((row.one.personStop || row.one.decision).code))) {
-      box.append(el('div', { class: 'person-row' }, el('div', { class: 'person-name' }, personName(row.one)),
-        el('div', { class: 'reason' }, reasonLine(row.one.personStop || row.one.decision))));
-    }
-    for (const row of listedRows.filter(row => row.state === 'ready' && row.one.reportHint)) {
-      box.append(el('div', { class: 'person-row' }, el('div', { class: 'person-name' }, personName(row.one)),
-        el('div', { class: 'reason' }, row.one.reportHint)));
-    }
     if (batch.timeLimit?.line) box.append(el('div', { class: 'warn time-limit', role: 'status' }, batch.timeLimit.line));
     const name = el('input', { type: 'text', value: work.signOff || '', required: true, 'aria-label': 'Your name for mail sign-off' });
     box.append(el('label', { class: 'sign-off' }, 'Your name for mail sign-off', name));
@@ -8591,18 +8610,6 @@ __exports.pastReportWarning = pastReportWarning;
 'use strict';
 const { addDays, compareDays, usDate, workingDays } = __require("./dates.js");
 const inRange = (day, start, end) => compareDays(day, start) >= 0 && compareDays(day, end) <= 0;
-function auditLoaInPlace(rows, plan) {
-  const loa = rows.filter(row => /^leave of absence/i.test(row.client) || /\(loa\)/i.test(row.client));
-  const period = leavePeriod(loa, plan, plan.loaStart);
-  const days = workingDays(period.start, period.end);
-  const inside = rows.filter(row => inRange(row.day, period.start, period.end));
-  const touching = loaBlocks(loa).filter(block => isThisLeave(block, period.start, period.end));
-  return days.length > 0 && inside.length === days.length && touching.length === 1 &&
-    touching[0].rows.every(row => inRange(row.day, period.start, period.end)) && days.every(day => {
-      const onDay = inside.filter(row => compareDays(row.day, day) === 0);
-      return onDay.length === 1 && loa.includes(onDay[0]) && onDay[0].hours === 8;
-    });
-}
 function leavePeriod(rows, plan, today) {
   if (plan.notificationType !== 'endOnly') return { start: plan.loaStart, end: plan.loaEnd };
   const blocks = loaBlocks(rows);
@@ -8651,7 +8658,6 @@ function loaBlocks(rows) {
   return blocks;
 }
 __exports.inRange = inRange;
-__exports.auditLoaInPlace = auditLoaInPlace;
 __exports.leavePeriod = leavePeriod;
 __exports.dayRanges = dayRanges;
 __exports.leaveRuns = leaveRuns;
@@ -8715,7 +8721,7 @@ const { emailKey, valueKey, rememberPageName, professionalName } = __require("..
 const { PageError, withPersonGuard, stopFlagged, cleanupAfter } = __require("../mysource/dom.js");
 const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, proveFindReopenAfter, canAddAssignment, beginScheduleTurn } = __require("../mysource/schedule.js");
 const { calendarHolds, showDate } = __require("../mysource/calendar.js");
-const { leaveRuns, leavePeriod, loaBlocks, dayRanges, inRange, auditLoaInPlace } = __require("../rules/leaves.js");
+const { leaveRuns, leavePeriod, loaBlocks, dayRanges, inRange } = __require("../rules/leaves.js");
 const { deleteAll, deleteRange, addAssignment, preflightDates, refreshNotes, setAssignmentHours } = __require("../mysource/write.js");
 const { compareCopies, copyWindow, entriesToAdd, dayOf, ENTRY_FIELDS, knownAssignmentRows } = __require("../mysource/copy.js");
 const { restoreWindow, restorePlan } = __require("../mysource/restore.js");
@@ -8878,14 +8884,8 @@ async function prepareAuditReadOnly(one, today, step) {
   if (scope) return { stop: reasonLine(scope), reasonCode: scope.code };
   rememberPageName(one.record, await step(() => openPerson(one.record.email, one.record.person.professional, one.record, { today, termDate: one.record.person.termDate })));
   const identity = personIdentity();
-  let copy;
-  if (one.record.notification.kind === 'leave') {
-    copy = await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => copyWindow({ start: today, end: today }, { future: true })));
-  } else {
-    await requirePersonIdentity(identity);
-  }
-  const auditAlready = one.record.notification.kind === 'leave' && auditLoaInPlace(copy.days, one.decision.plan);
-  return { nothing: auditAlready ? 'A&A LOA already in place; no schedule change.' : 'A&A: no schedule change.', auditAlready, identity, copy,
+  await requirePersonIdentity(identity);
+  return { nothing: 'A&A: no schedule change.', identity,
     checks: [['✓', 'Schedule read only; nothing changed', '']] };
 }
 function recordLaterChange(prepared, after, notesChanged = false) {
@@ -8924,7 +8924,7 @@ function splitAuditExitRun(run, kept) {
     start = addDays(day, 1);
   }
   through(run.end);
-  if (run.rows.some(row => !parts.some(part => part.rows.includes(row)))) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.');
+  if (run.rows.some(row => !parts.some(part => part.rows.includes(row)))) throw new PageError('A kept DNS and another entry share a day → by hand');
   return parts;
 }
 async function applyRecorded(one, prepared, { step = fn => fn(), onWrite: writeNotice = () => {} } = {}) {
@@ -12424,7 +12424,7 @@ __exports.diagnosticWaitName = diagnosticWaitName;
 'use strict';
 const reasons = [
   ['weekNotCovered', /whole week is not covered|week delete scope/],
-  ['keptRowInRange', /kept row is inside/],
+  ['keptRowInRange', /kept row is inside|A kept DNS and another entry share a day/],
   ['ownedDeleteTableChanged', /owned .*delete rows changed/],
   ['tableChanged', /table changed|table differs|Exit entries changed|LOA .*changed since the backup/],
   ['rowOutsideRange', /outside the (?:delete|restore|window)|whole-week table includes rows outside/],
@@ -12659,6 +12659,7 @@ function packFacts(input) {
 }
 function shortLiveReport(result) {
   const report = liveReportSummary(result), stop=report.stop, page=stop?.page, finish=report.finish, lines=[];
+  const noStop = report.verdict === 'PASS' && !stop;
   const line = (name, value) => {
     const prefix = `${name}: `;
     let current = prefix;
@@ -12683,9 +12684,9 @@ function shortLiveReport(result) {
   line('Assign Period',report.assignPeriod);
   line('Finds',Object.entries(report.finds.counts).map(([kind,n])=>`${kind} ${n}`).join(', ') || 'none');
   line('Find steps',`${report.finds.first} - ${report.finds.last}`);
-  line('View',page?.view); line('Periods',page?.periods);
-  line('Windows',page ? `open ${page.windows?.open ?? 'unknown'}, hidden ${page.windows?.hidden ?? 'unknown'}` : 'unavailable');
-  line('Window kinds',kinds(page)); line('Visible',visible(page)); line('Covers',page?.covers);
+  line('View',noStop ? 'none' : page?.view); line('Periods',noStop ? 'none' : page?.periods);
+  line('Windows',noStop ? 'none' : page ? `open ${page.windows?.open ?? 'unknown'}, hidden ${page.windows?.hidden ?? 'unknown'}` : 'unavailable');
+  line('Window kinds',kinds(page)); line('Visible',visible(page)); line('Covers',noStop ? 'none' : page?.covers);
   for (const [index,edit] of (page?.edits || []).entries()) line(`Edit ${index+1}`,`open ${edit.open}, shown ${edit.shown}, display ${edit.display}, rows ${edit.rows}, owned ${edit.owned}`);
   line('Writes',`${report.writes.attempted} attempted / ${report.writes.proved} proved`);
   line('Cleanup',smallSteps && report.cleanup === 'unconfirmed' ? 'UNCONFIRMED' : report.cleanup);
@@ -12824,7 +12825,7 @@ function runReportText(batch, version, now = Date.now()) {
     const kind = one.record.notification?.kind === 'exit' ? 'Exit' : one.record.notification?.kind === 'leave' || one.decision.plan?.action === 'add' ? 'LOA' : 'unknown';
     let mail;
     try { mail = row.state === 'timeLimit' || one.slice?.status === 'notOnReport' ? null : one.record.subcategory?.business === 'audit' ? chooseMail(one, row.prepared)?.template : one.exit?.template || chooseMail(one, row.prepared)?.template; } catch { mail = null; }
-    const safeMail = ['A', 'B', 'C', 'D', 'F', 1, 2, 3, 4, 5, '1', '2', '3', '4', '5', 'AA1', 'AA2', 'AA3', 'AA4', 'AALoaAsk', 'AALoaAlready', 'AAMissingDp'].includes(mail) ? mail : 'none';
+    const safeMail = ['A', 'B', 'C', 'D', 'F', 1, 2, 3, 4, 5, '1', '2', '3', '4', '5', 'AA1', 'AA2', 'AA3', 'AA4', 'AALoaAsk', 'AAMissingDp'].includes(mail) ? mail : 'none';
     const comparison = data.comparison;
     const fields = (comparison?.fields || []).filter(value => FIELDS.has(value));
     const pictures = number(data.pictures) ?? one.outputs?.screenshots?.length ?? 0;
@@ -13093,16 +13094,15 @@ function mailText(one, mail, { dpName = '', dpEmail = '', signOff = '' } = {}) {
   };
 }
 const AUDIT_LOA_ASK = "We have received the ELE notification below for the professional's Leave of Absence. As per the Audit process, we update the LOA only with your approval. Kindly let us know if the LOA should be updated for the dates below and the scheduled hours in that period removed. Please find the screenshot of the current schedule attached.";
-const AUDIT_LOA_ALREADY = "We have received the ELE notification below for the professional's Leave of Absence. The LOA is already updated on the schedule for these dates, so no action was needed from our end. Please find the screenshot of the current schedule attached.";
 function chooseAuditMail(one, worked) {
   if (one.personStop?.code === 'auditMissingDp') return { template: 'AAMissingDp', attachReport: false, paragraphs: [
     'I hope you are doing well.',
     'I am reaching out to inform you that this profile in MySource does not have a Deployment Professional aligned. As per the instructions received from A&A Deployment Leadership, we are forwarding this update to you for further action.',
-    'If you require any additional information, please let us know.', 'Thank you.',
+    'If you require any additional information, please let us know.',
   ] };
   if (one.personStop || ['byHand', 'notHandled'].includes(one.decision.outcome) || !worked) return null;
-  if (one.record.notification.kind === 'leave') return { template: worked.auditAlready ? 'AALoaAlready' : 'AALoaAsk', attachReport: false,
-    paragraphs: ['Greetings!', worked.auditAlready ? AUDIT_LOA_ALREADY : AUDIT_LOA_ASK] };
+  if (one.record.notification.kind === 'leave') return { template: 'AALoaAsk', attachReport: false,
+    paragraphs: ['Greetings!', AUDIT_LOA_ASK] };
   const audit = one.decision.audit;
   if (!audit?.region) return null;
   const date = usDate(audit.from);
@@ -13125,10 +13125,11 @@ function auditMailText(one, mail, { dpName, signOff }) {
   const details = exit ? [`${name} – ${email}`, `Date of Resignation: ${date('resignation')}`, `Planned Last Working Day: ${date('lastWorkingDay')}`]
     : ['LOA Details:', `Professional Name: ${name}`, `Mail ID: ${email}`, `Leave Start Date: ${date('start')}`, `Leave End Date: ${date('end')}`];
   const nameOnly = signOff.trim().replace(/^(?:thank you!?|thanks & regards,?|regards,?)\s*\n/i, '').trim();
-  const body = missingDp ? ['Hi <PR>,', '', ...mail.paragraphs.flatMap((p, i) => i ? ['', p] : [p])].join('\n')
+  const body = missingDp ? ['Hi <POC Name>,', '', ...mail.paragraphs.flatMap((p, i) => [p, '',
+    ...(i === 1 ? [`Professional Name: ${name}`, `Mail ID: ${email}`, ''] : [])]), 'Regards,', nameOnly || '<Your Name>'].join('\n')
     : [`Hi ${greeting || '<Deployment Professional Name>'},`, '', ...mail.paragraphs.flatMap(p => [p, '']), ...details, '', exit ? 'Thanks & Regards,' : 'Thank You!', nameOnly || '<Your Name>'].join('\n');
   return { to: missingDp ? '' : greeting ? dpName : '', subject: subjectLine(record.number, name), body, copyBody: body,
-    missing: [missingDp && 'the mail recipient', !missingDp && !greeting && 'the Resource Manager', !missingDp && !nameOnly && 'your name for mail sign-off'].filter(Boolean) };
+    missing: [missingDp && 'the mail recipient', !missingDp && !greeting && 'the Resource Manager', !nameOnly && 'your name for mail sign-off'].filter(Boolean) };
 }
 const TAX_MAIL_WORDS = {
   pastEnd: 'The LOA on the schedule already runs beyond the end date in the notification below; as per the process it has been left as it is.',
@@ -14102,8 +14103,11 @@ function start(version) {
   const { work, body } = mountPanel(version);
   let loading = false;
   let tickets = null, data = null;
+  let reviewButton = null;
+  const refreshReview = () => { if (reviewButton) reviewButton.disabled = work.busy || !tickets || !loadedReports(data).length; };
+  work.listeners.add(refreshReview);
   const errorLine = message => { body.querySelector('.load-error')?.remove(); body.append(el('div', { class: 'load-error warn', role: 'status' }, `✗ ${message}`)); };
-  const rebuild = () => {
+  const rebuild = (review = false) => {
     work.saveMessage = ''; work.saved = false; work.batch = null; work.refreshClockControls = null; work.undoExpanded = false;
     const sorted = sortCases({ tickets }, todayOf());
     const cases = sorted.cases.filter(one => one.decision.outcome !== 'notHandled');
@@ -14115,15 +14119,18 @@ function start(version) {
     work.backToFiles = () => {
       if (work.busy || work.batch?.active) return;
       work.batch = null; work.refreshClockControls = null; work.setScreenTitle('');
-      files.hidden = false;
-      body.replaceChildren(files, el('div', { class: 'buttons' }, el('button', { class: 'blue', onclick: rebuild }, 'Review batch')));
+      rebuild();
     };
-    files.hidden = !!data;
+    files.hidden = review && !!data;
     body.replaceChildren(files);
-    if (data) {
+    if (review && data) {
       const excludedCases = sorted.cases.filter(one => one.decision.outcome === 'notHandled');
       const box = batchControls(cases, data, work, () => { files.hidden = true; }, { noAction: excludedCases.length, excludedCases });
       body.append(box);
+    } else {
+      const next = el('button', { class: 'blue', onclick: () => { if (!work.busy && tickets && data) rebuild(true); } }, 'Review batch');
+      reviewButton = next; refreshReview();
+      body.append(el('div', { class: 'buttons' }, next));
     }
   };
   const beginRead = () => {
