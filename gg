@@ -1,46 +1,18 @@
 (() => {
-  const iso = value => {
-    if (!value) return null;
-    if (typeof value.format === 'function') return value.format('YYYY-MM-DD');
-    if (value instanceof Date) return value.toISOString().slice(0, 10);
-    return /^\d{4}-\d{2}-\d{2}/.test(String(value)) ? String(value).slice(0, 10) : 'unreadable';
-  };
-  const kind = text => /leave of absence|\(loa\)/i.test(text) ? 'LOA' : /do not schedule|\(dns\)/i.test(text) ? 'DNS' : /holiday|\(hol\)/i.test(text) ? 'Holiday' : 'client/other';
   const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
-  const view = [...document.querySelectorAll('.fc-view')].find(v => shown(v) && v.querySelector('.fc-event'));
-  if (!view) { console.log('No shown calendar view with tiles.'); return; }
-  const columnOf = (td) => {
-    const table = td.closest('table'), rows = [...table.querySelectorAll(':scope > tbody > tr, :scope > tr')];
-    const taken = [];
-    for (let r = 0; r < rows.length; r++) {
-      let col = 0;
-      for (const cell of rows[r].children) {
-        while (taken[r]?.[col]) col++;
-        if (cell === td) return col;
-        const span = cell.colSpan || 1, down = cell.rowSpan || 1;
-        for (let dr = 0; dr < down; dr++) for (let dc = 0; dc < span; dc++) (taken[r + dr] ||= [])[col + dc] = true;
-        col += span;
-      }
-    }
-    return null;
-  };
-  const rows = [...view.querySelectorAll('.fc-row')];
-  const tiles = [...view.querySelectorAll('.fc-event')].map(tile => {
-    const row = tile.closest('.fc-row'), td = tile.closest('td');
-    const dates = row ? [...row.querySelectorAll('.fc-bg td[data-date]')].map(cell => cell.getAttribute('data-date')) : [];
-    const col = td ? columnOf(td) : null;
-    let seg = null, event = null, error = null;
-    try { const $ = window.jQuery; seg = $ ? $(tile).data('fcSeg') : null; event = $ ? $(tile).data('event') || seg?.event : null; } catch (e) { error = e.name; }
-    return {
-      kind: kind(tile.textContent || ''), row: rows.indexOf(row), gridColumn: col, gridDate: col === null ? null : dates[col] ?? 'no cell',
-      segColumns: seg ? [seg.leftCol ?? seg.firstCol ?? null, seg.rightCol ?? seg.lastCol ?? null] : null,
-      segDate: seg && Number.isInteger(seg.leftCol ?? seg.firstCol) ? dates[seg.leftCol ?? seg.firstCol] ?? 'no cell' : null,
-      eventStart: iso(event?.start), eventEnd: iso(event?.end), segStart: iso(seg?.start), segEnd: iso(seg?.end),
-      idParts: (tile.getAttribute('data-event-id') || '').split('|').map(part => /^\d{4}-?\d{2}-?\d{2}/.test(part) ? part.slice(0, 10) : `${part.length} chars`),
-      rowDates: dates.length ? [dates[0], dates.at(-1), dates.length] : [], error,
-    };
-  });
-  const text = JSON.stringify({ probe: 'tile-week 2026-10-30', rows: rows.length, tiles }, null, 1);
+  const words = node => (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+  const mask = value => String(value || '').replace(/\d{3,}/g, '#');
+  const buttons = [...document.querySelectorAll('.fc-toolbar button, .fc-header-toolbar button, .fc-right button, .fc-left button')].map(b => ({
+    classes: [...b.classList].map(mask).join(' '), words: words(b), title: b.title || b.getAttribute('aria-label') || '', shown: shown(b),
+    icon: [...b.querySelectorAll('i, span, svg')].map(i => [...(i.classList || [])].join(' ')).filter(Boolean).slice(0, 3),
+  }));
+  const settings = [...document.querySelectorAll('button.fc-settings-button')].map(b => ({ shown: shown(b), words: words(b) }));
+  const menus = [...document.querySelectorAll('.dropdown-menu, [role=menu], .context-menu-list, ul.dropdown, .popover')].filter(shown).map(menu => ({
+    classes: [...menu.classList].map(mask).join(' '),
+    items: [...menu.querySelectorAll('a, button, li, .dropdown-item')].filter(shown).map(item => `${item.tagName.toLowerCase()}.${[...item.classList].map(mask).join('.')} "${words(item)}"`).slice(0, 20),
+  }));
+  const dialogs = [...document.querySelectorAll('.modal, [role=dialog]')].filter(shown).map(d => ({ title: words(d.querySelector('.modal-title, h4, h5') || d), selects: d.querySelectorAll('select').length, inputs: d.querySelectorAll('input:not([type=hidden])').length }));
+  const text = JSON.stringify({ probe: 'tax-periods 2026-10-30', toolbarButtons: buttons, settingsButtons: settings, openMenus: menus, openWindows: dialogs }, null, 1);
   console.log(text);
   try { copy(text); console.log('Copied to the clipboard.'); } catch {   }
 })();
