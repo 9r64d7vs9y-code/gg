@@ -1,18 +1,30 @@
 (() => {
   const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
-  const words = node => (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
-  const mask = value => String(value || '').replace(/\d{3,}/g, '#');
-  const buttons = [...document.querySelectorAll('.fc-toolbar button, .fc-header-toolbar button, .fc-right button, .fc-left button')].map(b => ({
-    classes: [...b.classList].map(mask).join(' '), words: words(b), title: b.title || b.getAttribute('aria-label') || '', shown: shown(b),
-    icon: [...b.querySelectorAll('i, span, svg')].map(i => [...(i.classList || [])].join(' ')).filter(Boolean).slice(0, 3),
-  }));
-  const settings = [...document.querySelectorAll('button.fc-settings-button')].map(b => ({ shown: shown(b), words: words(b) }));
-  const menus = [...document.querySelectorAll('.dropdown-menu, [role=menu], .context-menu-list, ul.dropdown, .popover')].filter(shown).map(menu => ({
-    classes: [...menu.classList].map(mask).join(' '),
-    items: [...menu.querySelectorAll('a, button, li, .dropdown-item')].filter(shown).map(item => `${item.tagName.toLowerCase()}.${[...item.classList].map(mask).join('.')} "${words(item)}"`).slice(0, 20),
-  }));
-  const dialogs = [...document.querySelectorAll('.modal, [role=dialog]')].filter(shown).map(d => ({ title: words(d.querySelector('.modal-title, h4, h5') || d), selects: d.querySelectorAll('select').length, inputs: d.querySelectorAll('input:not([type=hidden])').length }));
-  const text = JSON.stringify({ probe: 'tax-periods 2026-10-30', toolbarButtons: buttons, settingsButtons: settings, openMenus: menus, openWindows: dialogs }, null, 1);
+  const words = node => (node?.textContent || '').replace(/\s+/g, ' ').trim();
+  const kind = value => /leave of absence|\(loa\)/i.test(value) ? 'LOA' : /do not schedule|\(dns\)/i.test(value) ? 'DNS' : /holiday/i.test(value) ? 'Holiday' : value ? 'client' : '';
+  const modal = [...document.querySelectorAll('#FindAssignmentsModal')].find(shown);
+  if (!modal) { console.log('No open Find Assignments window.'); return; }
+  const form = modal.querySelector('form') || modal;
+  const box = label => {
+    const found = [...form.querySelectorAll('label')].filter(node => words(node).replace(/[*?]/g, '').trim() === label);
+    if (found.length !== 1) return { label, found: found.length };
+    const target = found[0].htmlFor ? form.querySelector(`#${CSS.escape(found[0].htmlFor)}`) : found[0].parentElement?.querySelector('input, select');
+    if (!target) return { label, found: 1, field: 'none' };
+    const out = { label, tag: target.tagName.toLowerCase(), type: target.type || '', readOnly: !!target.readOnly, disabled: !!target.disabled, shown: shown(target),
+      classes: [...target.classList].join(' ') };
+    if (target.type === 'checkbox') out.checked = target.checked;
+    else if (target.tagName === 'SELECT') out.chosen = [...target.selectedOptions].filter(o => o.value).map(o => kind(words(o)));
+    else { out.value = target.value; out.min = target.min || target.getAttribute('data-date-start-date') || ''; out.max = target.max || target.getAttribute('data-date-end-date') || ''; }
+    return out;
+  };
+  const labels = ['Start Date', 'End Date', 'Start Week', 'End Week', 'Include All Future Assignments', 'Include All Clients', 'Clients', 'Client', 'Pricing ID'];
+  const result = {
+    probe: 'find-form 2026-10-30', formId: form.id || '', title: words(modal.querySelector('.modal-title, h4')),
+    fields: labels.map(box).filter(field => field.found !== 0),
+    openPickers: [...document.querySelectorAll('.datepicker, .daterangepicker, .ui-datepicker')].filter(shown).length,
+    messages: [...modal.querySelectorAll('.error, .field-validation-error, .text-danger, .alert, .help-block')].filter(shown).map(words).filter(Boolean).slice(0, 5),
+  };
+  const text = JSON.stringify(result, null, 1);
   console.log(text);
   try { copy(text); console.log('Copied to the clipboard.'); } catch {   }
 })();
