@@ -4133,8 +4133,10 @@ async function setupView() {
     }, 'the Custom view and its dated range to settle', WAIT.window);
     await pageReady('after the Custom view change');
   }
-  if (!configuredPeriods.has(document)) await setPeriods();
-  await pageReady('after the view change');
+  if (!configuredPeriods.has(document)) {
+    await setPeriods();
+    await pageReady('after the view change');
+  }
   configuredPeriods.add(document);
 }
 async function openPeriods() {
@@ -4838,95 +4840,13 @@ __exports.readScheduleTile = readScheduleTile;
 },
 "mysource/editability.js": function (__require, __exports, document, window) {
 'use strict';
-const { addDays, compareDays, readIsoDay, todayOf, usDate, weekday } = __require("../rules/dates.js");
-const { PageError } = __require("./dom.js");
-const { canAddAssignment, emptySpots, personIdentity, waitForPersonIdentity: requirePersonIdentity } = __require("./schedule.js");
-const { showDate, calendarHolds } = __require("./calendar.js");
-function createEditability({ today = todayOf(), term = null, identity = personIdentity(), move = showDate } = {}) {
-  let reading = null;
-  const cells = async () => {
-    await requirePersonIdentity(identity);
-    const spots = emptySpots();
-    const mapped = spots.map(({ cell }) => ({ cell, day: readIsoDay(cell.getAttribute('data-date')) }));
-    if (mapped.some(row => !row.day)) throw new PageError('The calendar has an unreadable date cell. Nothing was changed; By hand.');
-    return [...new Map(mapped.map(row => [usDate(row.day), row])).values()].sort((a, b) => compareDays(a.day, b.day));
-  };
-  const holds = (rows, day, weekly) => rows.length && compareDays(day, rows[0].day) >= 0
-    && compareDays(day, addDays(rows.at(-1).day, weekly ? 6 : 0)) <= 0;
-  async function view(day) {
-    let rows = await cells();
-    let weekly = rows.length > 1 && rows.every(row => weekday(row.day) === 1);
-    if (!holds(rows, day, weekly)) {
-      await move(day);
-      rows = await cells();
-      weekly = rows.length > 1 && rows.every(row => weekday(row.day) === 1);
-      if (!holds(rows, day, weekly)) throw new PageError('The calendar did not show the requested permission date. Nothing was changed; By hand.');
-    }
-    const sameView = reading && reading.sourceRows.length === rows.length && reading.sourceRows.every((row, i) => row.cell === rows[i].cell);
-    if (sameView) return reading;
-    const sourceRows = rows;
-    rows = rows.filter(row => compareDays(addDays(row.day, weekly ? 6 : 0), today) >= 0);
-    if (!rows.length) throw new PageError('No current or future calendar cells to check. Nothing was changed; By hand.');
-    const inspected = new Map();
-    const inspect = async index => {
-      await requirePersonIdentity(identity);
-      if (!inspected.has(index)) inspected.set(index, await canAddAssignment(rows[index].day, { exact: true }));
-      await requirePersonIdentity(identity);
-      return inspected.get(index);
-    };
-    let enabledThrough = rows.length - 1;
-    if (!(await inspect(enabledThrough))) {
-      let locked = enabledThrough, enabled = -1;
-      for (let at = Math.max(0, locked - 5); ; at = Math.max(0, at - 5)) {
-        if (await inspect(at)) { enabled = at; break; }
-        locked = at;
-        if (!at) break;
-      }
-      if (enabled >= 0) {
-        while (enabled + 2 < locked) {
-          if (await inspect(enabled + 2)) enabled += 2;
-          else { locked = enabled + 2; break; }
-        }
-        if (enabled + 1 < locked && await inspect(enabled + 1)) enabled++;
-      }
-      enabledThrough = enabled;
-    }
-    reading = { sourceRows, rows, weekly, enabledThrough };
-    return reading;
-  }
-  return {
-    async through(end, start = today) {
-      await requirePersonIdentity(identity);
-      const limit = term && compareDays(term, end) < 0 ? term : end;
-      if (compareDays(limit, today) < 0 || compareDays(limit, start) < 0) return null;
-      let info = await view(start);
-      let provedThrough = null;
-      for (;;) {
-        if (info.enabledThrough < 0) return provedThrough;
-        const last = addDays(info.rows[info.enabledThrough].day, info.weekly ? 6 : 0);
-        if (compareDays(last, start) < 0) return null;
-        if (compareDays(last, limit) >= 0) return limit;
-        if (info.enabledThrough < info.rows.length - 1) return last;
-        provedThrough = last;
-        info = await view(addDays(last, 1));
-      }
-    },
-    async enabled(day, { probeAfterTerm = false } = {}) {
-      await requirePersonIdentity(identity);
-      if (compareDays(day, today) < 0) return false;
-      if (term && compareDays(day, term) > 0) {
-        if (!probeAfterTerm) return false;
-        if (!calendarHolds(day)) await move(day);
-        const enabled = await canAddAssignment(day, { dayOnly: true });
-        await requirePersonIdentity(identity);
-        return enabled;
-      }
-      const info = await view(day);
-      return info.enabledThrough >= 0 && compareDays(day, addDays(info.rows[info.enabledThrough].day, info.weekly ? 6 : 0)) <= 0;
-    },
-  };
+const { compareDays } = __require("../rules/dates.js");
+const NO_TERM = { y: 9999, m: 12, d: 31 };
+function isEditableDay(day, today, term = null) {
+  if (compareDays(day, today) < 0) return false;
+  return !term || compareDays(term, NO_TERM) === 0 || compareDays(day, term) < 0;
 }
-__exports.createEditability = createEditability;
+__exports.isEditableDay = isEditableDay;
 },
 "mysource/pageinfo.js": function (__require, __exports, document, window) {
 'use strict';
@@ -5507,15 +5427,19 @@ function splitDeleteWeeks(query) {
 async function deleteRange(query, before, { edit = null, read, onWrite = () => {}, validate = async () => {}, protectedRows = [] } = {}) {
   const inside = (day, range) => day && compareDays(day, range.start) >= 0 && (!range.end || compareDays(day, range.end) <= 0);
   const clientMatches = row => !query.clients || query.clients.some(client => valueKey(client) === valueKey(row.client));
-  const original = edit || await findAssignments(query);
-  const range = findAssignmentsRange(original);
+  const parts = splitDeleteWeeks(query);
+  const original = edit || (parts.length === 1 ? await findAssignments(query) : null);
+  const range = original ? findAssignmentsRange(original) : true;
   try {
     if (isTaxPage() || query.future || !query.end || !range || !read) throw new PageError('The week delete scope could not be proved. Nothing was deleted.');
-  } catch (error) { await cleanupAfter(error, () => closeEdit(original)); throw error; }
-  const parts = splitDeleteWeeks(query);
-  if (parts.length !== 1) await closeEdit(original);
+  } catch (error) { if (original) await cleanupAfter(error, () => closeEdit(original)); throw error; }
+  if (parts.length !== 1 && original) await closeEdit(original);
   let current = before;
   for (const [index, part] of parts.entries()) {
+    const knownNow = knownAssignmentRows(current);
+    if (parts.length > 1 && knownNow.range && compareDays(part.start, knownNow.range.start) >= 0
+      && (!knownNow.range.end || compareDays(part.end, knownNow.range.end) <= 0)
+      && !knownNow.rows.some(row => inside(row.day, part) && clientMatches(row))) continue;
     const partQuery = { ...query, start: part.start, end: part.end };
     const findQuery = { ...partQuery, weekEndFriday: true };
     let table = parts.length === 1 && index === 0 ? original : await findAssignments(findQuery);
@@ -6151,7 +6075,7 @@ const { addDays, compareDays, sameDay, todayOf, usDate } = __require("../rules/d
 const { termDayOf } = __require("../rules/shared.js");
 const { compareByDay, RESTORE_FIELDS, pastReportWarning } = __require("../run/backup.js");
 const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity, scheduleFacts, pageReady } = __require("./schedule.js");
-const { createEditability } = __require("./editability.js");
+const { isEditableDay } = __require("./editability.js");
 const { deleteAll, deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
 const { copyWindow, coverAssignmentRange, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows } = __require("./copy.js");
 const { sameAssignmentRows } = __require("./note-stage.js");
@@ -6221,7 +6145,7 @@ const sameRetained = (a, b) => {
     && a.days.every(old => old.id && byId.has(old.id)
       && sameLive({ days: [old] }, { days: [byId.get(old.id)] }));
 };
-async function restorePlanRecorded(backup, { after = null, today = todayOf(), fullReport = false, automaticRecovery = false, move, verifyBefore = null } = {}) {
+async function restorePlanRecorded(backup, { after = null, today = todayOf(), fullReport = false, automaticRecovery = false, verifyBefore = null } = {}) {
   const skippedPast = new Set(backup.days.filter(row => within(row.day, backup.window)
     && compareDays(row.day, today) < 0).map(row => usDate(row.day))).size;
   if (compareDays(backup.window.end, today) < 0) {
@@ -6261,10 +6185,8 @@ async function restorePlanRecorded(backup, { after = null, today = todayOf(), fu
     const termText = String(scheduleFacts().termDate ?? backup.termDate ?? '').trim();
     const term = termText ? termDayOf(termText) : null;
     if (termText && !term) throw new PageError('The Term Date cannot be read. Nothing was restored; By hand.');
-    const permissions = createEditability({ today, term, move });
     for (const day of candidates) {
-      const enabled = await permissions.enabled(day, { probeAfterTerm: automaticRecovery });
-      if (!enabled) {
+      if (!isEditableDay(day, today, term)) {
         skippedLocked.push(day); protectedDays.add(usDate(day));
       }
     }
@@ -6281,7 +6203,7 @@ async function restorePlanRecorded(backup, { after = null, today = todayOf(), fu
     nothing: changedDays.length ? '' : 'Nothing left to undo.' };
 }
 async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () => {}, today = todayOf(), after: provedAfter = null, previewBefore = null, fullReport = false, automaticRecovery = false, previewDays = null, move, verifyBefore = null } = {}) {
-  const plan = await restorePlanRecorded(backup, { after: provedAfter, today, fullReport, automaticRecovery, move, verifyBefore });
+  const plan = await restorePlanRecorded(backup, { after: provedAfter, today, fullReport, automaticRecovery, verifyBefore });
   const { window, scoped, before, skippedPast, skippedLater, skippedLocked = [], changedDays, protectedDays } = plan;
   if (previewDays && changedDays.some(day => !previewDays.some(allowed => compareDays(day, allowed) === 0))) throw new PageError('The restore dates changed since the preview. Nothing was changed; preview again.');
   if (previewBefore && before && !sameLive(previewBefore, before)) throw new PageError('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
@@ -7308,11 +7230,40 @@ function rowMailText(row, signOff) {
   })) };
   return mail ? mailText({ ...one, record: { ...one.record, notification } }, mail, { dpName, dpEmail, signOff }) : null;
 }
-function mailsTable(rows, signOff = '') {
-  return [['Ticket', 'To', 'Subject', 'Mail'], ...excelRows(rows).flatMap(row => {
-    const text = rowMailText(row, signOff);
-    return text ? [[row.one.record.number, text.to, text.subject, text.body.trim()]] : [];
-  })];
+const MAIL_GROUPS = ['LOA', 'LOA started in the past', 'LOA with only an end date', 'LOA with a past end date',
+  'Exit: DNS added', 'Exit: schedule greyed out', 'Exit: no last working day',
+  'A&A LOA', 'A&A Exit: asking permission', 'A&A Exit: DNS', 'A&A: no Deployment Professional', 'Tax LOA', 'Other'];
+function mailGroup(row) {
+  const one = row.one, mail = rowMail(row), template = mail?.template;
+  if (one.record.subcategory?.site === 'tax' || one.slice?.site === 'tax') return 'Tax LOA';
+  if (template === 'AAMissingDp') return 'A&A: no Deployment Professional';
+  if (template === 'AALoaAsk') return 'A&A LOA';
+  if (/^AA[123]$/.test(template)) return 'A&A Exit: asking permission';
+  if (template === 'AA4') return 'A&A Exit: DNS';
+  if (template === 'F') return 'Exit: no last working day';
+  if (['B', 'C'].includes(template)) return 'Exit: schedule greyed out';
+  if (['A', 'D'].includes(template)) return 'Exit: DNS added';
+  if (template === 5) return 'LOA with a past end date';
+  if (template === 3) return 'LOA started in the past';
+  if (one.decision.plan?.notificationType === 'endOnly') return 'LOA with only an end date';
+  return template === 2 ? 'LOA' : 'Other';
+}
+const attachWords = item => !item ? 'Nothing to attach'
+  : item.missing.length ? `${item.missing.join(' and ')} missing: take it by hand${item.folder ? `; attach the rest from folder ${item.folder}` : ''}`
+  : `Attach from folder ${item.folder}`;
+function mailsTable(rows, signOff = '', attachments = null, { headings = false } = {}) {
+  const mails = excelRows(rows).map(row => ({ row, text: rowMailText(row, signOff) })).filter(item => item.text)
+    .map(item => ({ ...item, group: mailGroup(item.row) }))
+    .sort((a, b) => MAIL_GROUPS.indexOf(a.group) - MAIL_GROUPS.indexOf(b.group));
+  const table = [['Ticket', 'To', 'Subject', 'Mail', ...(attachments ? ['Attach'] : [])]];
+  let last = null;
+  for (const { row, text, group } of mails) {
+    if (headings && group !== last) table.push([`${group} (${mails.filter(item => item.group === group).length})`]);
+    last = group;
+    table.push([row.one.record.number, text.to, text.subject, text.body.trim(),
+      ...(attachments ? [attachWords(attachments.get(personTicketKey(row.one.record)))] : [])]);
+  }
+  return table;
 }
 function batchTable(rows, signOff = '') {
   return [BATCH_COLUMNS, ...excelRows(rows).flatMap(row => {
@@ -7390,7 +7341,7 @@ function packageCheck(rows, files) {
       report: item(expectsReport(row), report, 'report'), picture: item(needsPersonPicture(row), picture, 'picture') };
   });
 }
-function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupReport = null, runReport = '', batchLabel = excelName.replace(/\.xlsx$/, ''), packVersion = 1 } = {}) {
+function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupReport = null, runReport = '' } = {}) {
   const attachments = new Map();
   const files = [];
   const folders = personFolders(rows);
@@ -7409,35 +7360,37 @@ function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupRe
       added.push({ ...report, name: `${folder}/${report.name}` });
     }
     if (pictured) (one.outputs?.screenshots || []).forEach((blob, i) => added.push({ name: `${folder}/${ticket} - Screenshot${i ? ` ${i + 1}` : ''}.png`, blob }));
-    attachments.set(key, added.map(file => file.name).join('\n'));
+    const missing = [
+      ...(expectsReport(row) && !added.some(file => file.name.endsWith('Staff Schedule Hours Report.xlsx')) ? ['Report'] : []),
+      ...(pictured && !one.outputs?.screenshots?.length ? ['Screenshot'] : [])];
+    if (added.length || missing.length) attachments.set(key, { folder: added.length ? folder : null, missing });
     files.push(...added);
   }
   const tableRows = excelRows(rows).flatMap(owner => batchTable([owner], signOff).slice(1).map((cells, index) => ({
     cells, owner, record: index ? owner.one.record.duplicates[index - 1] : owner.one.record,
   })));
   const table = [BATCH_COLUMNS, ...tableRows.map(item => item.cells)];
-  const mails = mailsTable(rows, signOff);
+  const mails = mailsTable(rows, signOff, attachments, { headings: true });
   const outgoing = new Map(rows.map(row => [personTicketKey(row.one.record), rowMailText(row, signOff)]));
   const checked = packageCheck(rows, files);
   const checks = new Map(rows.map((row, index) => [personTicketKey(row.one.record), checked[index]]));
-  const summary = [['Ticket', 'Person', 'Result', 'Attachments', 'Mail recipient', 'Mail details', 'Expected report', 'Report check', 'Expected picture', 'Picture check', 'Missing reason'], ...tableRows.map(({ cells: row, owner, record }) => {
-    const key = personTicketKey(record), check = checks.get(key), mail = outgoing.get(key);
-    return [row[0], row[1],
-      ['restoreFailed', 'undoFailed'].includes(owner.state) ? 'Restore unconfirmed' : ['restored', 'failed'].includes(owner.state) ? 'By hand' : row[6], attachments.get(key) || '', mail?.to || '', mail ? 'See Mails sheet' : '',
-      check ? check.report.expected ? 'Report' : 'None required' : '', check?.report.status || '',
-      check ? check.picture.expected ? 'Picture' : 'None required' : '', check?.picture.status || '',
-      [check?.report.reason, check?.picture.reason].filter(Boolean).join('; ')];
-  }), ['Batch label', batchLabel, 'Pack version', String(packVersion)]];
+  const missingFiles = row => {
+    const check = checks.get(personTicketKey(row.one.record));
+    return ['done', 'nothing'].includes(row.state) && check ? [['Report', check.report], ['Screenshot', check.picture]]
+      .filter(([, item]) => item.expected && item.status !== 'included').map(([kind, item]) => ({ kind, reason: item.reason || item.status })) : [];
+  };
+  const reasonWithMissing = (reason, missing) => [reason, ...missing.map(item => `${item.kind} missing: take it by hand${reason?.includes(item.reason) ? '' : ` (${item.reason})`}`)].filter(Boolean).join('; ');
   const mailRows = new Map(tableRows.map(({ cells, record }) => [personTicketKey(record), cells]));
-  const attention = excelRows(rows).filter(row => (['done','nothing'].includes(row.state) && row.one.outputs?.warnings) || outgoing.get(personTicketKey(row.one.record))?.missing.length || row.state === 'skipped' || failedRow(row) || ['ready', 'pending', 'timeLimit'].includes(row.state))
+  const attention = excelRows(rows).filter(row => (['done','nothing'].includes(row.state) && row.one.outputs?.warnings) || missingFiles(row).length || outgoing.get(personTicketKey(row.one.record))?.missing.length || row.state === 'skipped' || failedRow(row) || ['ready', 'pending', 'timeLimit'].includes(row.state))
     .sort((a, b) => Number(['restoreFailed', 'undoFailed'].includes(b.state)) - Number(['restoreFailed', 'undoFailed'].includes(a.state)));
   const needsAttention = [['Ticket', 'Person', 'Result', 'Reason'], ...attention.map(row => [row.one.record.number, professionalName(row.one.record),
-    ['restoreFailed', 'undoFailed'].includes(row.state) ? 'Restore unconfirmed' : row.state === 'timeLimit' ? row.message : row.state === 'skipped' || failedRow(row) ? 'By hand' : ['done','nothing'].includes(row.state) ? mailRows.get(personTicketKey(row.one.record))?.[6] || 'No schedule change' : 'Not run', mailRows.get(personTicketKey(row.one.record))?.[7] || rowWarnings(row)])];
+    ['restoreFailed', 'undoFailed'].includes(row.state) ? 'Restore unconfirmed' : row.state === 'timeLimit' ? row.message : row.state === 'skipped' || failedRow(row) ? 'By hand' : ['done','nothing'].includes(row.state) ? mailRows.get(personTicketKey(row.one.record))?.[6] || 'No schedule change' : 'Not run',
+    reasonWithMissing(mailRows.get(personTicketKey(row.one.record))?.[7] || rowWarnings(row), missingFiles(row))])];
   files.unshift({ name: excelName, blob: new Blob([xlsxBytes([
-    { name: 'Summary', rows: summary, widths: [20, 26, 52, 58, 36, 22, 20, 24, 20, 24, 64], rowHeight: 100 },
-    { name: 'Mails', rows: mails, widths: [20, 38, 80, 110], rowHeight: 409 },
-    { name: 'Batch', rows: table, widths: [20, 26, 36, 26, 36, 12, 52, 64, 48], rowHeight: 300 },
+    { name: 'Mails', rows: mails, widths: [20, 38, 80, 110, 30], rowHeight: 409, heading: cells => cells.length === 1,
+      highlight: (cells, index) => index === 4 && /^Attach from|missing/.test(String(cells[4])) },
     { name: 'Needs attention', rows: needsAttention, widths: [20, 26, 24, 100], rowHeight: 100 },
+    { name: 'Batch', rows: table, widths: [20, 26, 36, 26, 36, 12, 52, 64, 48], rowHeight: 300 },
   ])], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) });
   for (const report of loadedReports(backupReport).filter(report => report.sourceFile)) {
     const original = report.fileName || report.sourceFile.name || 'Staff Schedule Hours Report.xlsx';
@@ -7451,14 +7404,14 @@ function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupRe
 }
 function auditRequestBytes(clients) {
   const fields = ['Requestor Name *', 'Client *', 'WBS', 'Project Status *', 'Role Title*', 'Role Description*', 'Business Area*', 'Business Line*', 'Market Offering *', 'Practice*', 'Industry*', 'Industry Sector*', 'Accept Travelers *'];
-  const styles = '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="2" borderId="0" xfId="0" applyFill="1"/></cellXfs>';
-  const cell = (ref, value, style = 0) => `<c r="${ref}" s="${style}" t="inlineStr"><is><t xml:space="preserve">${xml(value)}</t></is></c>`;
+  const styles = '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="2"><border/><border><left style="thin"><color auto="1"/></left><right style="thin"><color auto="1"/></right><top style="thin"><color auto="1"/></top><bottom style="thin"><color auto="1"/></bottom><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/><xf numFmtId="0" fontId="0" fillId="2" borderId="1" xfId="0" applyFill="1" applyBorder="1"/></cellXfs>';
+  const cell = (ref, value, style = 0) => value ? `<c r="${ref}" s="${style}" t="inlineStr"><is><t xml:space="preserve">${xml(value)}</t></is></c>` : `<c r="${ref}" s="${style}"/>`;
   const widths = [26, 42, 24, 24, 26, 60, 26, 26, 26, 26, 26, 26, 24];
-  const sheetXml = () => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>${widths.map((width, i) => `<col min="${i + 1}" max="${i + 1}" width="${width}" customWidth="1"/>`).join('')}</cols><sheetData><row r="1">${fields.map((field, i) => cell(`${column(i)}1`, field, i === 1 || i === 2 ? 0 : 1)).join('')}</row>${clients.map((client, i) => `<row r="${i + 2}">${cell(`B${i + 2}`, client.client)}${cell(`C${i + 2}`, client.wbs)}</row>`).join('')}</sheetData></worksheet>`;
+  const sheetXml = () => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>${widths.map((width, i) => `<col min="${i + 1}" max="${i + 1}" width="${width}" customWidth="1"/>`).join('')}</cols><sheetData><row r="1">${fields.map((field, i) => cell(`${column(i)}1`, field, i === 1 || i === 2 ? 0 : 1)).join('')}</row>${clients.map((client, i) => `<row r="${i + 2}">${fields.map((_, c) => cell(`${column(c)}${i + 2}`, c === 1 ? client.client : c === 2 ? client.wbs : '')).join('')}</row>`).join('')}</sheetData></worksheet>`;
   return workbookBytes([{ name: 'Audit Request Template' }], { xml, sheetXml, styles });
 }
 async function saveBatch(rows, signOff, { excelName = batchExcelName(), backupReport = null, runReport = '', batchLabel = excelName.replace(/\.xlsx$/, ''), packVersion = 1 } = {}) {
-  const files = batchFiles(rows, signOff, { excelName, backupReport, runReport, batchLabel, packVersion });
+  const files = batchFiles(rows, signOff, { excelName, backupReport, runReport });
   const parts = await Promise.all(files.map(async file => [file.name, new Uint8Array(await file.blob.arrayBuffer())]));
   const name = `${batchLabel} v${packVersion}.zip`;
   saveFile(name, new Blob([zip(parts)], { type: 'application/zip' }));
@@ -7555,15 +7508,15 @@ function workbookBytes(sheets, { xml, sheetXml, styles }) {
   ];
   return zip(files);
 }
-function sheetXml({ rows, widths = [], rowHeight = 60 }) {
+function sheetXml({ rows, widths = [], rowHeight = 60, highlight = () => false, heading = () => false }) {
   const count = rows.reduce((count, row) => Math.max(count, row.length), 1);
   const cols = Array.from({ length: count }, (_, index) => `<col min="${index + 1}" max="${index + 1}" width="${widths[index] || Math.min(60, Math.max(16, String(rows[0]?.[index] || '').length + 3))}" customWidth="1"/>`).join('');
   const height = cells => Math.min(rowHeight, Math.max(26, 8 + 14 * Math.max(1, ...cells.map((cell, index) => String(cell ?? '').split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / (widths[index] || 24))), 0)))));
   const body = rows.map((cells, row) => `<row r="${row + 1}" ht="${row === 0 ? 32 : height(cells)}" customHeight="1">${cells.map((cell, index) => (String(cell ?? '') === '' ? ''
-    : `<c r="${column(index)}${row + 1}" s="${row === 0 ? 1 : 2}" t="inlineStr"><is><t xml:space="preserve">${xml(cell)}</t></is></c>`)).join('')}</row>`).join('');
+    : `<c r="${column(index)}${row + 1}" s="${row === 0 || heading(cells) ? 1 : highlight(cells, index) ? 3 : 2}" t="inlineStr"><is><t xml:space="preserve">${xml(cell)}</t></is></c>`)).join('')}</row>`).join('');
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${cols}</cols><sheetData>${body}</sheetData><autoFilter ref="A1:${column(count - 1)}${Math.max(1, rows.length)}"/></worksheet>`;
 }
-const STYLES = '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF000000"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf></cellXfs>';
+const STYLES = '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="4"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF000000"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFC9AA68"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf><xf numFmtId="0" fontId="0" fillId="3" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf></cellXfs>';
 function xlsxBytes(sheets) {
   return workbookBytes(sheets, { xml, sheetXml, styles: STYLES });
 }
@@ -8871,8 +8824,7 @@ const { addDays, compareDays, mondayOf, reportWindow, todayOf, usDate, workingDa
 const { entryKind } = __require("../rules/entries.js");
 const { emailKey, valueKey, rememberPageName, professionalName } = __require("../rules/prepare.js");
 const { PageError, withPersonGuard, stopFlagged, cleanupAfter } = __require("../mysource/dom.js");
-const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, canAddAssignment, beginScheduleTurn, exitCalendarSnapshot, proveExitCalendar } = __require("../mysource/schedule.js");
-const { calendarHolds, showDate } = __require("../mysource/calendar.js");
+const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, beginScheduleTurn, exitCalendarSnapshot, proveExitCalendar } = __require("../mysource/schedule.js");
 const { leaveRuns, leavePeriod, loaBlocks, dayRanges, inRange } = __require("../rules/leaves.js");
 const { deleteAll, deleteRange, addAssignment, preflightDates, refreshNotes, setAssignmentHours } = __require("../mysource/write.js");
 const { compareCopies, copyWindow, entriesToAdd, dayOf, ENTRY_FIELDS, knownAssignmentRows } = __require("../mysource/copy.js");
@@ -8884,7 +8836,7 @@ const { checkPerson, termDayOf } = __require("../rules/shared.js");
 const { exitMailChoice, decideExit } = __require("../rules/exit.js");
 const { reasonLine, notOnReportReason } = __require("../screen/wording.js");
 const { batchCover, closeSkippedPerson, sessionExpired, cancelBatchWindows } = __require("../mysource/batch.js");
-const { createEditability } = __require("../mysource/editability.js");
+const { isEditableDay } = __require("../mysource/editability.js");
 const BACKUP_KIND = 'Snooze backup 1';
 const HOURS_PER_DAY = 8;
 const TERM_DATE_UNDO = 'Cannot undo: MySource refuses entries after the Term Date';
@@ -8978,11 +8930,9 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
   if (reportTerm !== undefined && termText !== String(reportTerm ?? '').trim() && term && compareDays(term, plan.loaEnd) < 0) return {
     stop: reasonLine({ code: 'termBeforeEnd', termDate: term, loaEnd: plan.loaEnd }), reasonCode: 'termBeforeEnd',
   };
-  const permissions = createEditability({ today, term, identity });
   const firstEditable = compareDays(window.start, today) < 0 ? today : window.start;
-  const boundaries = [...new Map([window.end, firstEditable].map(day => [usDate(day), day])).values()];
-  for (const day of boundaries) {
-    if (!(await step(() => permissions.enabled(day)))) return { stop: 'Future leave dates are greyed out. Nothing was changed; By hand.', reasonCode: 'futureScheduleGreyed' };
+  for (const day of [window.end, firstEditable]) {
+    if (!isEditableDay(day, today, term)) return { stop: 'Future leave dates are greyed out. Nothing was changed; By hand.', reasonCode: 'futureScheduleGreyed' };
   }
   const { problems } = entriesToAdd({ window: watchedWindow, days });
   if (problems.length) return { stop: `Snooze could not put these days back if needed: ${problems.join('; ')}.` };
@@ -9111,22 +9061,7 @@ async function applyRecorded(one, prepared, { step = fn => fn(), onWrite: writeN
     const targets = prepared.exitRuns.flatMap(run => run.rows);
     if (prepared.termDay && targets.some(row => compareDays(row.day, prepared.termDay) > 0)) prepared.backup.undoBlocked = TERM_DATE_UNDO;
     const target = row => targets.some(old => compareDays(old.day, row.day) === 0 && valueKey(old.client) === valueKey(row.client));
-    const later = prepared.copy.days.filter(row=>compareDays(row.day,plan.dnsStart)>=0);
     const replace = exitReplaceEligible(plan, prepared);
-    if (replace) await step(async () => {
-      const edit = await findAssignments({ start: plan.dnsStart, future: true });
-      try {
-        const rows = await readEditTable(edit);
-        const actual = { days: rows.map(row => ({ ...row, day: dayOf(row.date) })) };
-        if (rows.length !== later.length || actual.days.some(row => !row.day) || !compareCopies({ days: later }, actual).same
-          || new Set(rows.map(row => row.id)).size !== rows.length
-          || actual.days.some(row => {
-            const old = later.find(old => old.id === row.id);
-            return !old || !compareCopies({ days: [old] }, { days: [row] }).same || (old.notes > 0) !== (row.notes > 0);
-          })) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.');
-      } catch (error) { await cleanupAfter(error, () => closeEdit(edit)); throw error; }
-      await closeEdit(edit);
-    });
     let dateForm = null;
     if (prepared.exitDatePreflight) {
       const dateCheck = await caseDates(prepared.exitDatePreflight.dates, prepared.identity, step,
@@ -9290,14 +9225,14 @@ async function prepareExit(one, version, today, { step }) {
   const termDay = termText ? termDayOf(termText) : null;
   if (termText && !termDay) return { stop: 'The Term Date shown beside the schedule cannot be read. Nothing was changed; By hand.', reasonCode: 'termDateUnreadable' };
   const termGreyed = !!termDay && compareDays(termDay, { y: 9999, m: 12, d: 31 }) !== 0 && compareDays(termDay, plan.dnsStart) < 0;
-  const permissions = createEditability({ today, term: termDay, identity });
+  const editable = day => isEditableDay(day, today, termDay);
   const greyedExit = !!termDay && compareDays(termDay, { y: 9999, m: 12, d: 31 }) !== 0 && compareDays(today, termDay) >= 0;
-  const startGreyed = greyedExit || termGreyed || !(await step(() => permissions.enabled(plan.dnsStart)));
-  const termLimitsDns = termDay && compareDays(termDay, plan.dnsEnd) < 0;
-  const permittedEnd = startGreyed ? null : await step(() => permissions.through(plan.dnsEnd, plan.dnsStart));
-  let greyed = startGreyed || !!termLimitsDns || !permittedEnd || compareDays(permittedEnd, plan.dnsEnd) < 0;
-  const editableDnsEnd = permittedEnd || (termLimitsDns ? termDay : plan.dnsEnd);
-  let addDns = !startGreyed && !!permittedEnd && workingDays(plan.dnsStart, editableDnsEnd).length > 0;
+  const startGreyed = greyedExit || termGreyed || !editable(plan.dnsStart);
+  const termLimitsDns = !!termDay && compareDays(termDay, { y: 9999, m: 12, d: 31 }) !== 0 && compareDays(termDay, plan.dnsEnd) <= 0;
+  const permittedEnd = startGreyed ? null : termLimitsDns ? addDays(termDay, -1) : plan.dnsEnd;
+  let greyed = startGreyed || termLimitsDns;
+  const editableDnsEnd = permittedEnd || (termLimitsDns ? addDays(termDay, -1) : plan.dnsEnd);
+  let addDns = !startGreyed && workingDays(plan.dnsStart, editableDnsEnd).length > 0;
   const copy = await step(() => copyWindow({ start: today, end: addDays(plan.dnsEnd, 56) }, { future: true, keepOpen: greyedExit }));
   const initialEdit = knownAssignmentRows(copy).edit;
   let keepEdit = false;
@@ -9312,7 +9247,10 @@ async function prepareExit(one, version, today, { step }) {
     if (keepTail) addDns = false;
     const properDns = row => valueKey(row.client) === valueKey(DNS_CLIENT) && workingDays(row.day, row.day).length
       && row.hours === HOURS_PER_DAY && valueKey(row.billable) === 'non billable' && valueKey(row.utilization) === 'no';
-    const dnsKept = keepTail ? copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, plan.dnsStart) >= 0) : withoutNotes ? copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && inRange(row.day, plan.dnsStart, editableDnsEnd)
+    const oneDnsOnDay = row => copy.days.filter(other => compareDays(other.day, row.day) === 0 && valueKey(other.client) === valueKey(DNS_CLIENT)).length === 1;
+    const replaceAllDns = withoutNotes && copy.days.some(row => valueKey(row.client) === valueKey(DNS_CLIENT) && inRange(row.day, plan.dnsStart, editableDnsEnd)
+      && (!properDns(row) || !oneDnsOnDay(row)));
+    const dnsKept = keepTail ? copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, plan.dnsStart) >= 0) : replaceAllDns ? [] : withoutNotes ? copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && inRange(row.day, plan.dnsStart, editableDnsEnd)
       && workingDays(row.day, row.day).length && row.hours === HOURS_PER_DAY && valueKey(row.billable) === 'non billable' && valueKey(row.utilization) === 'no'
       && copy.days.filter(other => compareDays(other.day, row.day) === 0 && valueKey(other.client) === valueKey(DNS_CLIENT)).length === 1) : [];
     const dnsAddRuns = withoutNotes && addDns ? [] : null;
@@ -9329,15 +9267,7 @@ async function prepareExit(one, version, today, { step }) {
       (!properDns(row) || copy.days.filter(other => valueKey(other.client) === valueKey(DNS_CLIENT) && compareDays(other.day, row.day) === 0).length !== 1));
     const dnsCandidates = copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, today) >= 0
       && (!termGreyed || compareDays(row.day, termDay) <= 0 || improper.includes(row)));
-    for (const day of [...new Map(dnsCandidates.map(row => [usDate(row.day), row.day])).values()]) {
-      const repair = improper.some(row => compareDays(row.day, day) === 0);
-      const enabled = await step(() => termGreyed || repair
-        ? withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), async () => {
-          if (!calendarHolds(day)) await showDate(day);
-          return canAddAssignment(day, { dayOnly: true });
-        }) : permissions.enabled(day));
-      if (enabled) dnsEditableDates.add(usDate(day));
-    }
+    for (const row of dnsCandidates) if (editable(row.day)) dnsEditableDates.add(usDate(row.day));
     const dnsEditable = row => (!startGreyed || improper.some(old => compareDays(old.day, row.day) === 0)) && dnsEditableDates.has(usDate(row.day));
     if (improper.some(row => inRange(row.day, plan.dnsStart, editableDnsEnd) && !dnsEditable(row))) { addDns = false; greyed = true; }
     const repairDays = [...new Map(improper.filter(row => compareDays(row.day, plan.dnsEnd) <= 0 && dnsEditable(row) && (!addDns || !inRange(row.day, plan.dnsStart, editableDnsEnd)))
@@ -9383,7 +9313,7 @@ async function prepareExit(one, version, today, { step }) {
     const beyond = copy.days.filter(row => !inReport(row));
     validatePageDays(beyond);
     const days = withPagePricing(reportPart, copy.days.filter(inReport), inChange);
-    const { problems } = entriesToAdd({ window: watchedWindow, days });
+    const { problems } = greyedExit ? { problems: [] } : entriesToAdd({ window: watchedWindow, days });
     if (problems.length) return { stop: `Snooze could not put these days back if needed: ${problems.join('; ')}.` };
     const backup = { kind: BACKUP_KIND, snooze: version, taken: copy.taken, ticket: record.number, email: record.email,
       professional: professionalName(record), plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')), window: { ...watchedWindow, end: compareDays(watchedWindow.end, reportEnd) < 0 ? watchedWindow.end : reportEnd }, days, reportEnd, termDate: termText,
@@ -9412,7 +9342,7 @@ async function prepareExit(one, version, today, { step }) {
         const dateStop = await caseDates(dates, identity, step, { anchor: dates[0] });
         if (dateStop.stop) return dateStop;
       }
-    } else if (!greyedExit && (addDns || await step(() => permissions.enabled(today)))) {
+    } else if (!greyedExit) {
       const dates = [...(addDns ? workingDays(plan.dnsStart, editableDnsEnd) : []), ...copy.days.filter(row => inChange(row) && inReport(row)).map(row => row.day)];
       if (exitReplaceEligible(plan, { exitRuns, copy, addDns, earlyDns, editableDnsEnd })) exitDatePreflight = { dates, anchor: today };
       else {
@@ -9456,6 +9386,17 @@ async function removeExitEntries(query, matches, prepared, before, step, onWrite
       await onWrite();
       if (prepared.greyedExit) prepared.deletedDays = [...new Set([...(prepared.deletedDays || []), ...before.days.filter(matches).map(row => usDate(row.day))])];
     };
+    const weeklyFuture = () => deleteRange({ start: query.start, end: prepared.watchedWindow.end, weekEndFriday: true }, before, { onWrite: deleteNotice,
+      protectedRows: prepared.dnsKept || [],
+      validate: async actual => {
+        if (actual.days.some(row => !matches(row))) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.');
+      },
+      read: async () => {
+        const after = await readAfter();
+        recordLaterChange(prepared, after); return after;
+      },
+    });
+    if (!prepared.deleteEdit && query.future && knownAssignmentRows(before).range?.weekBoxes) return weeklyFuture();
     const edit = prepared.deleteEdit || await findAssignments(query);
     const sameWindow = edit === prepared.deleteEdit;
     delete prepared.deleteEdit;
@@ -9470,16 +9411,7 @@ async function removeExitEntries(query, matches, prepared, before, step, onWrite
     }
     if (!sameWindow && query.future && findAssignmentsRange(edit)?.weekBoxes) {
       await closeEdit(edit);
-      return deleteRange({ start: query.start, end: prepared.watchedWindow.end, weekEndFriday: true }, before, { onWrite: deleteNotice,
-        protectedRows: prepared.dnsKept || [],
-        validate: async actual => {
-          if (actual.days.some(row => !matches(row))) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.');
-        },
-        read: async () => {
-          const after = await readAfter();
-          recordLaterChange(prepared, after); return after;
-        },
-      });
+      return weeklyFuture();
     }
     if (!query.future && !filteredKeptDay && findAssignmentsRange(edit)?.weekBoxes) {
       if (auditRangeTouchesKept(prepared, query)) {
@@ -10384,11 +10316,11 @@ async function runSmallConsultingRecorded({ email, version, today = todayOf(), o
 }
 const AUDIT_LIVE_STEPS = {
   aaSetup: 'A&A · Setup LOA and DNS; read back',
-  aaExit: 'A&A · Exit; delete ranges exclude Wednesday',
-  aaKept: 'A&A · Wednesday DNS id and note count unchanged',
+  aaExit: 'A&A · Exit; one wrong DNS replaces all DNS',
+  aaKept: 'A&A · Wednesday DNS replaced; old note gone',
   aaDns: 'A&A · New DNS 8 h, Non-Billable / No, blank Notes',
   aaPicture: 'A&A · Plain production screenshot',
-  aaUndo: 'A&A · Undo restores setup; Wednesday untouched',
+  aaUndo: 'A&A · Undo restores setup days without notes',
   aaClear: 'A&A · Clear test entries; span empty',
 };
 function auditTestPeriod(today = todayOf()) {
@@ -10785,7 +10717,7 @@ const { PageError, setBatchGuard, shown, click, settled, text, waitFor, WAIT, cl
 const { calendarView, openPerson, personIdentity, checkPersonIdentity, requireSchedulePage, scheduleFacts, findAssignments, findAssignmentsRange, readEditTable, closeEdit, setupView, pageReady } = __require("./schedule.js");
 const { sessionExpired, cancelBatchWindows } = __require("./batch.js");
 const { copyWindow, compareCopies, dayOf, entriesToAdd, knownAssignmentRows } = __require("./copy.js");
-const { createEditability } = __require("./editability.js");
+const { isEditableDay } = __require("./editability.js");
 const { calendarDates, showDate } = __require("./calendar.js");
 const { addAssignment, deleteAll, deleteRange, refreshNotes, preflightDates, setAssignmentHours, splitDeleteWeeks, saveStagedNotes } = __require("./write.js");
 const { restoreWindow } = __require("./restore.js");
@@ -11017,9 +10949,7 @@ function createLiveTestPage({ today = todayOf(), mode = 'consulting', small = fa
       await bounded(window); const text = String(scheduleFacts().termDate || '').trim();
       const term = text ? termDayOf(text) : null;
       if (text && !term) throw new PageError('Unreadable Term Date.');
-      const permissions = createEditability({ today, term, identity, move: day => showDate(day, { cellProof: true }) });
-      const through = await permissions.through(window.end, window.start);
-      if (!through || compareDays(through, window.end) !== 0) throw new PageError('The test week is greyed out.');
+      if (![window.start, window.end].every(day => isEditableDay(day, today, term))) throw new PageError('The test week is greyed out.');
     },
     async add(entry, mode, onWrite, onProgress = () => {}) {
       await bounded(entry); await addAssignment(entry, mode, { move: day => showDate(day, { cellProof: true }),
@@ -11462,10 +11392,6 @@ function auditLivePage(today, small = false) {
       await deleteAll(edit, { onWrite: notice });
     }, write);
   };
-  const checkKept = copy => {
-    const row = copy.days.filter(row => sameDay(row.day, wednesday));
-    if (row.length !== 1 || !matches({ days: [kept] }, { days: row })) throw new PageError('Wednesday DNS changed.');
-  };
   const smallNote = 'Snooze small live test';
   let smallCheckpoint = null, smallKept = null, smallKeptOriginalId = null;
   const smallKeep = () => {
@@ -11599,9 +11525,7 @@ function auditLivePage(today, small = false) {
       await openPerson(email); identity = personIdentity(); check(); await showDate(scope.start, { cellProof: true });
       known = await read();
       if (known.days.length) { known = null; throw new PageError('The A&A test span is not empty.'); }
-      const permissions = createEditability({ today, identity });
-      const through = await permissions.through(scope.end, scope.start);
-      if (!through || !sameDay(through, scope.end)) throw new PageError('The A&A test span is greyed out.');
+      if (![scope.start, scope.end].every(day => isEditableDay(day, today, null))) throw new PageError('The A&A test span is greyed out.');
       await preflightDates(workingDays(scope.start, scope.end), { anchor: scope.start });
       started = true;
     },
@@ -11625,23 +11549,29 @@ function auditLivePage(today, small = false) {
       one.decision.plan.dnsEnd = scope.end;
       prepared = await withReopen(() => prepare(one, 'diagnostic', scope.start));
       if (!prepared.backup || !matches(known, prepared.copy) || prepared.copy.days.some(row => !inside(row.day, scope))) throw new PageError('Production preparation includes unowned days.');
-      const expected = [first, second, { start: thursday, end: thursday }];
-      if (prepared.exitRuns.length !== expected.length || prepared.exitRuns.some((run, index) => run.future || !sameDay(run.start, expected[index].start) || !sameDay(run.end, expected[index].end) || inside(wednesday, run))) throw new PageError('A&A delete ranges were not proved.');
-      const operations = prepared.exitRuns.map(run => deleteOp(run, run.client));
-      operations.push(...prepared.dnsAddRuns.map(run => addOp({ ...run, client: DNS, hoursPerDay: 8, billable: 'Non-Billable', utilization: 'No', notes: '' })));
+      const targets = prepared.exitRuns.flatMap(run => run.rows);
+      if (prepared.dnsKept?.length || checkpoint.days.some(row => !targets.includes(row) && !targets.some(target => target.id === row.id))) throw new PageError('A&A delete ranges were not proved.');
+      const newDns = run => ({ ...run, client: DNS, hoursPerDay: 8, billable: 'Non-Billable', utilization: 'No', notes: '' });
+      const operations = prepared.exitDatePreflight
+        ? prepared.dnsAddRuns.map(run => ({ range: run, after: before => [...before.filter(row => !inside(row.day, run)), ...entryRows(newDns(run))] }))
+        : [...prepared.exitRuns.map(run => run.future ? deleteOp({ start: run.start, end: scope.end }) : deleteOp(run, run.client)), ...prepared.dnsAddRuns.map(run => addOp(newDns(run)))];
       applied = await sequence(operations, (notice, step) => apply(one, prepared, { onWrite: notice, step }), write);
       if (!applied.ok) throw new PageError('The production A&A result was not proved.');
       return { deleteRanges: prepared.exitRuns.map(run => ({ start: usDate(run.start), end: usDate(run.end) })), productionPrepare: true, productionApply: true };
     },
-    async auditKept() { checkKept(await assertKnown()); return { sameId: true, sameNoteCount: true }; },
+    async auditKept() {
+      const copy = await assertKnown(), row = copy.days.filter(row => sameDay(row.day, wednesday));
+      if (copy.days.some(row => row.id === kept.id) || row.length !== 1 || row[0].client !== DNS || row[0].notes !== 0) throw new PageError('Wednesday DNS was not replaced without its note.');
+      return { replaced: true, oldNoteGone: true };
+    },
     async auditDns() {
-      const copy = await assertKnown(); checkKept(copy);
+      const copy = await assertKnown();
       const dates = workingDays(scope.start, scope.end);
       if (copy.days.length !== dates.length || dates.some(day => {
         const rows = copy.days.filter(row => sameDay(row.day, day));
-        return rows.length !== 1 || rows[0].client !== DNS || rows[0].hours !== 8 || valueKey(rows[0].billable) !== 'non billable' || valueKey(rows[0].utilization) !== 'no' || !sameDay(day, wednesday) && rows[0].notes !== 0;
+        return rows.length !== 1 || rows[0].client !== DNS || rows[0].hours !== 8 || valueKey(rows[0].billable) !== 'non billable' || valueKey(rows[0].utilization) !== 'no' || rows[0].notes !== 0;
       })) throw new PageError('New DNS or blank Notes was not proved.');
-      return { blankNotesAccepted: true, newDays: dates.length - 1 };
+      return { blankNotesAccepted: true, newDays: dates.length };
     },
     async auditPicture() {
       await assertKnown();
@@ -11655,7 +11585,7 @@ function auditLivePage(today, small = false) {
       } finally { if (one.outputs) one.outputs.screenshots = []; }
     },
     async auditUndo(write) {
-      await assertKnown(); checkKept(known);
+      await assertKnown();
       const operations = [];
       for (const range of [first, { start: second.start, end: scope.end }]) {
         operations.push(deleteOp(range));
@@ -11668,8 +11598,8 @@ function auditLivePage(today, small = false) {
           const expected = pending?.after || known;
           if (!matches({ days: expected.days.filter(row => inside(row.day, actual.window)) }, actual)) throw new PageError('The A&A Undo table changed.');
         }, onWrite: notice })), write);
-      if (!restored.same || restored.skippedLater?.length || !matches({ days: checkpoint.days.map(row => row.id === kept.id ? row : { ...row, id: '' }) }, known)) throw new PageError('A&A Undo was not proved.');
-      checkKept(known); return { productionUndo: true, setupRestored: true };
+      if (!restored.same || restored.skippedLater?.length || !matches({ days: checkpoint.days.map(row => ({ ...row, id: '', notes: 0 })) }, known)) throw new PageError('A&A Undo was not proved.');
+      return { productionUndo: true, setupRestored: true };
     },
     async auditClear(write) { await clear(write); if ((await read()).days.length) throw new PageError('A&A span is not empty.'); },
     async auditCleanup(write, error) {
@@ -13556,8 +13486,8 @@ function chooseMail(one, worked = null) {
     const result = plan.pastDated
       ? `The LOA has been updated from ${usDate(workdayFrom(plan.loaStart))} through ${usDate(plan.loaEnd)}. The leave starts on ${usDate(plan.leaveStart || plan.loaStart)}, but past dates cannot be changed in the schedule.`
       : plan.notificationType === 'endOnly'
-      ? `LOA is in place through ${usDate(plan.loaEnd)}, as per the notification below.`
-      : `LOA is in place from ${usDate(plan.leaveStart || plan.loaStart)} through ${usDate(plan.loaEnd)}, as per the notification below.`;
+      ? `LOA is in place through ${usDate(plan.loaEnd)}, as per the details below.`
+      : `LOA is in place from ${usDate(plan.leaveStart || plan.loaStart)} through ${usDate(plan.loaEnd)}, as per the details below.`;
     return { template: plan.pastDated ? 3 : 2, attachReport: clientHours > 0,
       paragraphs: [result, ...kept, ...(tax ? taxMailLines(worked) : []), `${attach} ${HELP}`] };
   }
@@ -13571,22 +13501,26 @@ function chooseMail(one, worked = null) {
       return null;
   }
 }
+function detailsBlock(record) {
+  const date = field => record.notification.dates?.[field] ? usDate(record.notification.dates[field]) : 'not given';
+  const exit = record.notification.kind === 'exit';
+  return ['Professional Details:', `Email: ${record.exportEmail ?? record.email}`,
+    ...(exit ? [`Date of Resignation: ${date('resignation')}`, `Planned Last Working Day: ${date('lastWorkingDay')}`]
+      : [`Leave Start Date: ${date('start')}`, `Leave End Date: ${date('end')}`,
+        ...(record.notification.dates?.estimatedReturn ? [`Estimated Return Date: ${date('estimatedReturn')}`] : [])])];
+}
+const signOffName = signOff => signOff.trim().replace(/^(?:thank you!?|thanks & regards,?|regards,?)\s*\n/i, '').trim();
+const mailBody = (greeting, paragraphs, details, nameOnly) => [`Hi ${greeting},`, '', ...paragraphs.flatMap(p => [p, '']),
+  ...details, '', 'Regards,', nameOnly || '<Your Name>'].join('\n');
 function mailText(one, mail, { dpName = '', dpEmail = '', signOff = '' } = {}) {
   if (one.record.subcategory?.business === 'audit') return auditMailText(one, mail, { dpName, signOff });
   const { record } = one;
   const tax = record.subcategory?.site === 'tax';
   if (tax) dpEmail = '';
   const name = professionalName(record);
-  const details = record.notification.lines.join('\n');
   const greeting = greetingName(dpName);
   const rmNotApplicable = !greeting && String(dpName || '').trim() !== '';
-  const exit = typeof mail.template === 'string' && /^[A-DF]$/.test(mail.template);
-  const email = record.exportEmail ?? record.email;
-  const fields = exit ? [`Professional Email: ${email}`, '', 'Exit Details:', details]
-    : [`Email ID: ${email}`, '', 'LOA Details:', details];
-  const nameOnly = signOff.trim().replace(/^(?:thank you!?|regards,?)\s*\n/i, '').trim();
-  const closing = `Regards,\n${nameOnly || (exit ? '<Your First Name>' : '<Your sign-off>')}`;
-  const body = [`Hi ${greeting || '<Deployment Professional Name>'},`, '', ...mail.paragraphs.flatMap(p => [p, '']), ...fields, '', closing].join('\n');
+  const body = mailBody(greeting || '<Deployment Professional Name>', mail.paragraphs, detailsBlock(record), signOffName(signOff));
   return {
     to: dpEmail || (greeting ? tax ? dpName : `(${dpName}: email not in the files)` : rmNotApplicable ? '(RM not applicable)' : '(no Resource Manager on the profile)'),
     subject: subjectLine(record.number, name),
@@ -13595,62 +13529,56 @@ function mailText(one, mail, { dpName = '', dpEmail = '', signOff = '' } = {}) {
     missing: [!greeting && (rmNotApplicable ? 'RM not applicable' : 'the Resource Manager'), greeting && !dpEmail.trim() && 'Resource Manager email missing: add the recipient before sending', !signOff.trim() && 'your name for mail sign-off', mail.needsDeletionReview && "mail B's deletion statement (Snooze made no schedule change)"].filter(Boolean),
   };
 }
-const AUDIT_LOA_ASK = "We have received the ELE notification below for this professional's Leave of Absence. As per the Audit process, we update the LOA only with your approval. Please let us know if we should add the LOA for the dates below and remove the scheduled hours in that period.";
+const AUDIT_LOA_ASK = "We have received the ELE notification for this professional's Leave of Absence. As per the Audit process, we update the LOA only with your approval. Please let us know if we should add the LOA for the dates below and remove the scheduled hours in that period.";
 function chooseAuditMail(one, worked) {
   if (one.personStop?.code === 'auditMissingDp') return { template: 'AAMissingDp', attachReport: false, paragraphs: [
     'This profile in MySource does not have a Deployment Professional aligned. As per the instructions from A&A Deployment Leadership, we are forwarding this to you for further action.',
-    'Please reach out if you need any more information.',
+    HELP,
   ] };
   if (one.personStop || ['byHand', 'notHandled'].includes(one.decision.outcome) || !worked) return null;
   if (one.record.notification.kind === 'leave') return { template: 'AALoaAsk', attachReport: false,
-    paragraphs: [AUDIT_LOA_ASK, 'Please find the screenshot of the current schedule attached. Please reach out if there are any further changes.'] };
+    paragraphs: [AUDIT_LOA_ASK, `${ATTACHED.noReport} ${HELP}`] };
   const audit = one.decision.audit;
   if (!audit) return null;
   const date = usDate(audit.from);
+  const added = !!worked?.addDns, inPlace = added || !!one.exit?.dnsInPlace || !one.exit?.greyed;
+  const removeAsk = last => `May we remove the scheduled hours after ${last} and add Do Not Schedule (DNS)? If any requirements should be created, please fill in the attached template.`;
   const middle = {
-    1: 'Please confirm the last working day, and let us know if any requirements should be created; if so, please fill in the attached template. Once you confirm, we will create the requirements, remove the scheduled hours after the last working day and add Do Not Schedule (DNS).',
-    2: `There is no client time scheduled after ${date}. Please confirm the last working day, and we will add Do Not Schedule (DNS) after it.`,
-    3: `The last working day is ${date}, and there is client time scheduled after it. Please let us know if any requirements should be created; if so, please fill in the attached template. Once you confirm, we will create the requirements, remove the scheduled hours after ${date} and add Do Not Schedule (DNS).`,
-    4: `There was no client time scheduled after ${date}, so we have added Do Not Schedule (DNS) after the last working day.`,
+    1: `Could you please confirm the last working day? There is client time scheduled after ${date}. ${removeAsk('the last working day')}`,
+    2: `Could you please confirm the last working day? There is no client time scheduled after ${date}. May we add Do Not Schedule (DNS) after the last working day?`,
+    3: `The last working day is ${date}, and there is client time scheduled after it. ${removeAsk(date)}`,
+    4: inPlace ? `There is no client time scheduled after ${date}, and Do Not Schedule (DNS) is in place after the last working day${added && one.exit?.greyed ? ', except where the schedule is greyed out' : ''}.`
+      : `There is no client time scheduled after ${date}. ${EXIT_MAIL_WORDS.greyed}`,
   }[audit.template];
   const attachTemplate = [1, 3].includes(audit.template);
   return middle ? { template: `AA${audit.template}`, attachReport: false, attachTemplate, paragraphs: [
-    `We have received the notification below about this professional's exit. ${middle}`,
-    ...(audit.template === 4 && one.exit?.greyed ? ['DNS could not be added where the schedule is greyed out.'] : []),
-    attachTemplate ? 'Please find the template and the screenshot attached. Please reach out if there are any further changes.'
-      : 'Please find the screenshot attached. Please reach out if any further action is needed.',
+    `We have received the notification about this professional's exit. ${middle}`,
+    `${attachTemplate ? 'Please find the template and the screenshot attached.' : ATTACHED.noReport} ${HELP}`,
   ] } : null;
 }
 function auditMailText(one, mail, { dpName, signOff }) {
-  const record = one.record, name = professionalName(record), email = record.exportEmail ?? record.email;
+  const record = one.record, name = professionalName(record);
   const greeting = greetingName(dpName), missingDp = mail.template === 'AAMissingDp';
-  const date = field => record.notification.dates[field] ? usDate(record.notification.dates[field]) : '';
-  const exit = /^AA[1-4]$/.test(mail.template);
-  const details = exit ? ['Exit Details:', `Mail ID: ${email}`, `Date of Resignation: ${date('resignation')}`, `Planned Last Working Day: ${date('lastWorkingDay')}`]
-    : ['LOA Details:', `Mail ID: ${email}`, `Leave Start Date: ${date('start')}`, `Leave End Date: ${date('end')}`];
-  const nameOnly = signOff.trim().replace(/^(?:thank you!?|thanks & regards,?|regards,?)\s*\n/i, '').trim();
-  const body = missingDp ? ['Hi <POC Name>,', '', ...mail.paragraphs.flatMap((p, i) => [p, '',
-    ...(i === 0 ? [`Mail ID: ${email}`, ''] : [])]), 'Regards,', nameOnly || '<Your Name>'].join('\n')
-    : [`Hi ${greeting || '<Deployment Professional Name>'},`, '', ...mail.paragraphs.flatMap(p => [p, '']), ...details, '', 'Regards,', nameOnly || '<Your Name>'].join('\n');
+  const nameOnly = signOffName(signOff);
+  const body = mailBody(missingDp ? '<POC Name>' : greeting || '<Deployment Professional Name>', mail.paragraphs, detailsBlock(record), nameOnly);
   return { to: missingDp ? '' : greeting ? dpName : '', subject: subjectLine(record.number, name), body, copyBody: body,
     missing: [missingDp && 'the mail recipient', !missingDp && !greeting && 'the Resource Manager', !nameOnly && 'your name for mail sign-off'].filter(Boolean) };
 }
 const TAX_MAIL_WORDS = {
-  pastEnd: 'The LOA on the schedule already runs beyond the end date in the notification below; as per the process it has been left as it is.',
+  pastEnd: 'The LOA on the schedule already runs beyond the end date in the details below; as per the process it has been left as it is.',
   holiday: 'The Holiday on MM/DD/YYYY was kept, and the LOA for that week was reduced by 8 hours.',
   partialWeek: 'The client hours in the week of MM/DD/YYYY were reduced to the days outside the leave.',
   partner: 'As the Professional is Partner/Managing Director, the Scheduled hours are not available in MySource, nor are we supposed to update the schedule with LOA.',
-  partnerPicture: 'Please find the attached screenshot for your reference.',
+  partnerPicture: 'Please find the screenshot attached.',
 };
 function taxMailLines(worked) {
   return [...(worked.holidays || []).map(row => TAX_MAIL_WORDS.holiday.replace('MM/DD/YYYY', usDate(row.day))),
     ...(worked.partialWeeks || []).map(day => TAX_MAIL_WORDS.partialWeek.replace('MM/DD/YYYY', usDate(day)))];
 }
 const EXIT_MAIL_WORDS = {
-  lead: 'As per the Separation notification below, we have taken the following steps:',
-  greyed: 'We are unable to add DNS, as the schedule is greyed out.',
+  greyed: 'DNS could not be added, as the schedule is greyed out.',
   deactivate: 'Profile will be automatically de-activated on the date of termination.',
-  waiting: "We have received the ELE notification below for the PR's resignation and are waiting for the ELE Exits Team to update the LWD details. For now, we are sharing the resignation date for reference only, and we will share the LWD once we receive it from the ELE Exits Team.",
+  waiting: "We have received the ELE notification for the PR's resignation and are waiting for the ELE Exits Team to update the LWD details. For now, we are sharing the resignation date for reference only, and we will share the LWD once we receive it from the ELE Exits Team.",
   noAction: 'No action has been taken in MySource for this professional at this time.',
 };
 function chooseExitMail(one, worked) {
@@ -13658,18 +13586,18 @@ function chooseExitMail(one, worked) {
   const template = one.decision.code === 'exitNoLwd' ? 'F' : one.exit?.template;
   if (!['A', 'B', 'C', 'D', 'F'].includes(template) || (!worked && !['B', 'C', 'F'].includes(template))) return null;
   const w = EXIT_MAIL_WORDS;
-  if (template === 'F') return { template, attachReport: false, paragraphs: [w.waiting, w.noAction] };
+  if (template === 'F') return { template, attachReport: false, paragraphs: [w.waiting, `${w.noAction} ${HELP}`] };
   const clientHours = (worked?.removing || []).reduce((sum, item) => sum + item.clientHours, 0);
   const attachReport = clientHours > 0;
   const plan = one.decision.plan;
   const dates = exitDnsDates(plan, worked);
   const dnsInPlace = one.exit?.dnsInPlace || !one.exit?.greyed;
-  const result = dnsInPlace
-    ? `DNS is in place from ${usDate(dates.start)} through ${usDate(dates.end)}, as per the notification below.`
-    : w.greyed;
-  return { template, attachReport, paragraphs: [...(dnsInPlace ? [w.lead, result] : ['As per the Separation notification below, we are unable to add DNS, as the schedule is greyed out.']),
-    ...(attachReport ? ['Client hours after the last working day have been removed.'] : []),
-    attachReport ? ATTACHED.withReport : ATTACHED.noReport] };
+  const dns = `DNS is in place from ${usDate(dates.start)} through ${usDate(dates.end)}.`;
+  const result = !dnsInPlace ? w.greyed
+    : `As per the details below, ${attachReport ? `client hours after the last working day have been removed, and ${dns}` : dns}`;
+  return { template, attachReport, paragraphs: [result,
+    ...(attachReport && !dnsInPlace ? ['Client hours after the last working day have been removed.'] : []),
+    `${attachReport ? ATTACHED.withReport : ATTACHED.noReport} ${HELP}`] };
 }
 __exports.greetingName = greetingName;
 __exports.subjectLine = subjectLine;
