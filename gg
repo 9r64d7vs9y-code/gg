@@ -1,30 +1,46 @@
 (() => {
-  const words = node => (node?.textContent || '').replace(/\s+/g, ' ').trim();
-  const loose = value => value.toLowerCase().replace(/[^a-z0-9]+/g, '');
-  const kind = value => /leave of absence|\(loa\)/i.test(value) ? 'LOA' : /do not schedule|\(dns\)/i.test(value) ? 'DNS' : /holiday/i.test(value) ? 'Holiday' : 'client';
-  const shape = value => [/\(\d+(?:\.\d+)?\)\s*$/.test(value) ? 'ends (n.nn)' : '', /:\s*\d+\s*$/.test(value) ? 'ends : digits' : '', /\s-\s/.test(value) ? 'has " - "' : ''].filter(Boolean).join(', ') || 'plain';
-  const modal = document.querySelector('#editEventGridModal');
-  const clients = modal ? [...modal.querySelectorAll('td.column-clientname')].map(words).filter(Boolean) : [];
-  const unique = [...new Set(clients)];
-  const tiles = [...document.querySelectorAll('.fc-view .fc-event')].map(tile => {
-    const fields = [...tile.querySelectorAll('.field')];
-    const name = words(fields.find(field => /^name:?$/i.test(words(field.querySelector('.field-label'))))?.querySelector('.field-value'));
-    const match = !name ? 'no Name field'
-      : unique.includes(name) ? 'exact'
-      : unique.some(client => client.toLowerCase() === name.toLowerCase()) ? 'case only'
-      : unique.some(client => loose(client) === loose(name)) ? 'spaces or marks only'
-      : unique.some(client => client.startsWith(name)) ? 'table text is longer (starts with Name)'
-      : unique.some(client => name.startsWith(client)) ? 'Name is longer (starts with table text)'
-      : unique.some(client => loose(client).includes(loose(name)) || loose(name).includes(loose(client))) ? 'one contains the other'
-      : 'none';
-    return { kind: kind(name), nameShape: name ? shape(name) : '', nameLength: name.length, match };
-  });
-  const result = {
-    probe: 'tile-name 2026-10-30', tableOpen: !!modal && getComputedStyle(modal).display !== 'none', tableRows: clients.length,
-    tableClientShapes: [...new Set(unique.map(client => `${kind(client)}: ${shape(client)}`))],
-    tiles: tiles.slice(0, 30),
+  const iso = value => {
+    if (!value) return null;
+    if (typeof value.format === 'function') return value.format('YYYY-MM-DD');
+    if (value instanceof Date) return value.toISOString().slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}/.test(String(value)) ? String(value).slice(0, 10) : 'unreadable';
   };
-  const text = JSON.stringify(result, null, 1);
+  const kind = text => /leave of absence|\(loa\)/i.test(text) ? 'LOA' : /do not schedule|\(dns\)/i.test(text) ? 'DNS' : /holiday|\(hol\)/i.test(text) ? 'Holiday' : 'client/other';
+  const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
+  const view = [...document.querySelectorAll('.fc-view')].find(v => shown(v) && v.querySelector('.fc-event'));
+  if (!view) { console.log('No shown calendar view with tiles.'); return; }
+  const columnOf = (td) => {
+    const table = td.closest('table'), rows = [...table.querySelectorAll(':scope > tbody > tr, :scope > tr')];
+    const taken = [];
+    for (let r = 0; r < rows.length; r++) {
+      let col = 0;
+      for (const cell of rows[r].children) {
+        while (taken[r]?.[col]) col++;
+        if (cell === td) return col;
+        const span = cell.colSpan || 1, down = cell.rowSpan || 1;
+        for (let dr = 0; dr < down; dr++) for (let dc = 0; dc < span; dc++) (taken[r + dr] ||= [])[col + dc] = true;
+        col += span;
+      }
+    }
+    return null;
+  };
+  const rows = [...view.querySelectorAll('.fc-row')];
+  const tiles = [...view.querySelectorAll('.fc-event')].map(tile => {
+    const row = tile.closest('.fc-row'), td = tile.closest('td');
+    const dates = row ? [...row.querySelectorAll('.fc-bg td[data-date]')].map(cell => cell.getAttribute('data-date')) : [];
+    const col = td ? columnOf(td) : null;
+    let seg = null, event = null, error = null;
+    try { const $ = window.jQuery; seg = $ ? $(tile).data('fcSeg') : null; event = $ ? $(tile).data('event') || seg?.event : null; } catch (e) { error = e.name; }
+    return {
+      kind: kind(tile.textContent || ''), row: rows.indexOf(row), gridColumn: col, gridDate: col === null ? null : dates[col] ?? 'no cell',
+      segColumns: seg ? [seg.leftCol ?? seg.firstCol ?? null, seg.rightCol ?? seg.lastCol ?? null] : null,
+      segDate: seg && Number.isInteger(seg.leftCol ?? seg.firstCol) ? dates[seg.leftCol ?? seg.firstCol] ?? 'no cell' : null,
+      eventStart: iso(event?.start), eventEnd: iso(event?.end), segStart: iso(seg?.start), segEnd: iso(seg?.end),
+      idParts: (tile.getAttribute('data-event-id') || '').split('|').map(part => /^\d{4}-?\d{2}-?\d{2}/.test(part) ? part.slice(0, 10) : `${part.length} chars`),
+      rowDates: dates.length ? [dates[0], dates.at(-1), dates.length] : [], error,
+    };
+  });
+  const text = JSON.stringify({ probe: 'tile-week 2026-10-30', rows: rows.length, tiles }, null, 1);
   console.log(text);
   try { copy(text); console.log('Copied to the clipboard.'); } catch {   }
 })();
