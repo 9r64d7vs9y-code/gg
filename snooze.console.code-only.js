@@ -2899,6 +2899,7 @@ __exports.personSlice = personSlice;
 'use strict';
 const { usDate } = __require("../rules/dates.js");
 const { exitDnsDates } = __require("../rules/mails.js");
+const notOnReportReason = record => `not on the Staff Schedule Hours Report: either nothing is scheduled or the person is not in ${record.subcategory?.business === 'audit' ? 'A&A' : record.subcategory?.site === 'tax' ? 'Tax' : 'Consulting'}; check by hand`;
 const greyedExitLine = (plan, prepared) => prepared?.removing?.length
   ? `Removed entries from ${usDate(plan.dnsStart)}; no DNS (schedule greyed out)` : 'No change needed; no DNS (schedule greyed out)';
 const PAST_DATES_WORDS = 'Past dates cannot be changed. Nothing was changed; By hand.';
@@ -2975,6 +2976,7 @@ function reasonLine(decision, prepared = null) {
     default: return '✗ Snooze could not explain this → by hand; check the ticket';
   }
 }
+__exports.notOnReportReason = notOnReportReason;
 __exports.greyedExitLine = greyedExitLine;
 __exports.PAST_DATES_WORDS = PAST_DATES_WORDS;
 __exports.reasonLine = reasonLine;
@@ -2983,14 +2985,14 @@ __exports.reasonLine = reasonLine;
 'use strict';
 const { valueKey } = __require("../rules/prepare.js");
 const { reasonName, REASON_NAMES } = __require("../core/reason-names.js");
-const { recordRun, reasonCode, windowName, diagnosticWaitName, FIELDS, WINDOWS } = __require("../core/run-records.js");
+const { recordRun, reasonCode, stopSentence, windowName, diagnosticWaitName, FIELDS, WINDOWS } = __require("../core/run-records.js");
 class PageError extends Error {
   constructor(message, { record = true, reasonName: fixedReason } = {}) {
     super(message);
     this.name = 'PageError';
     this.reasonName = REASON_NAMES.has(fixedReason) ? fixedReason : reasonName(message);
     if (record) {
-      const event = { type: 'error', code: reasonCode(message), reasonName: this.reasonName };
+      const event = { type: 'error', code: reasonCode(message), reasonName: this.reasonName, sentence: stopSentence(message) };
       recordRun(event);
       if (event.liveStop) this.liveStop = event.liveStop;
     }
@@ -4389,7 +4391,7 @@ function currentWeekFindSpots(today) {
   const datedCells = [...view.querySelectorAll('td.fc-day[data-date]')].filter(shown);
   return [...root.querySelectorAll('.fc-event')].filter(isScheduleContent).filter(shown).map(entry => {
     const read = readScheduleTile(entry, view);
-    if (!read.day && !read.legacy) throw new PageError("A calendar tile's week could not be read and proved. Nothing was read or changed; By hand.");
+    if (!read.day) throw new PageError("A calendar tile's week could not be read and proved. Nothing was read or changed; By hand.");
     return { cell: entry, entry: true, ...read };
   }).filter(({ day, client: clientText }) => {
     return day && compareDays(day, monday) >= 0 && compareDays(day, addDays(monday, 6)) <= 0
@@ -4402,15 +4404,17 @@ function currentWeekFindSpots(today) {
 async function proveFindReopenAfter(removed) {
   const { greyed, today } = await findRoute();
   if (!greyed || !removed.length) return;
-  const edit = await findAssignments({ start: mondayOf(today), end: addDays(mondayOf(today), 6) });
-  let retained;
-  try {
-    const dated = currentWeekFindSpots(today).map(spot => spot.client);
-    const datedDns = dated.some(dnsFindAnchor), datedLoa = dated.some(loaFindAnchor);
-    retained = (await readEditTable(edit)).some(row => (/:\s*\d+\b/.test(row.client) || dnsFindAnchor(row.client) && datedDns || loaFindAnchor(row.client) && datedLoa)
-      && !removed.some(old => old.id === row.id || old.date === row.date && sameText(old.client, row.client) && sameText(old.wbs, row.wbs)));
-  } finally { await closeEdit(edit); }
+  const sunday = addDays(mondayOf(today), 6);
+  const retained = currentWeekFindSpots(today).some(spot => {
+    if (!Number.isFinite(spot.hours)) return false;
+    const rows = removed.filter(row => sameText(row.client, spot.client)
+      && row.day && compareDays(row.day, today) >= 0 && compareDays(row.day, sunday) <= 0);
+    return rows.every(row => Number.isFinite(row.hours) && row.hours >= 0)
+      && spot.hours - rows.reduce((sum, row) => sum + row.hours, 0) > 0;
+  });
   if (!retained) throw new PageError('Find Assignments would lose its current-week client entry or DNS entry after this change. Nothing was changed; By hand.');
+  const edit = await findAssignments({ start: today, end: sunday });
+  try { await readEditTable(edit); } finally { await closeEdit(edit); }
 }
 function findClientsLabel(form) {
   const labels = ['Clients', 'Client'].filter(name => [...form.querySelectorAll('label')].some(node => sameText(text(node).replace(/[*?]/g, ''), name)));
@@ -4447,6 +4451,7 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
   let stepStarted = Date.now();
   const measured = name => { recordRun({ type: 'findStep', name, seconds: (Date.now() - stepStarted) / 1000 }); stepStarted = Date.now(); };
   const { greyed, today } = await findRoute();
+  if (greyed && compareDays(start, today) < 0) start = today;
   let spots = greyed ? currentWeekFindSpots(today) : emptySpots();
   if (greyed) {
     const clients = spots.filter(spot => !dnsFindAnchor(spot.client) && !loaFindAnchor(spot.client));
@@ -4471,21 +4476,28 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
     const from = termDayOf(findDateBox(form, 'Start').value.trim());
     const to = termDayOf(findDateBox(form, 'End').value.trim());
     const selected = [...fieldByLabel(form, clientsLabel).selectedOptions].filter(option => option.value);
-    if (!from || !to || !sameDay(mondayOf(from), mondayOf(today)) || !sameDay(mondayOf(to), mondayOf(today))
+    if (!from || !to || !sameDay(from, today) || !sameDay(to, today)
         || compareDays(to, from) < 0 || selected.length !== 1 || !(/^[^:]+:\s*\d+$/.test(text(selected[0])) || dnsFindAnchor(text(selected[0])) || loaFindAnchor(text(selected[0])))) {
       throw new PageError('Find Assignments did not prove its current-week client entry or DNS entry prefill. Nothing was read or changed; By hand.');
     }
   }
   const allClients = fieldByLabel(form, 'Include All Clients');
-  if (greyed) await setChecked(allClients, true);
+  const checkFindBox = async (box, value, label) => {
+    try { await setChecked(box, value); }
+    catch (error) {
+      if (!(error instanceof PageError) || error.message !== 'A checkbox did not change when clicked.') throw error;
+      throw new PageError(`Find Assignments did not keep the dates Snooze typed: ${label}. Nothing was read or changed.`);
+    }
+  };
+  if (greyed) await checkFindBox(allClients, true, 'Include All Clients');
   if (clients) {
-    await setChecked(allClients, false);
+    await checkFindBox(allClients, false, 'Include All Clients');
     const select = fieldByLabel(form, clientsLabel);
     for (const option of select.options) option.selected = false;
     select.dispatchEvent(new window.Event('change', { bubbles: true }));
     for (const client of clients) await chooseInSelect2(select, client, clientsLabel);
   } else {
-    await setChecked(allClients, true);
+    await checkFindBox(allClients, true, 'Include All Clients');
   }
   const pricing = fieldByLabel(form, 'Pricing ID');
   if (pricing.tagName !== 'SELECT') throw new PageError('Find Assignments Pricing ID is not a readable filter. Nothing was read or changed.');
@@ -4495,22 +4507,29 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
   const startBox = findDateBox(form, 'Start');
   await typeInto(startBox, usDate(start));
   const futureBox = fieldByLabel(form, 'Include All Future Assignments');
-  await setChecked(futureBox, future);
+  await checkFindBox(futureBox, future, 'Include All Future Assignments');
   const endBox = findDateBox(form, 'End');
   if (!future) await typeInto(endBox, end ? usDate(end) : '');
   measured('filters');
   await pageReady('after setting Find Assignments filters');
   measured('settle');
   const from = termDayOf(startBox.value.trim()), to = termDayOf(endBox.value.trim());
-  const startKept = future ? startBox.value.trim() === usDate(start) || weekBoxes && from && sameDay(from, mondayOf(start))
+  const startKept = greyed ? from && sameDay(from, start) : future ? startBox.value.trim() === usDate(start) || weekBoxes && from && sameDay(from, mondayOf(start))
     : from && (sameDay(from, start) || sameDay(from, mondayOf(start)));
   const endKept = future || (end ? to && compareDays(to, end) >= 0 && sameDay(mondayOf(to), mondayOf(end)) : endBox.value.trim() === '');
   const controls = [['Include All Future Assignments', futureBox], ['Include All Clients', allClients], ['Pricing ID', pricing]];
   const dateBoxes = [startBox, endBox];
-  if (!form.isConnected || controls.some(([label, node]) => !node.isConnected || !form.contains(node) || fieldByLabel(form, label) !== node)
-      || dateBoxes.some(node => !node.isConnected || !form.contains(node)) || findDateBox(form, 'Start') !== startBox || findDateBox(form, 'End') !== endBox
-      || !startKept || futureBox.checked !== future || !endKept) {
-    throw new PageError('Find Assignments did not keep the dates Snooze typed. Nothing was read or changed.');
+  const changed = [];
+  if (!form.isConnected) changed.push('form box changed');
+  for (const [label, node] of controls) if (!node.isConnected || !form.contains(node) || fieldByLabel(form, label) !== node) changed.push(`${label} box changed`);
+  for (const [i, edge] of ['Start', 'End'].entries()) if (!dateBoxes[i].isConnected || !form.contains(dateBoxes[i]) || findDateBox(form, edge) !== dateBoxes[i]) changed.push(`${edge} box changed`);
+  const dateWords = day => day ? usDate(day) : 'unreadable or empty';
+  if (!startKept) changed.push(`Start (typed ${usDate(start)}, shown ${dateWords(from)})`);
+  if (!endKept) changed.push(`End (typed ${end ? usDate(end) : 'empty'}, shown ${dateWords(to)})`);
+  if (futureBox.checked !== future) changed.push('Include All Future Assignments');
+  if (allClients.checked !== !clients) changed.push('Include All Clients');
+  if (changed.length) {
+    throw new PageError(`Find Assignments did not keep the dates Snooze typed: ${changed.join('; ')}. Nothing was read or changed.`);
   }
   const chosen = [...fieldByLabel(form, clientsLabel).selectedOptions].filter(option => option.value).map(text);
   const wbs = fieldByLabel(form, 'WBS');
@@ -4520,7 +4539,11 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
   if (allClients.checked !== !clients || clients && (chosen.length !== clients.length || clients.some(client => !chosen.some(value => sameText(value, client))))
       || clients && [...wbs.selectedOptions].some(option => option.value)
       || [...pricing.selectedOptions].some(option => option.value) || pricingChip || pricingText) {
-    throw new PageError('Find Assignments did not keep the requested Clients and Pricing ID filters. Nothing was read or changed.');
+    const parts = [];
+    if (allClients.checked !== !clients) parts.push('Include All Clients');
+    if (clients && (chosen.length !== clients.length || clients.some(client => !chosen.some(value => sameText(value, client)))) || clients && [...wbs.selectedOptions].some(option => option.value)) parts.push('Clients or WBS');
+    if ([...pricing.selectedOptions].some(option => option.value) || pricingChip || pricingText) parts.push('Pricing ID');
+    throw new PageError(`Find Assignments did not keep the requested Clients and Pricing ID filters: ${parts.join('; ')}. Nothing was read or changed.`);
   }
   const submit = [...modal.querySelectorAll('button')].find(button => sameText(text(button), 'Submit'));
   if (!submit) throw new PageError('Find Assignments has no Submit button.');
@@ -4621,9 +4644,9 @@ function displayedTableRowCount(edit) {
 function proveCalendarRows(rows, range) {
   const view = calendarView();
   for (const tile of tilesOnScreen()) {
-    const { day, client, hours, legacy } = readScheduleTile(tile, view);
-    if (!day && !legacy) throw futureReadRefusal("A calendar tile's week could not be read and proved.");
-    if (!day || compareDays(day, range.start) < 0) continue;
+    const { day, client, hours } = readScheduleTile(tile, view);
+    if (!day) throw futureReadRefusal("A calendar tile's week could not be read and proved.");
+    if (compareDays(day, range.start) < 0) continue;
     if (range.clients && !range.clients.some(wanted => sameText(wanted, client))) continue;
     const matching = rows.filter(row => {
       const date = termDayOf(row.date);
@@ -6973,7 +6996,7 @@ __exports.batchCover = batchCover;
 "screen/compact.js": function (__require, __exports, document, window) {
 'use strict';
 const { addDays, compareDays, usDate } = __require("../rules/dates.js");
-const { greyedExitLine, reasonLine } = __require("./wording.js");
+const { greyedExitLine, reasonLine, notOnReportReason } = __require("./wording.js");
 const { professionalName } = __require("../rules/prepare.js");
 const { exitDnsDates } = __require("../rules/mails.js");
 const mailFNoAction = one => one.slice?.status !== 'notOnReport' && !one.personStop && one.decision.code === 'exitNoLwd' && one.decision.outcome === 'noReport';
@@ -7020,7 +7043,7 @@ function undoLine(one, prepared = null) {
 }
 function shortReason(row) {
   if (['personNotFound', 'pageReportMismatch'].includes(row.diagnostic?.reason) && row.message) return row.message;
-  if (row.one.slice?.status === 'notOnReport' && row.state === 'skipped') return `not on the Staff Schedule Hours Report, possibly not ${row.one.record.subcategory?.business === 'audit' ? 'A&A' : row.one.record.subcategory?.site === 'tax' ? 'Tax' : 'Consulting'}`;
+  if (row.one.slice?.status === 'notOnReport' && row.state === 'skipped') return notOnReportReason(row.one.record);
   const decision = row.one.personStop || row.one.decision;
   if (decision.code === 'taxTalentGroup') return reasonLine(decision);
   const codes = { cmat: 'CMAT', noDates: 'No leave dates', noStart: 'No leave start date', noEnd: 'No leave end date', noEmail: 'No email', notesTooLong: 'Notes exceed 150 characters', noBusiness: 'Business missing', termDateUnreadable: 'Term Date unreadable', notConsulting: `Business: ${decision.business || ''}`, exitNoLwdUs: 'US person; last working day missing' };
@@ -7210,8 +7233,12 @@ function rowWarnings(row) {
       : row.prepared?.alreadyDone ? row.prepared.nothing
         : ['pending', 'ready'].includes(row.state) ? `Not run · ${changeLine(one, row.prepared)}` : changeLine(one, row.prepared);
   const duplicates = one.record.duplicates || [];
-  return joinReasons([...new Set([
-    reasonLine(one.personStop || one.decision, row.prepared),
+  const planWords = reasonLine(one.personStop || one.decision, row.prepared);
+  const notDone = row.state === 'skipped' || failedRow(row) || ['pending', 'ready'].includes(row.state);
+  const hasPlan = notDone && !one.personStop && ['add', 'shorten', 'dns', 'clearClients'].includes(one.decision.plan?.action);
+  const plan = hasPlan ? planWords.replace(/^Removed entries/, 'remove entries').replace(/^([A-Z])/, letter => letter.toLowerCase()).replace(/[.!?]+$/, '') : '';
+  const words = joinReasons([...new Set([
+    hasPlan ? `Planned, not done: ${plan}.` : planWords,
     row.message,
     description && `${description}${duplicates.length ? ` · also ${duplicates.map(ticket => ticket.number).join(', ')}` : ''}`,
     row.result?.message,
@@ -7228,6 +7255,11 @@ function rowWarnings(row) {
     one.outputs?.warnings,
     row.undoWarning,
   ].filter(Boolean))]);
+  if (!hasPlan) return words;
+  const unchanged = ['skipped', 'pending', 'ready'].includes(row.state) || row.state === 'failed' && row.diagnostic?.changeAttempted === false;
+  if (!unchanged) return words;
+  const reason = words.replace(/\s*Nothing (?:was (?:read or )?)?changed\.?/g, '').trim().replace(/[;\s]+$/, '');
+  return `${reason}${/[.!?]$/.test(reason) ? '' : '.'} Nothing changed.`;
 }
 function rowMail(row) {
   const one = row.one;
@@ -7547,10 +7579,10 @@ const { sessionExpired, cancelBatchWindows, closeSkippedPerson, batchCover, unlo
 const { todayOf, compareDays, workingDays, usDate } = __require("../rules/dates.js");
 const { compareCopies, copyWindow } = __require("../mysource/copy.js");
 const { openPerson, personIdentity, checkPersonIdentity, waitForPersonIdentity, pageCalm, resumePageReady, requireSchedulePage, SCHEDULE_PAGE_WORDS, IDENTITY_PAUSE_WORDS } = __require("../mysource/schedule.js");
-const { reasonLine, PAST_DATES_WORDS } = __require("../screen/wording.js");
+const { reasonLine, notOnReportReason, PAST_DATES_WORDS } = __require("../screen/wording.js");
 const { checkLoaAdded, checkDnsAdded } = __require("../mysource/checks.js");
 const { capturePerson, needsPersonPicture, saveBatch, batchExcelName } = __require("../files/batch-outputs.js");
-const { setRunRecorder, timedRun, reasonCode } = __require("../core/run-records.js");
+const { setRunRecorder, timedRun, reasonCode, stopSentence } = __require("../core/run-records.js");
 const { safePageInfo } = __require("../mysource/pageinfo.js");
 const { combinedReportText } = __require("../files/run-report.js");
 const { estimateBatch, TIME_LIMIT_WORDS } = __require("./time-limit.js");
@@ -7729,8 +7761,8 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     }
     if (event.type === 'error' && data) {
       if (recordingPicture && event.code === 'screenshotUnreadable') pictureError = true;
-      if (!recordingPicture) data.reason = event.code;
-      if (!recordingPicture && ['pageUnreadable', 'pageTimeout', 'reportUnreadable', 'backupReadFailed', 'screenshotUnreadable'].includes(event.code)) run.unread.push({ person: batch.rows.indexOf(row) + 1, code: event.code, stage: data.currentStage || 'prepare' });
+      if (!recordingPicture) { data.reason = event.code; data.stopSentence = event.sentence; }
+      if (!recordingPicture && ['pageUnreadable', 'pageTimeout', 'reportUnreadable', 'backupReadFailed', 'screenshotUnreadable'].includes(event.code)) run.unread.push({ person: batch.rows.indexOf(row) + 1, code: event.code, sentence: event.sentence, stage: data.currentStage || 'prepare' });
     }
     if (event.type === 'comparison' && data) data.comparison = event.summary;
     if (event.type === 'restoreRead' && event.purpose === 'completedRun' && data && typeof event.reused === 'boolean') {
@@ -7807,7 +7839,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     await checkedPage();
     try { return await fn(); } catch (error) {
       if (error.connectionLost) throw error;
-      if (error.name !== 'PageError') batch.record(observedRow, { type: 'error', code: reasonCode(error.message) });
+      if (error.name !== 'PageError') batch.record(observedRow, { type: 'error', code: reasonCode(error.message), sentence: stopSentence(error.message) });
       if (error.session || sessionExpired()) { error.session = true; throw error; }
       if (error.schedulePage && !error.identityChanged && !error.session && !error.batchWide && !error.pageBlocked) {
         await checkedPage();
@@ -7821,7 +7853,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       try { return await fn(); } finally { retrying = false; }
     }
   }
-  const options = { step, onWrite: async () => { await waitFor(() => { guard(); return true; }, 'Schedule page before a write', WAIT.schedule); checkPlannedDates(observedRow); wrote = true; batch.changesAttempted = true; progress(observedRow); } };
+  const options = { step, onWrite: async () => { await waitFor(() => { guard(); return true; }, 'Schedule page before a write', WAIT.schedule); checkPlannedDates(observedRow); observedRow.diagnostic.changeAttempted = true; wrote = true; batch.changesAttempted = true; progress(observedRow); } };
   const skipReason = row => row.one.personStop ? reasonLine(row.one.personStop)
     : row.one.decision.outcome !== 'report' ? reasonLine(row.one.decision)
       : 'The Staff Schedule Hours Report for this person is not ready.';
@@ -7941,7 +7973,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
           batch.clockPaused = true; batch.diagnostic.paused = true; batch.state = 'paused'; tell(SESSION_WORDS.pause); return;
         }
         const row = batch.rows[batch.index];
-        observedRow = row; retrying = false;
+        observedRow = row; row.diagnostic.changeAttempted ??= false; retrying = false;
         progress(row);
         wrote = false;
         const personStarted = Date.now();
@@ -8102,7 +8134,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     for (const row of batch.rows) {
       if (row.one.personStop || row.one.decision.outcome !== 'report' || !row.one.decision.plan?.action || row.one.slice?.status !== 'ready') {
         row.state = row.one.slice?.status !== 'notOnReport' && !row.one.personStop && row.one.decision.outcome === 'noReport' ? 'nothing' : 'skipped';
-        row.message = row.one.slice?.status === 'notOnReport' ? `not on the Staff Schedule Hours Report, possibly not ${row.one.record.subcategory?.business === 'audit' ? 'A&A' : row.one.record.subcategory?.site === 'tax' ? 'Tax' : 'Consulting'}` : skipReason(row);
+        row.message = row.one.slice?.status === 'notOnReport' ? notOnReportReason(row.one.record) : skipReason(row);
         row.diagnostic.reason = row.one.slice?.status === 'notOnReport' ? 'notOnReport' : row.one.personStop?.code || row.one.decision.code;
         row.diagnostic.failedStage = 'report';
         if (['unreadableDate', 'termDateUnreadable'].includes(row.diagnostic.reason)) batch.diagnostic.unread.push({ person: batch.rows.indexOf(row) + 1, code: row.diagnostic.reason, stage: 'report' });
@@ -8803,7 +8835,7 @@ const { compareByDay, reportDays, withPagePricing, validatePageDays } = __requir
 const { requireDayReport } = __require("../files/report.js");
 const { checkPerson, termDayOf } = __require("../rules/shared.js");
 const { exitMailChoice, decideExit } = __require("../rules/exit.js");
-const { reasonLine } = __require("../screen/wording.js");
+const { reasonLine, notOnReportReason } = __require("../screen/wording.js");
 const { batchCover, closeSkippedPerson, sessionExpired, cancelBatchWindows } = __require("../mysource/batch.js");
 const { createEditability } = __require("../mysource/editability.js");
 const BACKUP_KIND = 'Snooze backup 1';
@@ -8840,7 +8872,7 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
   const { record, decision, slice } = one;
   if (record.subcategory?.site === 'tax') return prepareTax(one, version, today, { step });
   const { plan } = decision;
-  if (slice?.status === 'notOnReport') return { stop: `not on the Staff Schedule Hours Report, possibly not ${record.subcategory?.business === 'audit' ? 'A&A' : record.subcategory?.site === 'tax' ? 'Tax' : 'Consulting'}`, reasonCode: 'notOnReport' };
+  if (slice?.status === 'notOnReport') return { stop: notOnReportReason(record), reasonCode: 'notOnReport' };
   if (record.subcategory?.business === 'audit' && plan?.action === 'auditReadOnly') return prepareAuditReadOnly(one, today, step);
   if (!['add','dns','clearClients'].includes(plan?.action)) return {stop:'Unsupported schedule action. Nothing was changed.'};
   if (['dns', 'clearClients'].includes(plan?.action)) return prepareExit(one, version, today, { step });
@@ -12461,6 +12493,284 @@ function reasonCode(message) {
   ];
   return rules.find(([pattern]) => pattern.test(text))?.[1] || 'pageUnreadable';
 }
+const STOP_SENTENCES = new Set([
+  "A Weekly assignment does not prove its daily hours or its share after the last working day. By hand.",
+  "A Weekly assignment does not prove its daily hours or its share after the last working day. Nothing was changed; By hand.",
+  "A calendar tile's week could not be read and proved. By hand.",
+  "A calendar tile's week could not be read and proved. Nothing was changed; By hand.",
+  "A calendar tile's week could not be read and proved. Nothing was read or changed; By hand.",
+  "A checkbox did not change when clicked.",
+  "A completed person changed after the run stopped. The batch stopped.",
+  "A kept DNS and another entry share a day → by hand",
+  "A kept DNS row is inside the repair range. Restore this person before continuing.",
+  "A kept row is inside the delete range. Nothing was deleted.",
+  "A&A Undo was not proved.",
+  "A&A delete ranges were not proved.",
+  "A&A live test requires Consulting MySource.",
+  "A&A save ownership is unconfirmed.",
+  "A&A span is not empty.",
+  "Add Assignment has no Dates box.",
+  "An A&A write was not exercised.",
+  "Another batch is already running.",
+  "Another confirmation window is already open. Close it before Delete All; nothing was deleted.",
+  "Another confirmation window opened before Delete All; nothing was deleted.",
+  "Can't tell which MySource this is.",
+  "Cancel changed the saved diagnostic rows.",
+  "Cancel did not close the staged window. Nothing was saved.",
+  "Checkpoint outside the test week.",
+  "Diagnostic Retake guard boundary unavailable.",
+  "Diagnostic capture adapter refusal before paint.",
+  "Diagnostic stale-preview check unexpectedly reached a write; nothing was submitted.",
+  "Edit Assignment could not be closed safely.",
+  "Enter one test professional.",
+  "Existing entries changed during the addition-only restore.",
+  "Find Assignments Pricing ID is not a readable filter. Nothing was read or changed.",
+  "Find Assignments could not prove the right-click landed on its client entry. Nothing was changed; By hand.",
+  "Find Assignments did not prove its current-week client entry or DNS entry prefill. Nothing was read or changed; By hand.",
+  "Find Assignments has no Submit button.",
+  "Find Assignments has no proved Professional calendar. Nothing was changed; By hand.",
+  "Find Assignments has no proved client entry or DNS entry in the current week. Nothing was read or changed; By hand.",
+  "Find Assignments would lose its current-week client entry or DNS entry after this change. Nothing was changed; By hand.",
+  "More than one Add Assignment window is open. Nothing was changed.",
+  "More than one Bulk Edit window opened; Snooze will not guess.",
+  "More than one View Notes window opened; Snooze will not guess.",
+  "More than one active Professional calendar; Snooze will not guess.",
+  "More than one confirmation window opened for Delete All; Snooze will not guess.",
+  "More than one heading in the active calendar; Snooze will not guess.",
+  "New DNS or blank Notes was not proved.",
+  "No current or future calendar cells to check. Nothing was changed; By hand.",
+  "No day cells in the calendar: is it in Custom view?",
+  "No exact test professional is bound to this diagnostic.",
+  "No offered period list could be proved.",
+  "No owned LOA or DNS days for the picture.",
+  "No owned working day for the diagnostic Add Cancel.",
+  "No schedule is open.",
+  "No unique owned Tax hours entry.",
+  "No verified test copy.",
+  "No. of Periods offers no 14.",
+  "Only Find Assignments may use a client entry menu.",
+  "Outside the Tax test month.",
+  "Outside the approved A&A period.",
+  "Outside the approved Tax month.",
+  "Outside the approved test week.",
+  "Outside the owned 2028 diagnostic period.",
+  "Picture checkpoint outside the owned 2028 period.",
+  "Plain A&A screenshot was not proved.",
+  "Production apply returned an outside diagnostic row.",
+  "Production preparation includes unowned days.",
+  "Tax Add Assignment did not keep the requested fields. Nothing was added.",
+  "Tax Add/Replace cannot start before today.",
+  "Tax Add/Replace would start before today. Nothing was added.",
+  "Tax Delete All cannot change past dates.",
+  "Tax Edit Assignment has no unique enabled Submit. Nothing was saved.",
+  "Tax Find Assignments did not keep the requested weeks and filters. Nothing was read or changed.",
+  "Tax Find Assignments has ambiguous week controls. Nothing was read or changed.",
+  "Tax Find Assignments has no Client filter. Nothing was read or changed.",
+  "Tax Find Assignments has no unique Submit.",
+  "Tax Hours cell is unreadable. Nothing was saved.",
+  "Tax Hours edit is ambiguous. Nothing was saved.",
+  "Tax Hours has an unproved inline save action. Nothing was typed or saved.",
+  "Tax Hours has more than one edit box. Nothing was read or changed.",
+  "Tax LOA changed before deletion. Nothing was deleted.",
+  "Tax Monday hours are unconfirmed.",
+  "Tax Monday recovery is unconfirmed.",
+  "Tax Replace did not clear Holiday.",
+  "Tax assignments changed before the hours edit. Nothing was saved.",
+  "Tax diagnostic write was not exercised.",
+  "Tax hours edit has no unique unchanged entry. Nothing was saved.",
+  "Tax hours edit is outside the allowed change.",
+  "Tax hours edit moved outside the allowed dates.",
+  "Tax hours edit would change a past week. Nothing was saved.",
+  "Tax live save ownership is unconfirmed.",
+  "Tax live test requires Tax MySource.",
+  "Tax month cleanup unconfirmed.",
+  "Tax weekly hours are invalid. Nothing was added.",
+  "The \"Search for a Professional\" box is not on this page. Open Schedule > Calendar view.",
+  "The \"Search for a Professional\" box is not the dropdown Snooze expects.",
+  "The A&A Undo table changed.",
+  "The A&A cleanup table changed.",
+  "The A&A delete table is not unique.",
+  "The A&A test span is greyed out.",
+  "The A&A test span is not empty.",
+  "The Add Assignment picker does not prove exactly the required dates, Days and Total Hours. Nothing was added.",
+  "The Add Assignment window does not have one enabled Add button; nothing was added.",
+  "The Custom view button was not found.",
+  "The Dates box has no box Snooze can set.",
+  "The Dates range has no picker Snooze can set.",
+  "The Delete All confirmation does not have one visible Yes button; nothing was deleted.",
+  "The Edit Assignment grid has no proved rows or empty result. Nothing was read or changed.",
+  "The Edit Assignment grid is missing. Nothing was read or changed.",
+  "The Edit Assignment table has more than one page; Snooze cannot copy it whole yet.",
+  "The Edit Assignment table row count could not be read. Nothing was changed.",
+  "The Edit Assignment window closed before its table finished loading.",
+  "The Exit backup is not ready. Nothing was changed.",
+  "The Exit entries changed since the backup. Nothing was deleted.",
+  "The Go to Date calendar icon is missing.",
+  "The LOA diagnostic removal is not owned.",
+  "The LOA table changed before the note refresh. Nothing was changed.",
+  "The No. of Periods window did not open. Nothing was changed.",
+  "The No. of Periods window has no Submit.",
+  "The No. of Periods window has no list or box Snooze knows.",
+  "The Search for a Professional dropdown is still open. Close it before Resume.",
+  "The Tax Monday entry changed.",
+  "The Tax backup is not ready. Nothing was changed.",
+  "The Tax diagnostic stand-ins were not exercised.",
+  "The Tax month did not match its checkpoint after Undo.",
+  "The Tax month must be empty before the Monday check.",
+  "The Tax past-Monday exception is not available.",
+  "The Tax restore table changed. Nothing was deleted.",
+  "The Tax test delete table changed.",
+  "The Tax test month is not empty.",
+  "The Tax week is not empty.",
+  "The Term Date cannot be read for Find Assignments. Nothing was read or changed; By hand.",
+  "The Term Date cannot be read. Nothing was restored; By hand.",
+  "The View Notes window does not have its one text box and Cancel.",
+  "The active calendar has more than one readable view; Snooze will not guess.",
+  "The actual hover note differs from the diagnostic notification.",
+  "The all-future diagnostic table changed; nothing was written.",
+  "The assignment ID does not identify a single readable assignment.",
+  "The assignment has no single readable View Notes link.",
+  "The calendar does not expose readable weekly cells. Nothing was changed; By hand.",
+  "The calendar has an unreadable date cell. Nothing was changed; By hand.",
+  "The calendar icon next to the date was not found.",
+  "The calendar shows an assignment missing from the future table. By hand.",
+  "The calendar shows an assignment missing from the future table. Nothing was changed; By hand.",
+  "The combined reduction checkpoint is unreadable.",
+  "The confirmation does not ask to delete the selected assignments; nothing was deleted.",
+  "The confirmation windows changed before Delete All; Snooze will not guess.",
+  "The delete left unexpected rows.",
+  "The delete table differs from the verified test copy.",
+  "The diagnostic Bulk Cancel table changed.",
+  "The diagnostic Bulk Edit window could not be identified.",
+  "The diagnostic Cancel button is unclear. Nothing was saved.",
+  "The diagnostic Delete No table is not owned.",
+  "The diagnostic Retake or unchanged checkpoint was not proved.",
+  "The diagnostic capture refusal was not proved.",
+  "The diagnostic checkpoint is outside its owned period.",
+  "The diagnostic period count was not kept.",
+  "The diagnostic plan exceeds its checkpoint.",
+  "The diagnostic production write window is unclear. Nothing was submitted.",
+  "The diagnostic removal contains an unowned row.",
+  "The diagnostic schedule changed; no unowned row can be restored or removed.",
+  "The diagnostic schedule plan has no bounded dates.",
+  "The diagnostic stale preview was not refused.",
+  "The empty-day client filter did not return exactly its owned rows.",
+  "The exact delete dates changed. Nothing was deleted.",
+  "The form has fields labelled both \"Client\" and \"Clients\".",
+  "The future assignment table has no readable total row count. By hand.",
+  "The future assignment table has no readable total row count. Nothing was changed; By hand.",
+  "The header calendar copy has visible dated cells; Snooze will not guess.",
+  "The header calendar copy holds entries; Snooze will not guess.",
+  "The kept DNS checkpoint is unreadable.",
+  "The kept DNS day changed.",
+  "The normal Tax Undo was refused.",
+  "The normal Tax apply was not proved.",
+  "The opened window is not Bulk Edit Assignments. Nothing was changed.",
+  "The owned A&A test rows changed.",
+  "The owned Tax test rows changed.",
+  "The page still has an open schedule or is loading. Close the schedule and wait before Resume.",
+  "The page still showed entries after the delete.",
+  "The picker cannot prove separate dates. Nothing was added.",
+  "The picture checkpoint changed.",
+  "The plain A&A picture was not proved.",
+  "The preflight Add Assignment window closed before the change. Nothing was changed.",
+  "The prepared Bulk Edit fields changed. Nothing was saved.",
+  "The prepared Exit steps are missing. Nothing was changed.",
+  "The previous schedule is still open or loading. Close it and wait before Resume.",
+  "The previous schedule is still open. Close it with the ✕ and wait before Resume.",
+  "The production A&A decision was not proved.",
+  "The production A&A result was not proved.",
+  "The professional search closed before its results could be read.",
+  "The professional search results could not be read.",
+  "The professional search results have unreadable emails; Snooze will not guess.",
+  "The removal table changed. Nothing was saved.",
+  "The requested diagnostic period count is not offered.",
+  "The restore dates changed since the preview. Nothing was changed; preview again.",
+  "The schedule changed before Undo could clear these days. Nothing was deleted.",
+  "The searched schedule was not shown after loading.",
+  "The small Undo table changed.",
+  "The small backup was not restored.",
+  "The small delete exceeds its owned days.",
+  "The staged Cancel button is unclear.",
+  "The staged Tax hours edit changed unexpected fields. Nothing was saved.",
+  "The staged diagnostic rows are outside the owned period.",
+  "The test schedule changed before Restore. These days were left unchanged.",
+  "The test schedule changed before the next action.",
+  "The test week is greyed out.",
+  "The whole week is not covered by the checked schedule read. Nothing was deleted.",
+  "The whole-week Undo table changed. Nothing was deleted.",
+  "The whole-week table changed since the checked read. Nothing was deleted.",
+  "The whole-week table includes rows outside the delete range. Nothing was deleted.",
+  "The ⋮ settings button was not found.",
+  "The ✕ beside the current person was not found. Close their schedule by hand before Resume.",
+  "Unplanned A&A test write.",
+  "Unplanned Tax diagnostic write.",
+  "Unreadable Term Date.",
+  "Unsupported A&A schedule action. Nothing was changed.",
+  "Unsupported schedule action. Nothing was changed.",
+  "Wednesday DNS changed.",
+  "Wednesday note was not saved.",
+]);
+const STOP_TEMPLATES = [
+  [""," It reads \"","\" (shape)."],
+  [""," The loading cover "," is still there","."],
+  [""," Typed "," characters; ","."],
+  [""," could not be closed safely. Stop and close it by hand."],
+  [""," of "," entries were put back and checked. "," of "," runs were put back and checked. The final copy could not be read: ",""],
+  [""," of "," entries were put back and checked. Restore stopped at ",": "," "," of "," runs were put back and checked."],
+  [""," professionals show exactly ","; Snooze will not guess."],
+  [""," schedules are open at once. Close all but one (the ✕ beside each name) and use Custom view."],
+  ["A row's date \"","\" could not be read."],
+  ["Add Assignment did not keep "," as expected; nothing was added."],
+  ["No readable empty day cell on or after "," to check New Assignment. Nothing was changed; By hand."],
+  ["No right-click menu appeared. Right-clicked: ",". On top of the first day cell: ","","."],
+  ["No. of Periods did not change to 14 (it reads ","). Nothing was changed."],
+  ["Row "," of the Edit Assignment table could not be read."],
+  ["Row "," of the Edit Assignment table has a different or empty Professional. Nothing was changed."],
+  ["Row "," of the Edit Assignment table has no "," cell. Its cells: ","."],
+  ["The Dates in Add Assignment are not ","–",": ",". The form holds: ","."],
+  ["The Edit Assignment table has "," row"," outside the restore window (first: ",", ","). Nothing was deleted."],
+  ["The Edit Assignment table shows "," of its "," rows; Snooze cannot copy it whole."],
+  ["The LOA "," changed since the backup. Nothing was deleted."],
+  ["The form has "," field"," labelled \"","\"."],
+  ["The form has "," fields labelled \"","\" or \"","\"."],
+  ["The go-to-date window has no OK Snooze knows (buttons: ",")."],
+  ["The page gave a row outside the window (","); the copy is not trusted."],
+  ["The right-click menu has no \"","\"."],
+  ["The schedule shown is \"","\", not ","."],
+  ["The schedule shows two different values for ","."],
+  ["This backup cannot be put back by Snooze: ","."],
+  ["\"","\" is greyed out in the right-click menu."],
+  ["\"","\" is not the dropdown Snooze expects."],
+  ["\"","\": "," choices read \"","\"; Snooze will not guess."],
+  ["\"","\": the page offers nothing for \"","\" (",")."],
+];
+function matchesStopTemplate(message, parts) {
+  if (!message.startsWith(parts[0]) || !message.endsWith(parts.at(-1))) return false;
+  let offset = parts[0].length;
+  const end = message.length - parts.at(-1).length;
+  for (const part of parts.slice(1, -1)) {
+    const found = message.indexOf(part, offset);
+    if (found < 0 || found + part.length > end) return false;
+    offset = found + part.length;
+  }
+  return offset <= end;
+}
+function stopSentence(message) {
+  if (STOP_SENTENCES.has(message)) return message;
+  if (typeof message !== 'string' || message.length > 20000) return '';
+  const prefixes = ['Find Assignments did not keep the dates Snooze typed: ', 'Find Assignments did not keep the requested Clients and Pricing ID filters: '];
+  const prefix = prefixes.find(value => typeof message === 'string' && message.startsWith(value));
+  const suffix = '. Nothing was read or changed.';
+  if (!prefix || !message.endsWith(suffix)) {
+    return STOP_TEMPLATES.find(parts => matchesStopTemplate(message, parts))?.join('[value omitted]') || '';
+  }
+  const parts = message.slice(prefix.length, -suffix.length).split('; ');
+  const date = '(?:\\d{2}/\\d{2}/\\d{4}|empty|unreadable or empty)';
+  const dated = new RegExp(`^(?:Start|End) \\(typed ${date}, shown ${date}\\)$`);
+  const fixed = /^(?:(?:Start|End|Include All Future Assignments|Include All Clients|Pricing ID|form) box changed|Include All Future Assignments|Include All Clients|Pricing ID|Clients or WBS)$/;
+  return parts.length && parts.every(part => dated.test(part) || fixed.test(part)) ? message : '';
+}
 function windowName(what) {
   const text = String(what);
   if (text === 'Schedule page') return 'Schedule page';
@@ -12490,6 +12800,7 @@ __exports.PAGE_LIBRARIES = PAGE_LIBRARIES;
 __exports.PAGE_SELECTORS = PAGE_SELECTORS;
 __exports.FIELDS = FIELDS;
 __exports.reasonCode = reasonCode;
+__exports.stopSentence = stopSentence;
 __exports.windowName = windowName;
 __exports.WAIT_NAMES = WAIT_NAMES;
 __exports.diagnosticWaitName = diagnosticWaitName;
@@ -12840,7 +13151,7 @@ const { saveFile } = __require("../screen/ui.js");
 const { runReportDocx, runReportName } = __require("./run-report-docx.js");
 const { failedRow } = __require("../screen/compact.js");
 const { chooseMail } = __require("../rules/mails.js");
-const { RULE_CODES, REASON_CODES, STAGES, WINDOWS, FIELDS, STRUCTURES, PAGE_LIBRARIES, PAGE_SELECTORS } = __require("../core/run-records.js");
+const { RULE_CODES, REASON_CODES, STAGES, WINDOWS, FIELDS, STRUCTURES, PAGE_LIBRARIES, PAGE_SELECTORS, stopSentence } = __require("../core/run-records.js");
 const number = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 const amount = value => number(value) === null ? 'not recorded' : String(Math.round(value * 1000) / 1000);
 const code = value => RULE_CODES.has(value) || REASON_CODES.has(value) ? value : 'unknownFailure';
@@ -12897,6 +13208,7 @@ function runReportText(batch, version, now = Date.now()) {
   rows.forEach((row, index) => {
     const one = row.one;
     const data = row.diagnostic || {};
+    const sentence = data.reason === 'pageUnreadable' ? [data.stopSentence, row.prepared?.stop, row.message].map(stopSentence).find(Boolean) : '';
     const kind = one.record.notification?.kind === 'exit' ? 'Exit' : one.record.notification?.kind === 'leave' || one.decision.plan?.action === 'add' ? 'LOA' : 'unknown';
     let mail;
     try { mail = row.state === 'timeLimit' || one.slice?.status === 'notOnReport' ? null : one.record.subcategory?.business === 'audit' ? chooseMail(one, row.prepared)?.template : one.exit?.template || chooseMail(one, row.prepared)?.template; } catch { mail = null; }
@@ -12917,7 +13229,7 @@ function runReportText(batch, version, now = Date.now()) {
       `${row.state === 'done' || row.state === 'undone' ? 'Done' : 'Planned'}: ${action(one, today)}${row.state === 'undone' ? '; undone' : ''}`,
       `Page/Staff Schedule Hours Report: ${comparison?.agreed === true ? 'agreed' : comparison?.agreed === false ? 'disagreed' : 'not compared'}; differing days: ${amount(comparison?.days)}; fields: ${fields.join(', ') || 'none'}`);
     for (const step of data.steps || []) lines.push(`Step: ${stage(step.stage)} ${amount(step.seconds)} s; ${step.ok === true ? 'ok' : 'failed'}${step.retry === true ? '; retry' : ''}`);
-    if (data.reason || row.state === 'skipped' || failedRow(row)) lines.push(`Reason: ${code(data.reason || one.personStop?.code)}; failed stage: ${stage(data.failedStage)}`);
+    if (data.reason || row.state === 'skipped' || failedRow(row)) lines.push(`Reason: ${code(data.reason || one.personStop?.code)}${sentence ? '; ' + sentence : ''}; failed stage: ${stage(data.failedStage)}`);
     if (data.recovery) {
       const recovery = data.recovery;
       lines.push(`By hand; restore ${recovery.confirmed ? 'confirmed' : 'UNCONFIRMED'}; watched period: ${offset(recovery.window?.start, today)} .. ${offset(recovery.window?.end, today)}`);
@@ -12950,7 +13262,10 @@ function runReportText(batch, version, now = Date.now()) {
   }
   if (!records.dialogs?.length) lines.push('none recorded');
   lines.push('Could not read:');
-  const unread = (records.unread || []).map(item => `#${number(item.person) === null ? '?' : item.person}: ${code(item.code)} (${stage(item.stage)})`);
+  const unread = (records.unread || []).map(item => {
+    const sentence = item.code === 'pageUnreadable' ? stopSentence(item.sentence) : '';
+    return `#${number(item.person) === null ? '?' : item.person}: ${code(item.code)} (${stage(item.stage)})${sentence ? '; ' + sentence : ''}`;
+  });
   lines.push(...(unread.length ? [...new Set(unread)] : ['none recorded']));
   if (new Set(unread).size < unread.length) lines.push('Repeated checks, retries or Resume can record the same unreadable step for one person; each person/reason/stage is shown once.');
   lines.push('Schedule page checks:');
