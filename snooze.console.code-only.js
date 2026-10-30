@@ -2441,7 +2441,9 @@ function termDayOf(text) {
 function checkPerson(person, decision) {
   if (!person) return null;
   if (person.site === 'tax' && ['nationaltax', 'wnt'].includes(String(person.talentGroup || '').replace(/\s/g, '').toLowerCase())) return stop('notHandled', 'taxTalentGroup', { talentGroup: person.talentGroup });
-  if (person.disagreements?.length) return stop('byHand', 'reportPersonDisagrees', { fields: person.disagreements });
+  const exitCase = ['exitNoLwd', 'auditExit', 'dns', 'clearClients'].includes(decision.code);
+  const disagreements = (person.disagreements || []).filter(field => !exitCase || field !== 'region');
+  if (disagreements.length) return stop('byHand', 'reportPersonDisagrees', { fields: disagreements });
   if (person.site === 'tax') {
     const level = levelGroupKey(person.levelGroup);
     if (['lpp', 'lmd', 'll'].includes(level)) return stop('noReport', 'taxPartnerMd');
@@ -2537,25 +2539,15 @@ const { notesFor } = __require("../servicenow/tickets.js");
 const { stop, ticketProblem } = __require("./shared.js");
 const { entryKind } = __require("./entries.js");
 const { valueKey } = __require("./prepare.js");
-function emptyLwd(record) {
-  if (record.person?.region === undefined) return stop('noReport', 'exitNoLwd');
-  const suppliedRegion = String(record.person.region ?? '');
-  const region = suppliedRegion.replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase().replace(/\s*-\s*/g, '-');
-  if (region === 'us-us') return stop('byHand', 'exitNoLwdUs');
-  if (region === 'us-usi') return stop('noReport', 'exitNoLwd');
-  return stop('byHand', 'exitNoLwdRegion', { region: suppliedRegion });
+function emptyLwd() {
+  return stop('noReport', 'exitNoLwd');
 }
 function decideExit(record, today, slice = null) {
   const problem = ticketProblem(record);
   if (problem) return problem;
   const lastWorkingDay = record.notification.dates.lastWorkingDay;
   if (record.subcategory?.business === 'audit') return decideAuditExit(record, today, slice);
-  if (record.person?.region !== undefined) {
-    const region = String(record.person.region ?? '').replace(/[–—]/g, '-').replace(/\s+/g, '').toLowerCase();
-    if (!['us-us', 'us-usi'].includes(region)) return stop('byHand', 'exitNoLwdRegion', { region: String(record.person.region ?? '') });
-    if (region === 'us-usi' && lastWorkingDay) return stop('byHand', 'exitUsiLwd');
-  }
-  if (!lastWorkingDay) return emptyLwd(record);
+  if (!lastWorkingDay) return emptyLwd();
   const notes = notesFor(record.notification);
   if (notes === null) return stop('byHand', 'notesTooLong');
   return dnsDecision(lastWorkingDay, today, notes);
@@ -2572,11 +2564,6 @@ function dnsDecision(lastWorkingDay, today, notes) {
 }
 function decideAuditExit(record, today, slice) {
   const lastWorkingDay = record.notification.dates.lastWorkingDay;
-  const suppliedRegion = String(record.person?.region ?? '');
-  const regionKey = suppliedRegion.replace(/[–—]/g, '-').replace(/\s+/g, '').toLowerCase();
-  const region = regionKey === 'us-us' ? 'US' : regionKey === 'us-usi' ? 'USI' : null;
-  if (record.person?.region !== undefined && !region) return stop('byHand', 'exitNoLwdRegion', { business: 'audit', region: suppliedRegion });
-  if (region === 'USI' && lastWorkingDay) return stop('byHand', 'auditUsiLwd', { business: 'audit' });
   const from = lastWorkingDay || mondayOf(today);
   const entries = (slice?.backupEntries ?? slice?.entries ?? []).filter(entry => {
     if (entryKind(entry) !== 'client') return false;
@@ -2591,8 +2578,8 @@ function decideAuditExit(record, today, slice) {
   });
   const unique = new Map(entries.map(entry => [JSON.stringify([valueKey(entry.client), valueKey(entry.wbs)]), { client: entry.client, wbs: entry.wbs || '' }]));
   const template = !lastWorkingDay ? entries.length ? 1 : 2 : entries.length ? 3 : 4;
-  const audit = { region, template, clients: [...unique.values()], from };
-  if (!lastWorkingDay || entries.length || !slice || !region) return stop('report', 'auditExit', { business: 'audit', audit,
+  const audit = { template, clients: [...unique.values()], from };
+  if (!lastWorkingDay || entries.length || !slice) return stop('report', 'auditExit', { business: 'audit', audit,
     plan: { action: 'auditReadOnly', ...(lastWorkingDay ? { lastWorkingDay } : {}), window: reportWindow(today) } });
   const consulting = dnsDecision(lastWorkingDay, today, '');
   return { ...consulting, business: 'audit', audit, plan: { ...consulting.plan, notes: '', withoutNotes: true } };
@@ -2926,13 +2913,9 @@ function reasonLine(decision, prepared = null) {
     case 'clearClients': return `Remove entries from ${usDate(decision.plan.dnsStart)}; no DNS (greyed schedule).`;
     case 'dns': { const dates = exitDnsDates(decision.plan, prepared); return decision.plan.greyed && !prepared?.addDns ? greyedExitLine(decision.plan, prepared) : `Clear every entry from ${usDate(decision.plan.dnsStart)}; add DNS ${usDate(dates.start)} – ${usDate(dates.end)}, 8h a day, Mode Normal.`; }
     case 'exitNoLwd': return 'No last working day → no schedule action; mail F (USI).';
-    case 'exitUsiLwd': return 'USI Exit with a last working day → by hand; no schedule action.';
-    case 'auditUsiLwd': return 'A&A USI exit with a last working day: not in the SOP';
     case 'auditMissingDp': return 'A&A Deployment Professional missing → by hand; no schedule action.';
     case 'auditLoa': return "A&A LOA → ask the Deployment Professional; no schedule change.";
     case 'auditExit': return `A&A Exit → mail ${decision.audit.template}; no schedule change.`;
-    case 'exitNoLwdUs': return '✗ US professional with no last working day → by hand; no schedule action.';
-    case 'exitNoLwdRegion': return !decision.region.trim() ? 'No Region on the Staff Schedule Hours Report (expected US - USI or US - US) → by hand' : `Region "${decision.region}" not recognised (expected US - USI or US - US) → by hand`;
     case 'termBeforeLwd': return `✗ Term Date (${usDate(decision.termDate)}) is before the last working day (${usDate(decision.lastWorkingDay)}) → by hand`;
     case 'add': {
       const { plan } = decision;
@@ -7083,10 +7066,10 @@ function undoLine(one, prepared = null) {
 }
 function shortReason(row) {
   if (['personNotFound', 'pageReportMismatch'].includes(row.diagnostic?.reason) && row.message) return row.message;
-  if (row.one.slice?.status === 'notOnReport' && row.state === 'skipped') return notOnReportReason(row.one.record);
+  if (row.one.slice?.status === 'notOnReport') return notOnReportReason(row.one.record);
   const decision = row.one.personStop || row.one.decision;
   if (decision.code === 'taxTalentGroup') return reasonLine(decision);
-  const codes = { cmat: 'CMAT', noDates: 'No leave dates', noStart: 'No leave start date', noEnd: 'No leave end date', noEmail: 'No email', notesTooLong: 'Notes exceed 150 characters', noBusiness: 'Business missing', termDateUnreadable: 'Term Date unreadable', notConsulting: `Business: ${decision.business || ''}`, exitNoLwdUs: 'US person; last working day missing' };
+  const codes = { cmat: 'CMAT', noDates: 'No leave dates', noStart: 'No leave start date', noEnd: 'No leave end date', noEmail: 'No email', notesTooLong: 'Notes exceed 150 characters', noBusiness: 'Business missing', termDateUnreadable: 'Term Date unreadable', notConsulting: `Business: ${decision.business || ''}` };
   const reason = codes[decision.code] || row.message || reasonLine(decision);
   return reason.replace(/^[✗⚠✓]\s*/, '').replace(/\s*→.*$/, '').replace(/\s*Nothing was changed\.?/g, '').trim();
 }
@@ -7128,7 +7111,7 @@ const { safeName } = __require("./folder.js");
 const { saveFile } = __require("../screen/ui.js");
 const { changeLine, orderedRows, failedRow, shortReason } = __require("../screen/compact.js");
 const { professionalName, rememberPageName, emailKey } = __require("../rules/prepare.js");
-const { reasonLine } = __require("../screen/wording.js");
+const { reasonLine, notOnReportReason } = __require("../screen/wording.js");
 const { dayRanges } = __require("../rules/leaves.js");
 const { runReportDocx } = __require("./run-report-docx.js");
 const { loadedReports, reportKind } = __require("./report.js");
@@ -7265,7 +7248,13 @@ const joinReasons = parts => {
   }).filter(Boolean);
   return reasons.reduce((text, part) => !text ? part : `${text}${/[.!?]$/.test(text) ? ' ' : '; '}${part}`, '');
 };
+const sameReason = (full, short) => {
+  const key = text => String(text).replace(/^[✗⚠✓]\s*/, '').replace(/[:".!?]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  const whole = key(full), brief = key(short);
+  return !!brief && (whole === brief || whole.startsWith(`${brief} `));
+};
 function rowWarnings(row) {
+  if (row.one.slice?.status === 'notOnReport') return notOnReportReason(row.one.record);
   if (row.state === 'timeLimit') return joinReasons([row.message, row.one.reportHint].filter(Boolean));
   const one = row.one;
   const description = row.state === 'undoing' ? 'undoing…' : row.state === 'undone' ? 'undone'
@@ -7280,7 +7269,8 @@ function rowWarnings(row) {
   const words = joinReasons([...new Set([
     hasPlan ? `Planned, not done: ${plan}.` : planWords,
     row.message,
-    description && `${description}${duplicates.length ? ` · also ${duplicates.map(ticket => ticket.number).join(', ')}` : ''}`,
+    description && (sameReason(planWords, description) ? duplicates.length && `also ${duplicates.map(ticket => ticket.number).join(', ')}`
+      : `${description}${duplicates.length ? ` · also ${duplicates.map(ticket => ticket.number).join(', ')}` : ''}`),
     row.result?.message,
     row.prepared?.nothing,
     one.reportHint,
@@ -9096,7 +9086,7 @@ async function applyRecorded(one, prepared, { step = fn => fn(), onWrite: writeN
   if (prepared.tax) return applyTax(one, prepared, { step, onWrite: writeNotice });
   const { plan } = one.decision;
   if (one.record.subcategory?.business === 'audit' &&
-      (one.decision.audit?.region !== 'US' || one.decision.audit?.template !== 4 || plan.action !== 'dns' || !plan.withoutNotes || plan.notes !== '')) throw new PageError('Unsupported A&A schedule action. Nothing was changed.');
+      (!one.record.notification.dates.lastWorkingDay || one.decision.audit?.template !== 4 || plan.action !== 'dns' || !plan.withoutNotes || plan.notes !== '')) throw new PageError('Unsupported A&A schedule action. Nothing was changed.');
   const onWrite = async () => { await requirePersonIdentity(prepared.identity); await writeNotice(); };
   const writeThrough = days => async () => {
     await onWrite();
@@ -9288,7 +9278,7 @@ async function prepareExit(one, version, today, { step }) {
   requireDayReport(slice);
   if (withoutNotes) {
     const checked = decideExit(record, today, slice);
-    if (checked.plan?.action !== 'dns' || checked.audit?.region !== 'US' || checked.audit?.template !== 4 || !plan.withoutNotes || plan.notes !== '') return { stop: 'Unsupported A&A schedule action. Nothing was changed.' };
+    if (checked.plan?.action !== 'dns' || !record.notification.dates.lastWorkingDay || checked.audit?.template !== 4 || !plan.withoutNotes || plan.notes !== '') return { stop: 'Unsupported A&A schedule action. Nothing was changed.' };
   }
   rememberPageName(record, await step(() => openPerson(record.email, record.person.professional, record, { today, termDate: slice.person?.termDate ?? record.person.termDate })));
   const identity = personIdentity();
@@ -11631,7 +11621,7 @@ function auditLivePage(today, small = false) {
       const entries = checkpoint.days.map(row => ({ ...row, days: [{ day: row.day, hours: row.hours }], fields: {} }));
       const slice = { status: 'ready', mode: 'day', entries, backupEntries: entries, person, resourceManager: person.resourceManager, reportEnd: scope.end };
       one = { record, slice, decision: decideExit(record, scope.start, slice) };
-      if (one.decision.audit?.region !== 'US' || one.decision.audit?.template !== 4 || !one.decision.plan?.withoutNotes) throw new PageError('The production A&A decision was not proved.');
+      if (!record.notification.dates.lastWorkingDay || one.decision.audit?.template !== 4 || !one.decision.plan?.withoutNotes) throw new PageError('The production A&A decision was not proved.');
       one.decision.plan.dnsEnd = scope.end;
       prepared = await withReopen(() => prepare(one, 'diagnostic', scope.start));
       if (!prepared.backup || !matches(known, prepared.copy) || prepared.copy.days.some(row => !inside(row.day, scope))) throw new PageError('Production preparation includes unowned days.');
@@ -13615,7 +13605,7 @@ function chooseAuditMail(one, worked) {
   if (one.record.notification.kind === 'leave') return { template: 'AALoaAsk', attachReport: false,
     paragraphs: [AUDIT_LOA_ASK, 'Please find the screenshot of the current schedule attached. Please reach out if there are any further changes.'] };
   const audit = one.decision.audit;
-  if (!audit?.region) return null;
+  if (!audit) return null;
   const date = usDate(audit.from);
   const middle = {
     1: 'Please confirm the last working day, and let us know if any requirements should be created; if so, please fill in the attached template. Once you confirm, we will create the requirements, remove the scheduled hours after the last working day and add Do Not Schedule (DNS).',
@@ -14569,7 +14559,6 @@ function attachReport(cases, input, pull) {
     Object.assign(one.slice, { reportEnd: report.days?.at(-1), pullTime: report.pullTime, fileName: report.fileName });
     one.record.person.professional = '';
     if (one.slice.person) Object.assign(one.record.person, one.slice.person, { resourceManager: one.slice.resourceManager });
-    if (one.record.notification.kind === 'exit' && one.slice.backupEntries?.[0]) one.record.person.region = one.slice.backupEntries[0].fields.Region || '';
     one.personStop = one.slice.status === 'ready' ? checkPerson(one.slice.person && { ...one.slice.person, resourceManager: one.slice.resourceManager, site: one.record.subcategory?.site || 'consulting' }, one.decision)
       : one.slice.status === 'twoEmailsInReportCell' ? { outcome: 'byHand', code: 'twoEmailsInReportCell' } : null;
     if (one.record.notification.kind === 'exit' && one.slice.person) {
