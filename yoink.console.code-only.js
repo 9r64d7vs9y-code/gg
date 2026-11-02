@@ -1,4 +1,4 @@
-/* 1.2.0-console.46 */
+/* 2.0.0-console.5 */
 (() => {
 'use strict';
 const __yoinkModules = {
@@ -1710,7 +1710,7 @@ const { cleanEmail, emailDate, plainEmail, findByEmail } = __yoinkLoad('family/e
 const { reportWindow, todayOf, usDate } = __yoinkLoad('family/report-window.js');
 const { COLOURS } = __yoinkLoad('family/look.js');
 void (async () => {
-  const VERSION = '1.2.0-console.46';
+  const VERSION = '2.0.0-console.5';
   const TOOL_KEY = '__yoinkTool';
   if (window[TOOL_KEY]?.active || document.getElementById('bp-panel')) {
     alert('Yoink is already running. Close the existing panel before running it again.');
@@ -2054,7 +2054,9 @@ void (async () => {
     const getSelect = (which = 'email') => personField(which).resolve();
     const staffIdLabel = () => {
       const field = getSelect('id');
-      const label = [...(field?.labels || [])].find(node => node.getClientRects().length);
+      const visible = nodes => [...(nodes || [])].filter(node => node.getClientRects().length);
+      const boxed = visible(field?.closest('div.dynamic-field-container')?.querySelectorAll('label'));
+      const label = visible(field?.labels)[0] || (boxed.length === 1 ? boxed[0] : null);
       if (!label) return 'Empid';
       const copy = label.cloneNode(true);
       copy.querySelectorAll('select, input, .select2-container').forEach(node => node.remove());
@@ -2105,11 +2107,10 @@ void (async () => {
     };
     const addedTermsById = (which = 'email') => {
       const entries = new Map();
-      for (const batch of [...state.batches, state.pendingBatch]) {
-        for (const entry of batch?.addedEmails || []) {
-          const term = termOfEntry(entry);
-          if (entry.optionId != null && fieldOf(term) === which) entries.set(String(entry.optionId), term);
-        }
+      for (const person of state.people.values()) {
+        const entry = person.status === 'added' ? person.entry : null;
+        const term = termOfEntry(entry);
+        if (entry?.optionId != null && fieldOf(term) === which) entries.set(String(entry.optionId), term);
       }
       return entries;
     };
@@ -2812,7 +2813,7 @@ void (async () => {
     };
   })();
   const {
-    empidReady, fieldOf, getSelect, staffIdLabel, selectedIds, fieldOnScreen,
+    empidReady, fieldOf, staffIdLabel, selectedIds, fieldOnScreen,
     selectedEmails, selectedEmailFor, click, preflight, inputViewVisible, goToInputView,
     clearBox, undoChipIndex, removeSelectedEmail, reportAllIs, reportSingleIs,
     setReportSingle, setReportAll, setReportDate, reportAdvancedOpen, openReportAdvanced, tryAdd,
@@ -3380,7 +3381,7 @@ void (async () => {
   on(el('bp-status'), 'blur', event => paintStatus(event.currentTarget));
   const renderMessage = (required = false) => {
     const n = el('bp-status') || el('bp-recovery-note');
-    if (!n && !required) return;
+    if (!n) return;
     let text, title;
     if (messages.recovery) text = messages.recovery;
     else if (messages.readiness) {
@@ -3394,7 +3395,7 @@ void (async () => {
       title = [messages.status.title || messages.status.text, messages.live, messages.resumed].filter(Boolean).join('\n');
     }
     statusText = text || '';
-    if (n && statusText) n.style.display = 'block';
+    if (statusText) n.style.display = 'block';
     if (required || n.textContent !== statusText) n.textContent = statusText;
     n.title = messages.recovery ? '' : title || statusText;
     paintStatus(n);
@@ -3683,7 +3684,6 @@ void (async () => {
   };
   const termOfEntry = entry => entry?.term || entry?.email || '';
   const inputKeys = () => state.batches.flatMap(batch => batch.people);
-  const excludedKeys = () => state.batches.flatMap(batch => batch.skips.map(skip => skip.key));
   const isAdded = key => state.people.get(key)?.status === 'added';
   const batchSelected = batch => batch.people.filter(isAdded);
   const ownedAdded = batch => batch.created.map(key => {
@@ -4271,17 +4271,7 @@ void (async () => {
         chosen = await loadChosenColumns(chosen, readingCurrent);
         if (!readingCurrent()) return finish(null, false);
         selectedHeadings.forEach(key => rememberedHeadings.add(key));
-        const picked = uniq(chosen.map((c) => c.file)).map((file) => {
-          const mine = chosen.filter((c) => c.file === file);
-          const { emails, rejected } = chosenCellTerms(mine);
-          return {
-            name: file,
-            emails,
-            column: mine.map((c) => c.label).join(' + '),
-            excluded: [...rejected],
-          };
-        });
-        finish(picked);
+        finish(columnSources(chosen));
       } catch (error) {
         if (readingCurrent()) setStatus(`✗ ${csvErrorMessage(csvReadError({ name: source.name }, error))}`);
         return finish(null);
@@ -4421,11 +4411,10 @@ void (async () => {
       empties: withEmails.flatMap(r => (r.empties || []).map(e => ({ ...e, file: r.file }))),
       autoChoices: withEmails.filter(r => r.choices.length === 1 && likelyColumn(r.choices[0])).map(r => r.choices[0]),
     };
-    const sources = [], ambiguous = [], autoUsed = [];
+    const sources = [], ambiguous = [];
     for (const r of withEmails) {
       const choices = r.choices;
       if (choices.length === 1 && likelyColumn(choices[0])) {
-        autoUsed.push(`${clip(choices[0].header, 40)} (${clip(r.file, 40)})`);
         let choice;
         try { [choice] = await loadChosenColumns([choices[0]], current); }
         catch (error) {
@@ -4449,8 +4438,6 @@ void (async () => {
       if (!picked) { fileNotice = ''; return null; }
       for (const source of picked) sources.push(source);
     }
-    if (autoUsed.length && purpose === 'input') fileNotice = [fileNotice, `Used ${autoUsed.join(', ')}, the only ${reportMode
-      ? 'email column' : 'column with emails or numbers'}`].filter(Boolean).join(' · ');
     return sources.length ? sources : null;
   };
   const setDisclosureLabel = (toggleId, text) => {
@@ -4883,10 +4870,10 @@ void (async () => {
     if (!value) {
       if (pauseCauses.size) showPauseCause('');
       pauseCauses.clear();
+      if (pauseStartedAt !== null) { pausedFor += Date.now() - pauseStartedAt; pauseStartedAt = null; }
     }
     if (value === runPaused()) return;
     if (value) pauseStartedAt = Date.now();
-    else if (pauseStartedAt !== null) { pausedFor += Date.now() - pauseStartedAt; pauseStartedAt = null; }
     if (value) {
       runState.resumePhase = runState.phase;
       moveRun('paused');
@@ -5038,7 +5025,7 @@ void (async () => {
     if (runStopped() || !active()) return;
     const target = state.pendingBatch;
     if (!target) return;
-    if (!(await confirmModal('Cancel this batch?', 'Everything added by this batch will be removed. Earlier batches stay.', 'Cancel batch', 'Keep working'))) return;
+    if (!(await confirmModal('Cancel this batch?', 'Yoink will try to remove this batch\'s additions. Earlier batches stay.', 'Cancel batch', 'Keep working'))) return;
     if (state.pendingBatch !== target) {
       setStatus(state.pendingBatch
         ? '⚠ That batch finished before you confirmed — the next one is running → press Cancel again to stop that one.'
@@ -5093,15 +5080,7 @@ void (async () => {
     return person?.status === 'added' ? '' : person?.reason || 'not reached';
   };
   const finalStatus = (term) => finalReason(term) ? 'not_found' : 'added';
-  const sourceOf = () => {
-    const map = new Map();
-    const name = (batch) => batch.source || batch.label;
-    state.batches.forEach((b) => b.people.forEach((e) => { if (!map.has(e)) map.set(e, name(b)); }));
-    state.batches.forEach((b) => b.skips.map(skip => skip.key).forEach((e) => { if (!map.has(e)) map.set(e, name(b)); }));
-    return map;
-  };
   const buildCsv = () => {
-    const source = sourceOf();
     const rows = [['supplied', 'status', 'reason', 'source', 'profile']];
     const profile = (term) => mayBeInactiveId(term) ? 'may be inactive' : '';
     const supplied = new Set(inputKeys());
@@ -5111,15 +5090,16 @@ void (async () => {
       || state.people.get(term)?.pickedEmail || suppliedOfTerm(term, null, spellings);
     const emitted = new Set();
     for (const batch of state.batches) {
+      const source = batch.source || batch.label;
       for (const term of batch.people) {
         if (emitted.has(term) || state.people.get(term)?.owner !== batch) continue;
         emitted.add(term);
-        rows.push([csvTerm(term), finalStatus(term), finalReason(term), source.get(term) || '', profile(term)]);
+        rows.push([csvTerm(term), finalStatus(term), finalReason(term), source, profile(term)]);
       }
       for (const { key: term } of batch.skips) {
         if (emitted.has(term) || supplied.has(term)) continue;
         emitted.add(term);
-        rows.push([suppliedOfTerm(term, null, spellings), 'skipped', '', source.get(term) || '', profile(term)]);
+        rows.push([suppliedOfTerm(term, null, spellings), 'skipped', '', source, profile(term)]);
       }
     }
     const cell = (v) => String(v).replace(/^[=+\-@\t\r]/, "'$&").replace(/"/g, '""');

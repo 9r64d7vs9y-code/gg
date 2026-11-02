@@ -1,4 +1,4 @@
-// 0.7.0-console.62
+// 0.7.0-console.63
 (() => {
 'use strict';
 const __transfersModules = {
@@ -738,7 +738,90 @@ function describeMySourcePage(mySource, version, { bare = false } = {}) {
   } catch {
     lines.push('Could not be checked');
   }
+  lines.push(...pageLayout(win, mySource));
   return bare ? lines : lines.join('\n');
+}
+const LAYOUT_LINES = 120;
+const CHAIN_LEVELS = 12;
+function describeElement(element) {
+  const classes = [...element.classList].slice(0, 3).map(name => '.' + name).join('');
+  const names = element.getAttributeNames().filter(name => /^(data-|aria-)/.test(name)).slice(0, 8);
+  const role = element.getAttribute('role');
+  return element.tagName.toLowerCase() + (element.id ? '#' + element.id : '') + classes + (role ? '[role=' + role + ']' : '') + (names.length ? ' {' + names.join(' ') + '}' : '');
+}
+function chainOf(element, stop = null) {
+  const steps = [];
+  for (let at = element?.parentElement; at && at !== stop && steps.length < CHAIN_LEVELS; at = at.parentElement) steps.push(describeElement(at));
+  return steps.join(' < ') || '(none)';
+}
+function pageLayout(win, mySource) {
+  const doc = win.document;
+  const lines = ['', 'Page layout for auto mode'];
+  const count = (root, selector) => root.querySelectorAll(selector).length;
+  const saves = [...doc.querySelectorAll('button, input[type="button"], input[type="submit"]')]
+    .filter(button => String(button.textContent || button.value).replace(/\s+/g, ' ').trim().toLowerCase() === 'save');
+  lines.push('Save buttons: ' + saves.length);
+  for (const save of saves.slice(0, 3)) {
+    lines.push('Save: ' + describeElement(save) + ' · type ' + (save.type || '-') + ' · form property ' + (save.form ? 'yes' : 'no'));
+    lines.push('Save inside: ' + chainOf(save));
+  }
+  let readers = null;
+  try {
+    readers = mySource.readersFor(win);
+  } catch {
+    lines.push('Field readers: could not be used');
+  }
+  const control = label => {
+    try {
+      return readers?.fieldControl(label) || null;
+    } catch {
+      return null;
+    }
+  };
+  const identity = [['Email', control('Email')], ['Employee ID', control('Employee ID')]];
+  for (const [label, found] of identity) {
+    lines.push(label + ': ' + (found ? describeElement(found) + ' · nearest form ' + (found.closest('form') ? describeElement(found.closest('form')) : 'none') : 'not found'));
+    if (found) lines.push(label + ' inside: ' + chainOf(found));
+  }
+  const together = [saves[0], ...identity.map(([, found]) => found)];
+  let common = null;
+  if (together.every(Boolean)) {
+    common = saves[0].parentElement;
+    let depth = 1;
+    while (common && !together.every(element => common.contains(element))) {
+      common = common.parentElement;
+      depth += 1;
+    }
+    lines.push(common
+      ? 'Holds Save, Email and Employee ID: ' + describeElement(common) + ' · ' + depth + ' levels above Save · ' + count(common, 'input, select, textarea') + ' fields · ' + saves.filter(save => common.contains(save)).length + ' Save buttons'
+      : 'Holds Save, Email and Employee ID: nothing');
+  } else lines.push('Holds Save, Email and Employee ID: not worked out');
+  lines.push('Saved sign #save-status: ' + (doc.getElementById('save-status') ? 'found' : 'not found'));
+  const signs = [...doc.querySelectorAll('[role="status"], [role="alert"], [aria-live], [id*="save" i], [id*="status" i], [id*="toast" i], [id*="alert" i], [id*="message" i], [class*="save" i], [class*="toast" i], [class*="alert" i], [class*="message" i]')]
+    .filter(element => !element.matches('input, select, textarea, option'));
+  lines.push('Possible saved signs: ' + signs.length);
+  for (const sign of signs.slice(0, 15)) lines.push('  ' + describeElement(sign));
+  for (const label of ['Security', 'Authorization', 'Schedule Compliance', 'Assign Period', 'Resource Manager', 'Termination Date', 'Comments 4']) {
+    const found = control(label);
+    if (!found) {
+      lines.push(label + ': not found');
+      continue;
+    }
+    const inside = ['.select2-container', '.twitter-typeahead', '[data-profile-widget]'].filter(selector => found.closest(selector) || found.parentElement?.querySelector(':scope > ' + selector));
+    const tied = ['aria-controls', 'aria-owns', 'aria-autocomplete'].filter(name => found.hasAttribute(name));
+    lines.push(label + ': ' + describeElement(found) + ' · type ' + (found.type || '-') + (found.tagName === 'SELECT' ? ' · ' + found.options.length + ' options' : '')
+      + (tied.length ? ' · has ' + tied.join(' ') : '') + (inside.length ? ' · widget ' + inside.join(' ') : ''));
+    lines.push(label + ' inside: ' + chainOf(found, common));
+  }
+  for (const id of ['new-date', 'new-department', 'new-level', 'new-shift']) {
+    const found = doc.getElementById(id);
+    lines.push('#' + id + ': ' + (found ? found.tagName.toLowerCase() + ' · type ' + (found.type || '-') + ' · placeholder ' + (found.getAttribute('placeholder') ? 'yes, format ' + found.getAttribute('placeholder').replace(/[^/.\-\sdmyDMY]/g, '') : 'no') + ' · pattern ' + (found.hasAttribute('pattern') ? 'yes' : 'no') : 'not found'));
+  }
+  const add = [...doc.querySelectorAll('button, input[type="button"], input[type="submit"]')].filter(button => String(button.textContent || button.value).replace(/\s+/g, ' ').trim().toLowerCase() === 'add');
+  lines.push('Add buttons: ' + add.length + (add[0] ? ' · ' + describeElement(add[0]) : ''));
+  const frames = win.frameElement ? 'this page is itself in a frame' : 'top page';
+  lines.push('Frames inside the page: ' + count(doc, 'iframe') + ' · ' + frames);
+  return lines.slice(0, LAYOUT_LINES);
 }
 __exports.MESSAGES = MESSAGES;
 __exports.connectMySource = connectMySource;
@@ -759,6 +842,7 @@ const { confirmClose, confirmDiscard } = __require("./confirm.js");
 const { TOOL_NAME } = __require("./wording.js");
 const { fileCheck, loadedFilesCheck } = __require("../files/file-check.js");
 const { openReview } = __require("../rules/review.js");
+const { waitingForPage } = __require("../rules/checks.js");
 const { createReportSession } = __require("../files/report-session.js");
 const { ticketMailContext } = __require("../files/run-workbook.js");
 function redact(value) {
@@ -1258,8 +1342,17 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
       onDone: outcome => markDone(item, outcome),
       onSkip: () => skipCase(item),
       onReplan: description => replanCase(item, description),
+      onWaiting: waiting => waitCase(item, waiting),
       pageDescription: state.pageDescriptions.get(item.ticketNumber) || '',
     });
+  }
+  function waitCase(item, waiting) {
+    if (state.selected !== item) return false;
+    const again = waitingForPage(item, waiting);
+    state.cases = state.cases.map(one => (one === item ? again : one));
+    state.trail = state.trail.map(one => (one === item ? again : one));
+    selectCase(again, { keepTrail: true });
+    return true;
   }
   function replanCase(item, description) {
     const { service, profile, dp, roster } = state.read || {};
@@ -1420,6 +1513,8 @@ __exports.startWorklist = startWorklist;
 },
 "rules/review.js": function (__require, __exports, document, window) {
 'use strict';
+const { sundayBefore } = __require("./prepare.js");
+const { FLOW_FIELDS } = __require("./checks.js");
 const { button, caseBox, caseScreen, changeLine, changesSection, dateSensitiveLine, doneRow, element, showChanges, statusLine, textLines } = __require("../screen/case-view.js");
 const { TOOL_NAME } = __require("../screen/wording.js");
 const { caseChanges, personName } = __require("../screen/case-summary.js");
@@ -1434,7 +1529,7 @@ const LOOK_EVERY = 300;
 const SETTLE_TIME = 500;
 const SECOND_LOOK = 2000;
 const READ_AGAIN = 1000;
-function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFinding, wrong = '', onWrong = null, pageHealth = null, onReplan = null, pageDescription = '', scheduleConfirmed = false, onScheduleConfirmed = null }) {
+function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFinding, wrong = '', onWrong = null, pageHealth = null, onReplan = null, onWaiting = null, pageDescription = '', scheduleConfirmed = false, onScheduleConfirmed = null }) {
   const manual = item.status === 'manual' && !item.deadEnd;
   const noAction = item.status === 'no-action';
   const completedDeactivation = isCompletedDeactivation(item);
@@ -1521,6 +1616,8 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
     if (checklist) {
       checklist.hidden = deactivationIsDone();
       checklist.querySelector('input').disabled = !person?.verified;
+      const commentPart = into.querySelector('.deactivation-comment');
+      if (commentPart) commentPart.hidden = deactivationIsDone();
     }
     const comment = into.querySelector('.comment-block');
     comment?.querySelector('.edit-cue')?.remove();
@@ -1710,13 +1807,15 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
     ].join(' | '));
   }
   function replanFrom(reading) {
-    return Boolean(reading.description && person?.verified && onReplan?.(reading.description));
+    if (reading.description && person?.verified && onReplan?.(reading.description)) return true;
+    return Boolean(reading.waiting?.length && person?.verified && onWaiting?.(reading.waiting));
   }
   async function comparePage(isCurrent) {
     if (!comparable) return null;
     const planned = plannedChanges.map(({ field, target, check, anyOf, absentOf }) => ({ field, target, check, ...(anyOf ? { anyOf } : {}), ...(absentOf ? { absentOf } : {}) }));
     const extra = (rules?.fields || []).filter(rule => !plannedChanges.some(change => change.field === rule.field)
-      && !(rules?.costCenterDescription && rule.field === 'Cost Center Description'));
+      && !(rules?.costCenterDescription && rule.field === 'Cost Center Description'))
+      .map(rule => (FLOW_FIELDS.has(rule.field) ? { ...rule, giveReading: true } : rule));
     const rowRule = plannedRow || (rules?.dateSensitive ? { ...rules.dateSensitive, newestRow: true } : null);
     const descriptionRule = rules?.costCenterDescription || null;
     const emailRule = rules?.resourceManagerEmail || null;
@@ -1746,7 +1845,9 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
         planned: values.slice(0, planned.length).map(onPage),
         otherComment: values.slice(0, planned.length).some(value => value?.otherText),
         positions: values.slice(0, planned.length).map(value => (Number.isFinite(value?.position) ? value.position : null)),
-        extra: extra.filter((rule, index) => extraValues[index]?.available && !extraValues[index].matches),
+        extra: extra.filter((rule, index) => !rule.giveReading && extraValues[index]?.available && !extraValues[index].matches),
+        waiting: extra.flatMap((rule, index) => (rule.giveReading && extraValues[index]?.available && !extraValues[index].matches
+          ? [{ field: rule.field, current: extraValues[index].text || 'blank', target: rule.display || rule.target }] : [])),
         commentOnPage: extra.some((rule, index) => rule.field === 'Comment' && rule.contains && onPage(extraValues[index])),
         row: plannedRow ? onPage(rowValue) : false,
         neededRow: !plannedRow && rowValue?.available && !rowValue.matches ? rules.dateSensitive : null,
@@ -1903,7 +2004,7 @@ function liveChecks(item, pageDescription) {
     { field: 'Profile Status', target: 'No' },
     { field: 'Resource Manager', target: 'Not Applicable' },
   );
-  if (!listed.has('Termination Date') && used('Term Date')) fields.push({ field: 'Termination Date', target: used('Term Date'), check: 'termination-date', latest: item.effectiveMonday || '' });
+  if (!listed.has('Termination Date') && used('Term Date')) fields.push({ field: 'Termination Date', target: used('Term Date'), check: 'termination-date', latest: sundayBefore(item.effectiveMonday) });
   return {
     ...rules,
     fields,
@@ -3272,7 +3373,7 @@ function attachAutoPage({mySource,worklist}) {
     const cases=worklist.getBatch().cases;
     results.replaceChildren(...[...state.records].filter(([,r])=>r.state!=='not-run').map(([key,r])=>{
       const item=cases.find(c=>c.key===key),ticket=item?.ticketNumber || key,success=r.state==='done';
-      return element('p',`case-line ${success?'auto-done':'attention'}`,success ? `\u2713 ${ticket} Done` : `\u2717 ${ticket} By hand \u00b7 ${r.reason}`);
+      return element('p',`case-line ${success?'auto-done':'attention'}`,success ? `\u2713 ${ticket} Done` : `\u2717 ${ticket} By hand \u00b7 ${String(r.reason ?? '').replace(`${ticket}: `, '').replace(/^By hand:\s*/i, '').replace(/\/container\.?$|\.$/, '')}`);
     }));
   }
   function close(){run.stop('Operator returned to the worklist; run stopped.');page.hidden=true;for(const [node,value] of hidden)node.hidden=value;hidden=[];worklist.showList();entry.hidden=!worklist.hasBatch();}
@@ -3400,11 +3501,11 @@ function textLines(texts, tone = '') {
 }
 function whatToDoLines(item, steps) {
   const lines = textLines(steps);
-  if (item.status !== 'no-action' || !lines) return lines;
+  if (!lines) return lines;
   for (const line of lines.children) {
-    const text = line.textContent;
-    if (!text.startsWith('Write "No Change" in the ticket\'s Resolution Notes.')) continue;
-    line.replaceChildren('Write "', copyText('No Change', 'Resolution Notes'), text.slice('Write "No Change'.length));
+    const note = /^Write "(No Change|RM is not applicable)" in the ticket's Resolution Notes\./.exec(line.textContent)?.[1];
+    if (!note) continue;
+    line.replaceChildren('Write "', copyText(note, 'Resolution Notes'), line.textContent.slice(`Write "${note}`.length));
   }
   return lines;
 }
@@ -3630,6 +3731,8 @@ function caseScreen(item, { done, changes, box, note, onNote, wrong = '', onWron
   number.append(item.ticketNumber ? copyText(item.ticketNumber, 'case number') : 'No number');
   const tag = statusTag(item, done, outcome);
   head.append(number, element('span', `badge ${tag.key}`, tag.label));
+  const dateNote = (item.notes || []).find(one => one.dateRead);
+  if (dateNote) number.after(noteFlag([dateNote.text]));
   const meta = element('p', 'case-meta');
   meta.append(item.email ? copyText(item.email, 'email') : 'No email');
   if (item.employeeId) meta.append(` · Employee ID ${item.employeeId}`);
@@ -3640,10 +3743,9 @@ function caseScreen(item, { done, changes, box, note, onNote, wrong = '', onWron
   const comment = item.comment ? copyText(item.comment, 'comment') : null;
   comment?.classList.add('comment-block');
   const deactivating = item.specialCase === 'deactivation';
-  let commentContent = comment;
+  let schedule = null;
   if (deactivating && comment) {
-    const list = element('ul', 'deactivation-steps');
-    const schedule = element('li', 'case-line schedule-step');
+    schedule = element('p', 'case-line schedule-step deactivation-checklist');
     const label = element('label');
     const tick = element('input');
     tick.type = 'checkbox';
@@ -3652,15 +3754,12 @@ function caseScreen(item, { done, changes, box, note, onNote, wrong = '', onWron
     tick.addEventListener('change', () => onScheduleConfirmed?.(tick.checked));
     label.append(tick, ` ${deactivationSchedule(item.effectiveMonday)}`);
     schedule.append(label);
-    const commentStep = element('li', 'case-line deactivation-comment');
-    commentStep.append('Add in Comments 4: ', comment);
-    list.append(schedule, commentStep);
-    commentContent = list;
+    reasons?.querySelector('.case-label')?.after(schedule);
   }
-  const commentSection = caseSection(deactivating ? 'Deactivation checklist' : 'Comment to add', commentContent);
-  if (!deactivating) commentSection?.querySelector('.case-label').append(' ', element('span', 'hint', '(in Comments 4)'));
+  const commentSection = caseSection('Comment to add', comment);
+  commentSection?.querySelector('.case-label').append(' ', element('span', 'hint', '(in Comments 4)'));
   commentSection?.classList.add('comment-to-add', 'comment-waiting');
-  if (deactivating) commentSection?.classList.add('deactivation-checklist');
+  if (deactivating) commentSection?.classList.add('deactivation-comment');
   const identity = element('div', 'case-identity');
   const name = element('h3', 'case-name');
   const who = personName(item);
@@ -3729,6 +3828,19 @@ function endPoint(item) {
 }
 const LATER_HEADINGS = ['Date to come', 'Waiting for MySource'];
 const laterHeading = item => (item.status === 'later' ? LATER_HEADINGS[0] : LATER_HEADINGS[1]);
+const RM_NOT_APPLICABLE_NOTE = 'RM is not applicable';
+const NO_ONE_DP = new Set(['no-row', 'several', 'blank', 'no-sheet']);
+const rmNotApplicable = item => !item.deadEnd && (item.specialCase === 'deactivation' || Boolean(item.noResourceManager)
+  || normalizeResourceManager(item) || NO_ONE_DP.has(item.dp?.status));
+const normalizeResourceManager = item => (item.pageChecks?.fields || item.changes || []).some(change => change.field === 'Resource Manager' && /^not applicable$/i.test(String(change.target ?? '').trim()));
+function resolutionNote(item) {
+  if (item.deadEnd) return 'No Change';
+  if (endPoint(item) === 'later') return '';
+  if (rmNotApplicable(item)) return RM_NOT_APPLICABLE_NOTE;
+  return endPoint(item) === 'no-action' ? 'No Change' : '';
+}
+const NO_CHANGE_STEP = 'Write "No Change" in the ticket\'s Resolution Notes.';
+const resolutionStep = item => (resolutionNote(item) ? `Write "${resolutionNote(item)}" in the ticket's Resolution Notes.` : '');
 function endPointDetail(item) {
   if (item.deadEnd) return 'Dead end';
   const end = endPoint(item);
@@ -3759,17 +3871,16 @@ function differences(item) {
   return item.notes.filter(note => note.field && !note.expected).map(noteText);
 }
 function nextStep(item) {
-  if (item.deadEnd) {
-    const why = item.notes.map(noteText).filter(Boolean).join(' · ') || item.whatToDo || 'No supported profile work';
-    return `Dead end: ${why.replace(/^[✓\s]+/, '')} → nothing to do in MySource`;
-  }
+  if (item.deadEnd) return item.whatToDo && item.whatToDo !== 'Nothing to do.' ? item.whatToDo : 'Nothing to do in MySource.';
   if (item.specialCase === 'deactivation') return `${item.whatToDo} Confirm the schedule step: ${deactivationSchedule(item.effectiveMonday)} Add in Comments 4: ${item.comment}`;
   return item.cannotPlan ? CANNOT_PLAN_STEP : item.whatToDo;
 }
 function whatToDo(item) {
   if (item.pendingCostCenterDescription) return nextStep(item);
-  if (item.specialCase === 'deactivation') return item.whatToDo;
-  return item.status === 'ready' && item.specialCase !== 'deactivation' ? '' : nextStep(item);
+  const steps = item.specialCase === 'deactivation' ? item.whatToDo : item.status === 'ready' ? '' : nextStep(item);
+  const note = resolutionStep(item);
+  if (!note || steps.includes(note)) return steps;
+  return steps === NO_CHANGE_STEP ? note : [steps, note].filter(Boolean).join(STEP_BREAK);
 }
 function caseChanges(item) {
   if (item.pendingCostCenterDescription) return { title: 'Changes to make', informationOnly: false, changes: [], dateSensitive: null, dateNote: dateNote(item) };
@@ -3839,7 +3950,7 @@ function howDecided(item) {
   const plain = !caseHeading(item) && item.status !== 'later' && !item.deadEnd;
   const why = topSaysIt || (plain && !said.length) ? [] : [
     item.status === 'later' ? `${END_POINTS.later} · ${LATER_HEADINGS[0]} (${item.effectiveMonday || 'the effective date'})`
-      : item.deadEnd ? `${END_POINTS['by-hand']} · Dead end: nothing to do in MySource` : PLAIN_WHY[endPoint(item)],
+      : item.deadEnd ? `Dead end: ${String(noteText(item.notes[0])).split(' · ')[0].split(' → ')[0].replace(/^[✓\s]+/, '')}` : PLAIN_WHY[endPoint(item)],
     ...said,
   ];
   const explained = dpExplanation(item.dp);
@@ -3883,6 +3994,9 @@ __exports.END_POINTS = END_POINTS;
 __exports.endPoint = endPoint;
 __exports.LATER_HEADINGS = LATER_HEADINGS;
 __exports.laterHeading = laterHeading;
+__exports.rmNotApplicable = rmNotApplicable;
+__exports.resolutionNote = resolutionNote;
+__exports.resolutionStep = resolutionStep;
 __exports.endPointDetail = endPointDetail;
 __exports.statusTag = statusTag;
 __exports.manualReasons = manualReasons;
@@ -3995,57 +4109,59 @@ __exports.downloadBlob = downloadBlob;
 "files/run-workbook.js": function (__require, __exports, document, window) {
 'use strict';
 const { worklistRows } = __require("./export.js");
-const { endPoint } = __require("../screen/case-summary.js");
+const { endPoint, resolutionNote, rmNotApplicable } = __require("../screen/case-summary.js");
+const { descriptionToText } = __require("../rules.js");
 const { DEACTIVATED_ALREADY } = __require("../rules/gates.js");
 const { xlsxBytes } = __require("./xlsx-writer.js");
 const person = item => item.rosterName || item.profileName || item.subjectPerson || '';
+const mailDp = item => ((item.deadEnd ? item.mailDp : item.dp)?.status === 'matched' ? (item.deadEnd ? item.mailDp : item.dp) : null);
+const firstName = name => (String(name ?? '').includes(',') ? String(name).split(',')[1] : String(name ?? '')).trim().split(/\s+/)[0] || '';
 const mailEligible = (item, record) => record?.state === 'done'
   && (record.manual || record.mailConfirmed)
   && endPoint(item) !== 'no-action' && item.specialCase !== 'deactivation'
+  && !rmNotApplicable(item) && !(item.deadEnd && !mailDp(item))
   && !(item.notes || []).some(note => note.text?.startsWith(DEACTIVATED_ALREADY));
 function runMail(item, record, context = {}, signOff = '') {
   if (!mailEligible(item, record)) return null;
-  const to = item.dp?.status === 'matched' ? item.dp.email || '' : '';
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to) || !signOff.trim() || !person(item) || !item.ticketNumber) return null;
+  const dp = mailDp(item);
+  const to = dp?.email || '';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to) || !signOff.trim() || !person(item) || !item.ticketNumber || !firstName(dp.name)) return null;
   let body;
-  if (context.newProfile) {
+  if (context.newProfile && !item.deadEnd) {
     if (!context.source || !context.destination) return null;
     body = `The profile has been created in ${context.destination}, following the transfer from ${context.source}. The ${context.source} profile will be deactivated after the transfer effective date.\n\nPlease let us know if anything changes.`;
   } else {
     if (!context.notificationText) return null;
     body = `${context.notificationText}\n\nThe changes are now reflected in MySource. Please let us know if you have any concerns.`;
   }
-  return { to, subject: `${item.ticketNumber} Deployment RMIS Request - System Updates for ${person(item)}`,
-    body: `Hi Deployment Professional,\n\n${body}\n\nBest regards,\n${signOff}` };
+  return { to, subject: `${item.ticketNumber} - Deployment RMIS Request - System Updates for ${person(item)}`,
+    body: `Hi ${firstName(dp.name)},\n\n${body}\n\nBest regards,\n${signOff}` };
 }
 function ticketMailContext(ticket) {
-  const description = String(ticket?.Description ?? '');
-  const source = /^Operating Model:[ \t]*(.*)$/m.exec(description)?.[1].replace(/\r$/, '') || '';
-  const destination = /^Future Operating Model:[ \t]*(.*)$/m.exec(description)?.[1].replace(/\r$/, '') || '';
+  const description = descriptionToText(String(ticket?.Description ?? '')).trim();
+  const source = /^Operating Model:[ \t]*(.*)$/m.exec(description)?.[1].trim() || '';
+  const destination = /^Future Operating Model:[ \t]*(.*)$/m.exec(description)?.[1].trim() || '';
   return { notificationText: description, source, destination,
     newProfile: Boolean(source && destination && source.replace(/^\d+\s*-\s*/, '').trim().toLowerCase() !== destination.replace(/^\d+\s*-\s*/, '').trim().toLowerCase()) };
 }
 function runSheets({ cases, results = new Map(), contexts = new Map(), signOff = '', done = null, outcomes = new Map(), ...worklist }) {
   const marks = done || new Set(cases.filter(item => { const record=results.get(item.key); return record?.state==='done' && (record.manual || record.confirmed); }).map(item=>item.key));
-  const summary = [['Ticket','Person','Result','Mail recipient','Mail details']];
-  const mails = [['Ticket','To','Subject','Mail']];
-  const batch = [['Ticket','Person','Email','Result','What was done','Resolution notes','Reason']];
-  const attention = [['Ticket','Person','Result','Reason']];
+  const summary = [['Ticket','Person','Email','Result','What was done','Resolution note','Needs attention']];
+  const mails = [['Ticket','To','Subject','Mail','Resolution note']];
   for (const item of cases) {
     const record = done?.has(item.key) ? { ...results.get(item.key), state:'done', manual:true, outcome:outcomes.get(item.key) || '' } : (done && results.get(item.key)?.state==='done' ? {state:'not-run',reason:'Reopened; not Done.'} : results.get(item.key)) || { state: 'not-run', reason: item.manualReasons?.join('; ') || 'Not run' };
     const proved = record.state === 'done' && record.confirmed;
     const result = record.state === 'done' ? record.manual ? `Done${record.outcome ? ` (${record.outcome})` : ''}` : proved ? 'Done' : 'Unproved Done' : record.state === 'by-hand' ? 'By hand' : record.state;
     const mail = runMail(item, record, contexts.get(item.key), signOff);
     const missing = mailEligible(item, record) && !mail
-      ? 'Mail not made: check Deployment Professional Resource Manager email, ticket notification, source/destination and sign-off.' : '';
+      ? 'Mail not made: check Deployment Professional email, ticket notification, source/destination and sign-off.' : '';
     const reason = [record.reason, missing].filter(Boolean).join('; ');
-    summary.push([item.ticketNumber,person(item),result,mail?.to || '',mail?.body || missing]);
-    if (mailEligible(item, record)) mails.push([item.ticketNumber,mail?.to || '',mail?.subject || '',mail?.body || '']);
-    batch.push([item.ticketNumber,person(item),item.email,result,record.what || '',
-      record.state === 'done' && endPoint(item) === 'no-action' ? 'No Change' : record.resolution || '',reason]);
-    if ((!proved && !record.manual) || reason || record.outcome) attention.push([item.ticketNumber,person(item),result,reason || record.outcome || 'No proved outcome']);
+    const note = record.state === 'done' ? resolutionNote(item) || record.resolution || '' : record.resolution || '';
+    const attention = (!proved && !record.manual) || reason || record.outcome ? reason || record.outcome || 'No proved outcome' : '';
+    summary.push([item.ticketNumber,person(item),item.email,result,record.what || '',note,attention]);
+    if (mailEligible(item, record) || (record.state === 'done' && note)) mails.push([item.ticketNumber,mail?.to || '',mail?.subject || '',mail?.body || '',note]);
   }
-  return [{ name:'Summary',rows:summary }, { name:'Mails',rows:mails }, { name:'Batch',rows:batch }, { name:'Needs attention',rows:attention }, { name:'Worklist',rows:worklistRows({cases,done:marks,outcomes,...worklist}) }];
+  return [{ name:'Cases',rows:summary }, { name:'Mails',rows:mails }, { name:'Worklist',rows:worklistRows({cases,done:marks,outcomes,...worklist}) }];
 }
 const runWorkbook = batch => xlsxBytes(runSheets(batch));
 function downloadRunWorkbook(batch, download) {
@@ -4296,11 +4412,12 @@ const { plainTicketNote, ticketSaysNoDate, TWO_WAYS, UNUSED_TICKET_LINE } = __re
 const MAPPING_COLUMNS = [...DP_MAPPING_KEY, ...DP_MAPPING_QUALIFIERS].filter(field => field !== 'Level1');
 const rosterEmployeeId = roster => (roster?.employeeId && roster.employeeId.length >= 6 ? roster.employeeId : '');
 const rosterFlag = (field, ticketValue, rosterValue) => ({ text: `${field}: ticket "${ticketValue}" · roster "${rosterValue}" → the roster's is used`, aside: true });
+const DATE_WAS_READ = /^⚠ Effective date ".*" read as /;
 function ticketNoteList(texts) {
   const shown = texts.filter(Boolean);
   const unused = shown.filter(text => text.startsWith(UNUSED_TICKET_LINE)).map(text => text.slice(UNUSED_TICKET_LINE.length));
   return [
-    ...shown.filter(text => !text.startsWith(UNUSED_TICKET_LINE)).map(text => ({ text })),
+    ...shown.filter(text => !text.startsWith(UNUSED_TICKET_LINE)).map(text => (DATE_WAS_READ.test(text) ? { text, aside: true, dateRead: true } : { text })),
     ...(unused.length ? [{ text: `Ticket lines not used: ${unused.join(', ')}`, aside: true }] : []),
   ];
 }
@@ -4722,6 +4839,7 @@ __exports.pageTicketValues = pageTicketValues;
 const { containsAuditOrTax, extractLevelCode, isAwaitingEffectiveDate, meaningfulFutureFields, normalizeText, profileKind, withoutLeadingCode } = __require("../rules.js");
 const { BLOCKED_HEADCOUNT, CLOSING_BUSINESS_AREA, UNSUPPORTED_BUSINESS_AREAS, DATE_SENSITIVE_LEVEL_OPTIONS, deactivationComment, deactivationSteps, GPS_NATIONAL_OFFICE, IGNORED_TICKET_FIELDS, mySourceName, NO_RESOURCE_MANAGER, OPEN_TERMINATION_DATE, PROFILE_NOT_FOUND_STEPS, reactivationSteps, ROSTER_SHOULD_SHOW, TICKET_FIELD_CHECKS } = __require("./mappings.js");
 const { emailCandidates, emailIndex, emailKey, exactEmployeeId, findByEmail, onOrBefore, plainEmail, readDay, sameDay, sameValue } = __require("./prepare.js");
+const { sundayBefore } = __require("./prepare.js");
 const { STEP_BREAK, ticketSaysNoDate } = __require("../screen/wording.js");
 const { levelMatches } = __require("./dp-mapping.js");
 const { auditAssuranceArea, baseRecord, correction, ticketNoteList, dateSensitiveTarget, deadEnd, filled, groupsByEmail, idWithOne, inProductDepartment, inXTermDepartment, isArea, isClosingBusinessArea, isConsultingServices, isDeactivatedProfile, isInactive, isProductSubGroup, KIND, manualRecord, moving, namesConsulting, NO_CHECKS, returnMappingValues, rosterEmployeeId, rosterFlag, shown, trimmed, unsupportedBusiness, waitUntil } = __require("./facts.js");
@@ -4832,7 +4950,7 @@ function sortTicket(row, parsed, key, { ticketGroups, profiles, profileUnclear =
     if (intoConsulting) {
       if (kindOf(facts.profile, inRoster) === 'unknown') return { ...manualRecord(base, 'gps-indicator-unknown', unknownIndicator(inRoster)), used: usedFrom(facts) };
       const found = returnFoundLive({ ...base, region: rosterRegion(inRoster), rosterEmployeeId: rosterEmployeeId(inRoster), rosterLevel: inRoster?.level || '', ...(unsupported.pendingCostCenterDescription ? { pendingCostCenterDescription: true } : {}), ...(unsupported.checkCostCenterDescription ? { checkCostCenterDescription: true, watchCostCenterDescription: true } : {}) }, parsed, kindOf(facts.profile, inRoster), returnMappingValues(facts, inRoster));
-      const fromTax = [business.now, facts.fields['Business Area'].now].some(value => /\btax\b/.test(normalizeText(value)));
+      const fromTax = comesFromTax(facts);
       return { ...found, ...(fromTax ? { whatToDo: `${FROM_TAX_NOTE}${STEP_BREAK}${found.whatToDo}` } : {}), used: usedFrom(facts) };
     }
     return { ...manualRecord(base, 'no-profile', '✗ Profile not on MySource', PROFILE_NOT_FOUND_STEPS), used: usedFrom(facts) };
@@ -4848,6 +4966,7 @@ function rosterById(byEmail) {
 }
 const unknownIndicator = roster => `✗ GPS Indicator (roster) "${trimmed(roster?.values['GPS Indicator'])}" is not GPS, GPS India or Commercial → the grade table's column is unclear`;
 const FROM_TAX_NOTE = '⚠ Coming from Tax → check their profile in the Tax MySource is deactivated before creating one here';
+const comesFromTax = facts => [facts.fields['Operating Model'].now, facts.fields['Business Area'].now].some(value => /\btax\b/.test(normalizeText(value)));
 function returnFoundLive(base, ticket, kind = 'cs', mappingValues = null) {
   const manual = manualRecord(base, 'reactivation', '', reactivationSteps(base.effectiveMonday, false));
   const record = {
@@ -4973,11 +5092,11 @@ function closingArea({ fields, profile, roster, pageDescription = '' }) {
   const description = fromPage || fromRoster || withoutLeadingCode(ticketCostCenter).trim();
   const where = into ? `Business Area → ${CLOSING_BUSINESS_AREA}` : `Business Area: ${CLOSING_BUSINESS_AREA} (no change)`;
   if (!filled(description)) {
-    return { where: `${where} (only ${BLOCKED_HEADCOUNT} is supported there)`, checkPage: `${where} · no Cost Center description on the ticket${roster ? ' or the roster' : ''} → ⚠ the page check reads it: not ${BLOCKED_HEADCOUNT} → deactivate instead`, ...(rosterNumberOnly ? { pendingCostCenterDescription: true, checkCostCenterDescription: true } : {}) };
+    return { where, checkPage: `${where} · no Cost Center description on the ticket${roster ? ' or the roster' : ''} → ⚠ the page check reads it: not ${BLOCKED_HEADCOUNT} → deactivate instead`, ...(rosterNumberOnly ? { pendingCostCenterDescription: true, checkCostCenterDescription: true } : {}) };
   }
   const readOnPage = fromPage ? { checkCostCenterDescription: true } : {};
   if (normalizeText(description).includes(normalizeText(BLOCKED_HEADCOUNT))) return { blockedHeadcount: true, ...readOnPage };
-  return { deactivate: `${where} · ${fromPage ? 'Cost Center Description on the page' : `Cost Center ${costCenter}${fromRoster ? ' (roster)' : ''}`} (only ${BLOCKED_HEADCOUNT} is supported there)`, ...readOnPage };
+  return { deactivate: `${where} · ${fromPage ? 'Cost Center Description on the page' : `Cost Center ${costCenter}${fromRoster ? ' (roster)' : ''}`}`, ...readOnPage };
 }
 function gpsNationalOffice({ fields, profile, inExport }) {
   const words = value => normalizeText(value);
@@ -5078,7 +5197,7 @@ function deactivationCase(base, profile, deactivated, why) {
   const { ticketNotes, noDateStated, ...record } = base;
   const termDate = profile['Term Date'];
   const leftByThen = Boolean(readDay(termDate)) && !sameDay(termDate, OPEN_TERMINATION_DATE)
-    && (!base.effectiveMonday || onOrBefore(termDate, base.effectiveMonday));
+    && (!base.effectiveMonday || onOrBefore(termDate, sundayBefore(base.effectiveMonday)));
   const done = !deactivated ? (idWithOne(profile) ? ['Employee ID'] : []) : [
     ...(!filled(profile.Email) ? ['Email'] : []),
     ...(idWithOne(profile) ? ['Employee ID'] : []),
@@ -5231,6 +5350,8 @@ __exports.olderTicket = olderTicket;
 __exports.rosterSays = rosterSays;
 __exports.sortTicket = sortTicket;
 __exports.rosterById = rosterById;
+__exports.FROM_TAX_NOTE = FROM_TAX_NOTE;
+__exports.comesFromTax = comesFromTax;
 __exports.returnFoundLive = returnFoundLive;
 __exports.returnRowNote = returnRowNote;
 __exports.businessMove = businessMove;
@@ -5261,11 +5382,13 @@ __exports.takenIn = takenIn;
 'use strict';
 const { compareText, extractLevelCode, normalizeText } = __require("../rules.js");
 const { ASSIGN_PERIOD, BLOCKED_HEADCOUNT, BLOCKED_HEADCOUNT_RESOURCE_MANAGER, SITUATION_CHECKS, DEACTIVATION_COMMENT_WORDS, REMOVE_DEACTIVATION_AND_PRODUCT_COMMENT, REMOVE_DEACTIVATION_COMMENT, REMOVE_PRODUCT_COMMENT, situationOf, DATE_SENSITIVE_LEVEL_OPTIONS, DP_MAPPING_SHEETS, GRADES, INFORMATION_ONLY_REASONS, INTERN, NO_RESOURCE_MANAGER, OLD_PRODUCT_COMMENT, OPEN_TERMINATION_DATE, PRODUCT_COMMENT, PRODUCT_DEPARTMENT, PROFILE_VALUES, reactivationSteps, SCHEDULE_NO_LEVELS, X_TERM_DEPARTMENT } = __require("./mappings.js");
-const { sameDay, TICKET_CUT_LENGTH, usDateOf } = __require("./prepare.js");
+const { sameDay, sundayBefore, TICKET_CUT_LENGTH, usDateOf } = __require("./prepare.js");
 const { findResourceManager } = __require("./dp-mapping.js");
 const { correction, dateSensitiveTarget, EMPLOYEE_ID_BY_HAND, isProductSubGroup, EMPLOYEE_ID_WITH_ONE_BY_HAND, filled, idWithOne, inConsultingDepartment, inProductDepartment, isDeactivatedProfile, isInactive, KIND, NOT_UPDATED_STEP, notMatched, returnMappingValues, ROSTER_NOT_UPDATED_STEP, rosterEmployeeId, trimmed, waitUntil } = __require("./facts.js");
 const { pageTicketValues } = __require("./collate.js");
 const { returnRowNote } = __require("./gates.js");
+const { comesFromTax, DEACTIVATED_ALREADY, FROM_TAX_NOTE } = __require("./gates.js");
+const { STEP_BREAK } = __require("../screen/wording.js");
 function shouldShowFor(level, kind, intern) {
   const grade = GRADES[level]?.[kind];
   return {
@@ -5317,6 +5440,7 @@ function checkCase(facts, { base, move, unsupported, product, kind, kindNote = '
     notes.push({ text: returnWaiting
       ? `↩ A return${from} · active in MySource ✓ → waiting for it to take in the ticket`
       : `↩ A return${from} · active in MySource ✓${returnRow ? ' → Date Sensitive row to 110 - Consulting Services' : ''}` });
+    if (comesFromTax(facts)) notes.unshift({ text: FROM_TAX_NOTE });
   }
   const needsDateSensitiveRow = productRow || returnRow;
   profileChecked += 1;
@@ -5392,7 +5516,7 @@ function applySpecialCase(result, facts, product, unsupported, move) {
       returnRow: !inConsultingDepartment(profile),
       productToo: [profile['Talent Sub Group'], result.mappingValues?.['Talent Sub Group'], facts.roster?.values['Talent Sub Group']].some(isProductSubGroup),
     };
-    return specialManual(record, 'reactivation', [...notes, ...returnRowNote(record)], reactivationSteps(result.effectiveMonday));
+    return specialManual(record, 'reactivation', [...notes, ...returnRowNote(record)], `${comesFromTax(facts) ? `${FROM_TAX_NOTE}${STEP_BREAK}` : ''}${reactivationSteps(result.effectiveMonday)}`);
   }
   if (unsupported.blockedHeadcount) result = { ...result, blockedHeadcount: true };
   if (unsupported.checkPage) {
@@ -5434,7 +5558,9 @@ function addDpAssignments(results, mapping) {
     const unlooked = extra => ({ ...item, ...extra });
     if (notMatched(item)) return unlooked({ dp: NOT_USED });
     if (item.noResourceManager || item.dpNotUsed) {
-      return unlooked({ dp: NOT_USED, checks: item.noResourceManager ? withResourceManagerCheck(item, NO_RESOURCE_MANAGER) : item.checks });
+      const mailDp = item.deadEnd && !(item.notes || []).some(note => note.text?.startsWith(DEACTIVATED_ALREADY))
+        ? findResourceManager(mapping, { region: item.region, values: item.mappingValues || {}, level: item.newLevel || extractLevelCode(item.currentLevel) }) : null;
+      return unlooked({ dp: NOT_USED, ...(mailDp ? { mailDp } : {}), checks: item.noResourceManager ? withResourceManagerCheck(item, NO_RESOURCE_MANAGER) : item.checks });
     }
     if (item.sorted === 'later' || (item.manualReasons || []).includes('not-updated')) return unlooked({ dp: { ...NOT_USED, status: 'not_yet' } });
     if (item.blockedHeadcount) {
@@ -5469,7 +5595,7 @@ function mappingSummary(found, item) {
   if (found.status === 'no-row') return [`${sheet}: no row fits → ${NO_RESOURCE_MANAGER}.`, ...nearestLines(trail.nearest)].join(DP_LINE_BREAK);
   const start = `${sheet}: ${rows(trail.rows)} fit${trail.rows.length === 1 ? 's' : ''} (${listed(trail.managers.map(name => name || 'blank'))})`;
   const by = trail.fieldsUsed.map(field => (field === 'Level1' ? `Level1 (${item.newLevel})` : field));
-  const order = by.length ? `; named first in the training's order: ${listed(by)}, leaving ${rows(trail.decidingRows)}` : '';
+  const order = by.length ? `; named first in the set order: ${listed(by)}, leaving ${rows(trail.decidingRows)}` : '';
   if (found.status === 'matched' && trail.unnamedRows?.length) {
     return `${start}${order}; ${rows(trail.unnamedRows)} ${trail.unnamedRows.length === 1 ? 'names' : 'name'} no one, so ${rows(trail.decidingRows)} → ${found.name}.`;
   }
@@ -5483,7 +5609,7 @@ function mappingSummary(found, item) {
   }
   return by.length
     ? `${start}${order.replace(/, leaving .*$/, '')}; the rows left still give different DPs (${listed(trail.managersLeft)}).`
-    : `${start}; nothing in the training's order tells them apart.`;
+    : `${start}; nothing in the set order tells them apart.`;
 }
 const withOutcome = (status, summary) => {
   if (['matched', 'fixed', 'no-row'].includes(status)) return summary;
@@ -5589,20 +5715,19 @@ function newDateSensitiveRow(item, planNotes, asOfDate) {
     planNotes.push({ text: `✗ No Date Sensitive Level option for ${targetLevel} → add the row by hand`, blocks: 'level' });
     return null;
   }
-  const effectiveDate = item.effectiveMonday || dateOfThisWeeksMonday(item, planNotes, asOfDate);
+  const effectiveDate = sundayBefore(item.effectiveMonday) || dateOfThisWeeksSunday(item, planNotes, asOfDate);
   if (!effectiveDate) return null;
   return dateSensitiveTarget(item, targetLevel, effectiveDate);
 }
-function dateOfThisWeeksMonday(item, planNotes, asOfDate) {
+function dateOfThisWeeksSunday(item, planNotes, asOfDate) {
   if (item.unreadableDate || item.twoWaysDate) return '';
   if (item.ticketEffectiveDate || !item.ticketAgreesWithProfile) {
     planNotes.push({ text: '✗ The effective date could not be worked out from the ticket → check the ticket, then add the Date Sensitive row by hand', blocks: 'date' });
     return '';
   }
-  const monday = new Date(asOfDate.getFullYear(), asOfDate.getMonth(), asOfDate.getDate() - asOfDate.getDay() + 1);
-  const date = usDateOf(monday);
+  const date = usDateOf(new Date(asOfDate.getFullYear(), asOfDate.getMonth(), asOfDate.getDate() - asOfDate.getDay()));
   planNotes.push({
-    text: `⚠ No effective date, and the profile already shows the change → the row starts this week's Monday, ${date}: check it against the ticket`,
+    text: `⚠ No effective date, and the profile already shows the change → the row starts this week's Sunday, ${date}: check it against the ticket`,
     answersTheMissingDate: true,
   });
   return date;
@@ -5615,7 +5740,7 @@ function informationFor(item, asOfDate, ordinaryPlan) {
   return changesFor(source, [], asOfDate);
 }
 function deactivationChecklist(item) {
-  const monday = item.effectiveMonday;
+  const sunday = sundayBefore(item.effectiveMonday);
   const levelOption = DATE_SENSITIVE_LEVEL_OPTIONS[extractLevelCode(item.currentLevel)];
   const done = new Set(item.stepsDone || []);
   return {
@@ -5625,10 +5750,10 @@ function deactivationChecklist(item) {
         : { field: 'Employee ID', current: '', target: EMPLOYEE_ID_WITH_ONE_BY_HAND, check: 'with-one' },
       { field: 'Profile Status', current: item.currentStatus || 'Yes', target: 'No' },
       { field: 'Resource Manager', current: item.currentResourceManager || '', target: NO_RESOURCE_MANAGER },
-      ...(monday ? [{ field: 'Termination Date', current: item.currentTermDate || '', target: monday }] : []),
+      ...(sunday ? [{ field: 'Termination Date', current: item.currentTermDate || '', target: sunday }] : []),
     ].filter(change => !done.has(change.field) && SITUATION_CHECKS.deactivation.includes(change.field)),
-    dateSensitiveRow: monday && levelOption && !done.has('Date Sensitive row')
-      ? { effectiveDate: monday, department: X_TERM_DEPARTMENT, level: levelOption, requiredExistingShift: '' }
+    dateSensitiveRow: sunday && levelOption && !done.has('Date Sensitive row')
+      ? { effectiveDate: sunday, department: X_TERM_DEPARTMENT, level: levelOption, requiredExistingShift: '' }
       : null,
   };
 }
@@ -5655,7 +5780,7 @@ function returnChecklist(item) {
       ...[resourceManagerChange(item, [])].filter(Boolean),
       commentRemoval(item.productToo ? REMOVE_DEACTIVATION_AND_PRODUCT_COMMENT : REMOVE_DEACTIVATION_COMMENT, [DEACTIVATION_COMMENT_WORDS, OLD_PRODUCT_COMMENT, PRODUCT_COMMENT]),
     ].filter(change => SITUATION_CHECKS.reactivation.includes(change.field)),
-    dateSensitiveRow: item.returnRow ? dateSensitiveTarget({}, item.newLevel, item.effectiveMonday) : null,
+    dateSensitiveRow: item.returnRow ? dateSensitiveTarget({}, item.newLevel, sundayBefore(item.effectiveMonday)) : null,
   };
 }
 function pageChecksFor(item, asOfDate, levelGroups = {}) {
@@ -5698,13 +5823,29 @@ function pageChecksFor(item, asOfDate, levelGroups = {}) {
   if (item.email && SITUATION_CHECKS[situationOf(item)].includes('Email')) fields.push({ field: 'Email', target: item.email, quiet: true });
   fields.push(...(item.pageTicketValues || []));
   fields.push(...everythingElse(item, levelGroups));
-  const dateSensitive = dateSensitiveTarget(item, item.newLevel, item.effectiveMonday || 'not stated in the ticket');
+  const dateSensitive = dateSensitiveTarget(item, item.newLevel, sundayBefore(item.effectiveMonday) || 'not stated in the ticket');
   const checks = { fields, dateSensitive };
   if (item.checkCostCenterDescription) checks.costCenterDescription = BLOCKED_HEADCOUNT;
   if (manager && item.dp?.status === 'matched' && item.dp.email) checks.resourceManagerEmail = item.dp.email;
   return checks;
 }
 const EXPORT_ON_THE_PAGE = ['Practice', 'Job Family', 'Job Sub Family', 'Talent Model', 'People Leader', 'Major/Minor', 'Primary Industry'];
+const FLOW_FIELDS = new Set(['Position Title', 'Cost Center Description', 'Level Group', 'Current Intern', 'Region', ...EXPORT_ON_THE_PAGE]);
+function waitingForPage(item, waiting) {
+  return {
+    ...item,
+    status: 'manual',
+    sorted: 'manual',
+    cannotPlan: false,
+    manualReasons: ['not-updated'],
+    changes: [],
+    corrections: [],
+    dateSensitiveRow: null,
+    comment: '',
+    whatToDo: NOT_UPDATED_STEP,
+    notes: [...(item.notes || []), ...waiting.map(({ field, current, target }) => ({ field, current, target, notUpdated: true }))],
+  };
+}
 function everythingElse(item, levelGroups) {
   const level = item.newLevel;
   const values = item.mappingValues || {};
@@ -5762,13 +5903,15 @@ __exports.commentRemoval = commentRemoval;
 __exports.changesFor = changesFor;
 __exports.resourceManagerChange = resourceManagerChange;
 __exports.newDateSensitiveRow = newDateSensitiveRow;
-__exports.dateOfThisWeeksMonday = dateOfThisWeeksMonday;
+__exports.dateOfThisWeeksSunday = dateOfThisWeeksSunday;
 __exports.informationFor = informationFor;
 __exports.deactivationChecklist = deactivationChecklist;
 __exports.returnLevelValues = returnLevelValues;
 __exports.returnChecklist = returnChecklist;
 __exports.pageChecksFor = pageChecksFor;
 __exports.EXPORT_ON_THE_PAGE = EXPORT_ON_THE_PAGE;
+__exports.FLOW_FIELDS = FLOW_FIELDS;
+__exports.waitingForPage = waitingForPage;
 __exports.everythingElse = everythingElse;
 __exports.costCenterDescriptionCheck = costCenterDescriptionCheck;
 __exports.commentCheck = commentCheck;
@@ -5857,6 +6000,10 @@ const fullYear = day => (day.short ? 2000 + day.year : day.year);
 const usDate = (year, month, date) => `${String(month).padStart(2, '0')}/${String(date).padStart(2, '0')}/${year}`;
 const usDateOf = (when, utc = false) => (utc ? usDate(when.getUTCFullYear(), when.getUTCMonth() + 1, when.getUTCDate())
   : usDate(when.getFullYear(), when.getMonth() + 1, when.getDate()));
+function sundayBefore(monday) {
+  const found = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(String(monday ?? ''));
+  return found ? usDateOf(new Date(Date.UTC(Number(found[3]), Number(found[1]) - 1, Number(found[2]) - 1)), true) : '';
+}
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const dayAndMonth = (date, month) => (MONTH_NAMES[month - 1] ? `${date} ${MONTH_NAMES[month - 1]}` : '');
 function sameDay(value, target) {
@@ -5917,6 +6064,7 @@ __exports.readDay = readDay;
 __exports.fullYear = fullYear;
 __exports.usDate = usDate;
 __exports.usDateOf = usDateOf;
+__exports.sundayBefore = sundayBefore;
 __exports.dayAndMonth = dayAndMonth;
 __exports.sameDay = sameDay;
 __exports.onOrBefore = onOrBefore;
@@ -6100,7 +6248,7 @@ const OLD_PRODUCT_COMMENT = "Product Professionals will be placed in 'Department
   + "Deployment' and no Resource Manager aligned. Please do not change profile attributes.";
 const PRODUCT_COMMENT = '*DSS*-Product Professionals will be placed in “Department = 400 – Other Non '
   + 'Deployment” and no Resource Manager aligned. Please do not change profile attributes';
-const theMonday = monday => monday || 'the Monday after the effective date';
+const theDate = monday => monday || 'the effective Sunday';
 function lastWorkingDayOfMay(monday) {
   const [month, , year] = String(monday || '').split('/').map(Number);
   if (!month || !year) return '';
@@ -6110,7 +6258,7 @@ function lastWorkingDayOfMay(monday) {
   return usDate(endYear, 5, day.getDate());
 }
 const dnsUntil = monday => (lastWorkingDayOfMay(monday) ? `until ${lastWorkingDayOfMay(monday)} (the last working day of May)` : 'until the last working day of May');
-const deactivationSteps = (monday, finishing = false) => `${finishing ? 'Finish the deactivation' : 'Deactivate'} → make the changes below${monday ? '' : ` (the effective line and Termination Date on ${theMonday(monday)})`}.`;
+const deactivationSteps = (monday, finishing = false) => `${finishing ? 'Finish the deactivation' : 'Deactivate'} → make the changes below${monday ? '' : ` (the effective line and Termination Date on ${theDate(monday)})`}.`;
 const deactivationSchedule = monday => `Remove all Revenue and Non-Revenue hours from Schedule + add a DNS ${dnsUntil(monday)}.`;
 const X_TERM_DEPARTMENT = '999 - X-Term Professional/Client';
 const deactivationComment = ticketNumber => `*DSS*-As per the notification, we have cleared the schedules and deactivated the profile${ticketNumber ? ` - ${ticketNumber}` : ''}`;
@@ -6810,9 +6958,12 @@ function zip(files) {
 const xml = value => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/\r/g, '&#13;');
 const column = index => (index < 26 ? '' : column(Math.floor(index / 26) - 1)) + String.fromCharCode(65 + (index % 26));
 function sheetXml(rows) {
+  const multiline = cell => /\n/.test(String(cell ?? ''));
+  const wide = [...new Set(rows.flatMap(cells => cells.flatMap((cell, index) => (multiline(cell) ? [index] : []))))].sort((one, two) => one - two);
+  const cols = wide.length ? `<cols>${wide.map(index => `<col min="${index + 1}" max="${index + 1}" width="80" customWidth="1"/>`).join('')}</cols>` : '';
   const body = rows.map((cells, row) => `<row r="${row + 1}">${cells.map((cell, index) => (String(cell ?? '') === '' ? ''
-    : `<c r="${column(index)}${row + 1}" t="inlineStr"><is><t xml:space="preserve">${xml(cell)}</t></is></c>`)).join('')}</row>`).join('');
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${body}</sheetData></worksheet>`;
+    : `<c r="${column(index)}${row + 1}"${multiline(cell) ? ' s="1"' : ''} t="inlineStr"><is><t xml:space="preserve">${xml(cell)}</t></is></c>`)).join('')}</row>`).join('');
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${cols}<sheetData>${body}</sheetData></worksheet>`;
 }
 function xlsxBytes(sheets) {
   const MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
@@ -6823,7 +6974,7 @@ function xlsxBytes(sheets) {
     ['_rels/.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${PACKAGE_RELS}"><Relationship Id="rId1" Type="${RELS}/officeDocument" Target="xl/workbook.xml"/></Relationships>`],
     ['xl/workbook.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="${MAIN}" xmlns:r="${RELS}"><sheets>${sheets.map((sheet, index) => `<sheet name="${xml(sheet.name)}" sheetId="${index + 1}" r:id="rId${index + 1}"/>`).join('')}</sheets></workbook>`],
     ['xl/_rels/workbook.xml.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${PACKAGE_RELS}">${sheets.map((sheet, index) => `<Relationship Id="rId${index + 1}" Type="${RELS}/worksheet" Target="worksheets/sheet${index + 1}.xml"/>`).join('')}<Relationship Id="rId${sheets.length + 1}" Type="${RELS}/styles" Target="styles.xml"/></Relationships>`],
-    ['xl/styles.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="${MAIN}"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>`],
+    ['xl/styles.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="${MAIN}"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf></cellXfs></styleSheet>`],
     ...sheets.map((sheet, index) => [`xl/worksheets/sheet${index + 1}.xml`, sheetXml(sheet.rows)]),
   ];
   return zip(files);
@@ -7149,7 +7300,7 @@ function batchPart(cases, dp) {
   const changes = cases.flatMap(item => [...(item.changes || []).map(change => change.field), ...(item.dateSensitiveRow ? ['Date Sensitive row'] : [])]);
   const found = cases.map(item => item.dp || {});
   const decided = found.filter(entry => entry.status === 'matched').flatMap(entry => [
-    ...(entry.trail?.fieldsUsed?.length ? entry.trail.fieldsUsed.map(field => `the training's order: ${field}`)
+    ...(entry.trail?.fieldsUsed?.length ? entry.trail.fieldsUsed.map(field => `the set order: ${field}`)
       : entry.trail?.unnamedRows?.length ? ['one named row beside rows that name no one'] : ['one DP among the rows that fit']),
   ]);
   const sources = new Map();
@@ -7169,7 +7320,7 @@ function batchPart(cases, dp) {
     return `${entry.trail.sheet}: ${parts.join(' / ')}`;
   });
   const several = found.filter(entry => entry.status === 'several')
-    .map(entry => `${entry.trail.sheet}: ${Object.values(entry.trail.key || {}).map(value => value || '(blank)').join(' / ')} (${entry.trail.rows.length} rows${entry.trail.namedRows ? `, ${entry.trail.namedRows.length} left by the training's order` : ''}, ${entry.trail.managers.length} DPs${entry.trail.fieldsUsed?.length ? `; the training's order used: ${entry.trail.fieldsUsed.join(', ')}` : '; nothing in the training\'s order tells them apart'}; ${rowsDiffer(dp, entry.trail)})`);
+    .map(entry => `${entry.trail.sheet}: ${Object.values(entry.trail.key || {}).map(value => value || '(blank)').join(' / ')} (${entry.trail.rows.length} rows${entry.trail.namedRows ? `, ${entry.trail.namedRows.length} left by the set order` : ''}, ${entry.trail.managers.length} DPs${entry.trail.fieldsUsed?.length ? `; the set order used: ${entry.trail.fieldsUsed.join(', ')}` : '; nothing in the set order tells them apart'}; ${rowsDiffer(dp, entry.trail)})`);
   const noSheet = found.filter(entry => entry.status === 'no-sheet').map(entry => entry.trail?.region || '(blank)');
   const noRule = cases.flatMap(item => (item.notes || []).map(fieldWithoutRule).filter(Boolean));
   return [
@@ -9294,7 +9445,7 @@ function readValues(asks) {
     return {
       label: ask.field,
       available: true,
-      ...(ask.giveText ? { text: readings.map(reading => String(reading).replace(/\s+/g, ' ').trim()).filter(Boolean).join(' ') } : {}),
+      ...(ask.giveText || ask.giveReading ? { text: readings.map(reading => String(reading).replace(/\s+/g, ' ').trim()).filter(Boolean).join(' ') } : {}),
       matches: ask.contains
         ? readings.some(reading => normalized(reading).includes(normalized(ask.target)))
         : ask.compare === 'code' ? readings.some(reading => number(reading) !== '' && number(reading) === number(ask.target))
@@ -9318,6 +9469,9 @@ function readValues(asks) {
     pageDetected: looksLikeAProfilePage(mySourceField('Email').control),
     values: values.map((value, index) => (asks[index].field === 'Date Sensitive row' ? value : { ...value, position: positionOf(asks[index]) })),
   };
+}
+function fieldControl(label) {
+  return mySourceField(label).control || null;
 }
 function listFields() {
   return ['Security', 'Authorization', 'Assign Period', 'Schedule Compliance', 'Resource Manager', 'Termination Date', 'Cost Center Description',
@@ -9439,13 +9593,13 @@ function readDateSensitiveRow(expected) {
     shiftNow,
   };
 }
-return { readIdentity, readProfileControls, readValues, listFields, readDateSensitiveRow, profileFieldControls };
+return { readIdentity, readProfileControls, readValues, listFields, fieldControl, readDateSensitiveRow, profileFieldControls };
 }
 const __transfersScreens = [["header",{"class":"tool-head"},[["button",{"class":"button quiet header-back","id":"header-back","type":"button","hidden":""},["← Worklist"]],["span",{"class":"case-steps","id":"case-steps","hidden":""},[["button",{"class":"button quiet header-step","id":"case-previous","type":"button","title":"Previous case (Alt+↑)","aria-label":"Previous case"},["↑"]],["span",{"class":"case-position","id":"case-position"},[]],["button",{"class":"button quiet header-step","id":"case-next","type":"button","title":"Next case (Alt+↓)","aria-label":"Next case"},["↓"]]]],["strong",{},["Shuffle"]],["span",{"class":"header-space"},[]],["button",{"class":"button secondary header-action","id":"auto-mode","type":"button","hidden":""},["Auto"]],["button",{"class":"button secondary header-action","id":"download","type":"button","title":"Download workbook","aria-label":"Download workbook","hidden":""},["⬇"]],["button",{"class":"button quiet close-transfers","id":"close","type":"button","title":"Close Shuffle","aria-label":"Close Shuffle"},["✕"]]]],["main",{},[["section",{"class":"intake","id":"intake","aria-labelledby":"intake-title"},[["h2",{"id":"intake-title"},["Add the four files"]],["div",{"class":"drop-grid"},[["button",{"class":"drop-card","id":"service-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["ServiceNow export"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"service-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"service-file","accept":".csv,.xlsx","hidden":""},[]],["button",{"class":"drop-card","id":"profile-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["MySource export"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"profile-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"profile-file","accept":".csv,.xlsx","hidden":""},[]],["button",{"class":"drop-card","id":"dp-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["DP mapping"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"dp-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"dp-file","accept":".xlsx","hidden":""},[]],["button",{"class":"drop-card","id":"roster-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["Roster"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"roster-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"roster-file","accept":".csv,.xlsx","hidden":""},[]]]],["label",{"class":"mail-signoff"},["Your name (mail sign-off)",["input",{"id":"run-signoff","type":"text","autocomplete":"off"},[]]]],["div",{"class":"run-row"},[["button",{"class":"button primary","id":"run","type":"button","disabled":""},["Build worklist"]],["p",{"class":"notice","id":"run-status","role":"status"},[]]]],["div",{"class":"loading-help"},[["button",{"class":"button quiet","id":"file-check","type":"button"},["Copy check"]],["span",{"id":"self-check"},[]]]],["pre",{"class":"field-names","id":"file-check-output","hidden":""},[]]]],["div",{"class":"error-panel","id":"error-panel","role":"alert","hidden":""},[["strong",{"id":"error-title"},[]],["ul",{"id":"error-details"},[]]]],["section",{"id":"results","aria-label":"Worklist","hidden":""},[["section",{"class":"queue","id":"queue","aria-label":"Cases"},[["div",{"class":"summary-grid","id":"summary-grid"},[["label",{"class":"summary-card","data-filter":"action"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"action"},[]],["span",{},["Action"]],["strong",{"id":"count-action"},["0"]]]],["label",{"class":"summary-card","data-filter":"deactivation"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"deactivation"},[]],["span",{},["Deactivation"]],["strong",{"id":"count-deactivation"},["0"]]]],["label",{"class":"summary-card","data-filter":"by-hand"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"by-hand"},[]],["span",{},["By hand"]],["strong",{"id":"count-by-hand"},["0"]]]],["label",{"class":"summary-card","data-filter":"later"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"later"},[]],["span",{},["Later"]],["strong",{"id":"count-later"},["0"]]]],["label",{"class":"summary-card","data-filter":"no-action"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"no-action"},[]],["span",{},["No action"]],["strong",{"id":"count-no-action"},["0"]]]],["label",{"class":"summary-card","data-filter":"done"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"done"},[]],["span",{},["Done"]],["strong",{"id":"count-done"},["0"]]]]]],["p",{"class":"batch-warning","id":"batch-warning","role":"status","hidden":""},[]],["label",{"class":"search-box"},[["span",{"class":"sr-only"},["Search cases"]],["input",{"id":"search","type":"search","placeholder":"Search cases"},[]]]],["div",{"class":"filter-row","id":"filter-row","hidden":""},[["span",{"id":"filter-label"},[]]]],["div",{"id":"worklist-cases"},[]],["p",{"id":"empty-filter","hidden":""},[]]]],["section",{"class":"case-pane","id":"case-pane","aria-label":"Selected case","hidden":""},[["div",{"id":"case-preview"},[]],["div",{"id":"profile-review","hidden":""},[["article",{"class":"case-card","id":"detail"},[]]]]]],["p",{"class":"sr-only","id":"review-progress","role":"status","aria-live":"polite"},[]]]]]]];
-const __transfersStyles = [":root {\n  color-scheme: dark;\n  --bg: #151515;\n  --surface: #1c1c1c;\n  --surface-2: #1e1e1e;\n  --surface-3: #242424;\n  --border: #3a3a3a;\n  --border-strong: #4b4b4b;\n  --text: #eeeeee;\n  --muted: #a8a8a8;\n  --faint: #969696;\n  --sage: #a9c77d;\n  --sage-ink: #151515;\n  --blue: #86b8c8;\n  --amber: #c9aa68;\n  --coral: #c97972;\n  --shadow: 0 12px 36px rgba(0, 0, 0, .5);\n  --radius: 10px;\n  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;\n}\n* { box-sizing: border-box; }\n[hidden] { display: none !important; }\nbody { margin: 0; min-width: 300px; background: var(--bg); color: var(--text); }\nbutton, input { font: inherit; }\nbutton { color: inherit; }\n",":root {\n  --border: #303030;\n  --border-strong: #3a3a3a;\n  --selected-text: #c6d9a8;\n  font-size: 13px;\n  line-height: 1.5;\n}\nbody {\n  min-width: 280px;\n}\nbutton,\ninput,\ntextarea,\nselect {\n  font: inherit;\n}\nbutton,\nsummary {\n  cursor: pointer;\n}\nbutton:focus-visible,\nsummary:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\na:focus-visible,\n.summary-card:focus-within,\n.queue-row:focus-within {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 3px;\n}\nbutton:disabled {\n  opacity: 0.5;\n  cursor: not-allowed;\n}\n.button {\n  border: 0;\n  border-radius: 8px;\n  padding: 8px 10px;\n  background: var(--border-strong);\n  color: var(--text);\n  font-size: 13px;\n  font-weight: 700;\n  line-height: 1.4;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 7px;\n  min-height: 36px;\n  transition:\n    transform 120ms,\n    filter 120ms,\n    box-shadow 120ms;\n}\n.button:hover:not(:disabled),\n.drop-card:hover:not(:disabled) {\n  filter: brightness(1.1);\n  transform: translateY(-1px);\n  box-shadow: 0 3px 8px rgb(0 0 0 / 0.2);\n}\n.button:active:not(:disabled),\n.drop-card:active:not(:disabled) {\n  transform: scale(0.985);\n  filter: brightness(0.95);\n}\n.button.primary {\n  background: var(--sage);\n  color: var(--bg);\n}\n.button.secondary {\n  background: var(--blue);\n  color: var(--bg);\n}\n.button.warn {\n  background: var(--amber);\n  color: var(--bg);\n}\n.button.danger {\n  background: var(--coral);\n  color: var(--bg);\n  width: 100%;\n}\n.button-row,\n.actions {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 8px;\n  align-items: center;\n}\n.button-row > .button,\n.actions > .button {\n  flex: 1 1 calc(50% - 4px);\n  min-width: 0;\n  padding: 8px 6px;\n}\n.actions > .primary {\n  flex-basis: 100%;\n  order: -1;\n}\n.actions > .danger {\n  flex-basis: 100%;\n  order: 2;\n}\n.tool-head {\n  display: flex;\n  align-items: center;\n  gap: 12px;\n  min-height: 48px;\n  padding: 8px 14px;\n  background: var(--surface);\n  border-bottom: 1px solid var(--border);\n}\n.tool-head strong {\n  font-size: 14px;\n  font-weight: 700;\n}\n.tool-head > span {\n  margin-left: auto;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  color: var(--muted);\n  font-size: 12px;\n}\n.tool-menu {\n  margin-left: auto;\n  position: relative;\n  flex-shrink: 0;\n}\n.tool-head > span + .tool-menu {\n  margin-left: 0;\n}\n.tool-menu > summary {\n  list-style: none;\n  padding: 7px 10px;\n  border-radius: 8px;\n  background: var(--border-strong);\n  color: var(--text);\n  font-size: 12px;\n  font-weight: 700;\n}\n.tool-menu > summary::-webkit-details-marker {\n  display: none;\n}\n.menu-body {\n  position: absolute;\n  top: calc(100% + 8px);\n  right: 0;\n  z-index: 20;\n  width: min(310px, calc(100vw - 28px));\n  max-height: calc(100vh - 80px);\n  overflow-y: auto;\n  padding: 12px;\n  border: 1px solid var(--border-strong);\n  border-radius: 10px;\n  background: var(--surface);\n  box-shadow: var(--shadow);\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.menu-body hr {\n  width: 100%;\n  border: 0;\n  border-top: 1px solid var(--border);\n  margin: 0;\n}\n.menu-body details[open] {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\nh1,\nh2,\nh3,\nh4,\np {\n  margin: 0;\n}\nh2 {\n  font-size: 18px;\n  line-height: 1.3;\n  font-weight: 600;\n}\nh3 {\n  font-size: 20px;\n  font-weight: 600;\n}\nh4 {\n  font-size: 13px;\n  font-weight: 600;\n}\np {\n  color: var(--muted);\n}\nsmall,\n.notice,\n.session-warning {\n  color: var(--muted);\n  font-size: 12px;\n  line-height: 1.5;\n}\ndetails > summary {\n  font-size: 12px;\n  color: var(--muted);\n  padding: 5px 0;\n}\n.session-warning {\n  padding: 12px 0;\n  border-top: 1px solid var(--border);\n}\n.error,\n.error-panel {\n  color: var(--coral);\n  border-left: 2px solid var(--coral);\n  padding: 8px 10px;\n  overflow-wrap: anywhere;\n}\n.error-panel ul {\n  margin: 4px 0 0;\n  padding-left: 18px;\n}\n#diagnostic-log {\n  max-height: 190px;\n  overflow: auto;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  font:\n    11px/1.5 ui-monospace,\n    Consolas,\n    monospace;\n  color: var(--muted);\n}\ntextarea {\n  width: 100%;\n  min-height: 70px;\n  resize: vertical;\n  background: var(--surface);\n  border: 1px solid var(--border-strong);\n  border-radius: 8px;\n  color: var(--text);\n  padding: 8px 10px;\n}\n.session-note {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.discard-dialog {\n  max-width: min(390px, calc(100vw - 24px));\n  margin: auto;\n  border: 1px solid var(--border-strong);\n  border-radius: 12px;\n  padding: 20px;\n  background: var(--bg);\n  color: var(--text);\n}\n.discard-dialog[open] {\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n}\n.discard-dialog::backdrop {\n  background: rgb(0 0 0 / 0.6);\n}\n.sr-only {\n  position: absolute;\n  width: 1px;\n  height: 1px;\n  overflow: hidden;\n  clip-path: inset(50%);\n  white-space: nowrap;\n}\n.selection-input {\n  position: absolute;\n  width: 1px;\n  height: 1px;\n  opacity: 0;\n}\n@media (pointer: coarse) {\n  button,\n  summary,\n  .summary-card,\n  .queue-row {\n    min-height: 44px;\n  }\n  input,\n  textarea,\n  select {\n    font-size: 16px;\n  }\n}\n@media (prefers-reduced-motion: reduce) {\n  *,\n  *::before,\n  *::after {\n    scroll-behavior: auto !important;\n    transition: none !important;\n    transform: none !important;\n  }\n}\n",":root {\n  --head: #1b1b1b;\n  --border-soft: #242424;\n  --lavender: #a58ecc;\n}\nhtml {\n  scrollbar-width: none;\n}\nhtml::-webkit-scrollbar {\n  display: none;\n}\nbutton:focus-visible,\nsummary:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\na:focus-visible {\n  outline-offset: 2px;\n}\nmain {\n  max-width: 1120px;\n  margin: auto;\n  padding: 12px;\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.tool-head {\n  position: sticky;\n  top: 0;\n  z-index: 10;\n  min-height: 36px;\n  gap: 8px;\n  padding: 3px 6px 3px 12px;\n  background: var(--head);\n  border-bottom-color: var(--border-soft);\n}\n.tool-head > .close-transfers,\n.tool-head > .header-back {\n  min-height: 0;\n  padding: 3px 10px;\n  font-size: 13px;\n  line-height: 1.25;\n}\n.case-steps {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.case-steps[hidden] {\n  display: none;\n}\n.tool-head .header-step {\n  min-height: 0;\n  padding: 3px 8px;\n  font-size: 13px;\n  line-height: 1.25;\n}\n.queue-row .row-number {\n  color: var(--muted);\n  font-variant-numeric: tabular-nums;\n  margin-right: 6px;\n}\n.tool-head:has(> .header-back:not([hidden])) > strong {\n  display: none;\n}\n.header-space { flex: 1; }\n.tool-head > .header-action { width: auto; min-height: 0; padding: 3px 10px; font-size: 13px; line-height: 1.25; }\n.mail-signoff { display: flex; flex-direction: column; gap: 7px; margin-top: 20px; color: var(--muted); font-size: 12px; }\n.mail-signoff input { width: 100%; padding: 9px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); color: var(--text); box-sizing: border-box; }\n.loading-help { display: flex; align-items: center; gap: 12px; margin-top: 36px; color: var(--muted); font-size: 10px; }\n.loading-help .button { width: auto; min-height: 0; padding: 3px 0; font-size: 11px; background: transparent; color: var(--muted); }\n.optional {\n  font-weight: 400;\n  opacity: 0.8;\n}\n#file-check {\n  align-self: flex-start;\n}\n.field-names {\n  max-height: 180px;\n  overflow: auto;\n  margin: 0;\n  padding: 8px;\n  border: 1px solid var(--border);\n  border-radius: 6px;\n  background: var(--bg);\n  white-space: pre-wrap;\n  font: 11px/1.5 ui-monospace, Consolas, monospace;\n}\n.intake {\n  width: 100%;\n  max-width: 600px;\n  margin: auto;\n  display: flex;\n  flex-direction: column;\n  gap: 18px;\n  scroll-margin-top: 64px;\n}\n.drop-grid {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.drop-card {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 14px;\n  width: 100%;\n  padding: 8px 10px;\n  background: var(--surface);\n  color: var(--muted);\n  border: 1px solid var(--border);\n  border-radius: 8px;\n  text-align: left;\n  cursor: pointer;\n  transition:\n    transform 120ms,\n    filter 120ms;\n}\n.drop-card.loaded {\n  color: var(--text);\n}\n.file-copy {\n  display: flex;\n  align-items: baseline;\n  gap: 8px;\n  flex: 1;\n  min-width: 0;\n}\n.file-sign {\n  flex-shrink: 0;\n}\n.loaded .file-sign {\n  color: var(--sage);\n}\n.file-name {\n  min-width: 0;\n  overflow-wrap: anywhere;\n}\n.file-separator {\n  display: none;\n}\n.loaded .file-separator {\n  display: inline;\n}\n.drop-card .file-state {\n  font-size: inherit;\n  max-width: none;\n  overflow: visible;\n  white-space: normal;\n}\n.file-control {\n  flex-shrink: 0;\n  padding: 3px 8px;\n  border: 1px solid var(--blue);\n  border-radius: 6px;\n  color: var(--blue);\n  font-size: 12px;\n}\n.drop-card.dragging {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 3px;\n}\n.file-state {\n  font-size: 12px;\n  max-width: 44%;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n.run-row {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.run-row .primary {\n  width: 100%;\n}\n#results {\n  display: flex;\n  flex-direction: column;\n  gap: 18px;\n  scroll-margin-top: 64px;\n}\n.queue {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.summary-grid {\n  display: flex;\n  gap: 2px;\n  flex-wrap: wrap;\n}\n.summary-card {\n  position: relative;\n  border: 0;\n  border-radius: 6px;\n  color: var(--muted);\n  padding: 6px 5px;\n  cursor: pointer;\n  font-size: 12px;\n  display: flex;\n  align-items: center;\n  gap: 5px;\n}\n.summary-card strong {\n  font-weight: 600;\n}\n.summary-card.active {\n  color: var(--selected-text);\n}\n.summary-card:hover {\n  background: var(--surface-3);\n}\n.summary-card:focus-within,\n.queue-row:focus-within {\n  outline: none;\n}\n.summary-card:has(:focus-visible),\n.queue-row:has(:focus-visible) {\n  outline: 2px solid var(--selected-text);\n  outline-offset: -2px;\n}\n.batch-warning {\n  margin: 4px 0 0;\n  font-size: 12px;\n  color: var(--amber);\n}\n.search-box input {\n  width: 100%;\n  border: 1px solid var(--border-strong);\n  background: var(--surface);\n  color: var(--text);\n  border-radius: 8px;\n  padding: 9px 10px;\n}\n.filter-row {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.queue-row {\n  position: relative;\n  display: flex;\n  align-items: baseline;\n  gap: 10px;\n  width: 100%;\n  padding: 8px 10px;\n  border-bottom: 1px solid var(--border-soft);\n  background: transparent;\n  color: var(--text);\n  cursor: pointer;\n  border-radius: 6px;\n}\n.queue-row:hover {\n  background: var(--surface-3);\n}\n.row-top {\n  display: flex;\n  flex: none;\n  justify-content: space-between;\n  gap: 8px;\n}\n.row-top > div {\n  text-align: right;\n}\n.queue-row .person {\n  display: block;\n  font-size: 13px;\n}\n.status-note {\n  display: block;\n  font-size: 11px;\n  color: var(--muted);\n  line-height: 1.4;\n}\n.list-heading {\n  margin: 8px 0 0;\n  font-size: 11px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  color: var(--blue);\n}\n.case-pane {\n  min-width: 0;\n}\n.case-card {\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.case-head {\n  display: flex;\n  justify-content: space-between;\n  align-items: baseline;\n  gap: 12px;\n}\n.ticket-number {\n  font-size: 12px;\n  color: var(--muted);\n}\n.badge {\n  font-size: 11px;\n  color: var(--muted);\n}\n.badge.ready,\n.badge.deactivation {\n  color: var(--sage);\n}\n.badge.done {\n  color: var(--lavender);\n}\n.badge.manual {\n  color: var(--amber);\n}\n.badge.later {\n  color: var(--blue);\n}\n.case-identity {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.case-name {\n  margin: 0;\n  font-size: 20px;\n  font-weight: 600;\n}\n.case-meta {\n  margin: 0;\n  font-size: 12px;\n  color: var(--muted);\n  overflow-wrap: anywhere;\n}\n.case-section {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n}\n.case-label {\n  display: block;\n  margin: 0 0 2px;\n  font-size: 12px;\n  font-weight: 600;\n  color: var(--text);\n}\n.manual-section > .case-label {\n  color: var(--amber);\n}\n.case-lines {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n}\n.case-line {\n  margin: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  overflow-wrap: anywhere;\n}\n.case-line strong {\n  font-weight: 600;\n}\n.case-line.attention {\n  color: var(--amber);\n}\n.case-line.sign-problem {\n  color: var(--coral);\n}\n.case-line.sign-fine {\n  color: var(--sage);\n}\n.case-line.sign-info {\n  color: var(--blue);\n}\n.case-line.good {\n  color: var(--sage);\n}\n.case-line.noticed,\n.case-line.noticed strong,\n.case-line.noticed .sub-line {\n  color: var(--sage);\n}\n.edit-cue {\n  margin-left: 8px;\n  font-size: 0.9em;\n  font-weight: 600;\n}\n.deactivation-steps {\n  padding-left: 20px;\n}\n.schedule-step label {\n  cursor: pointer;\n}\n.information-list .case-line {\n  color: var(--muted);\n}\n.date-sensitive > strong {\n  color: var(--muted);\n}\n.date-sensitive .sub-line {\n  margin: 0;\n  padding-left: 12px;\n}\n.date-sensitive .sub-line.attention {\n  color: var(--amber);\n}\n.copy-text {\n  padding: 0;\n  border: 0;\n  background: none;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  cursor: copy;\n  text-decoration: underline dotted var(--faint);\n  text-underline-offset: 3px;\n}\n.copy-text:hover {\n  color: var(--text);\n  text-decoration-color: var(--text);\n}\n.copy-note {\n  margin-left: 6px;\n  font-size: 11px;\n  color: var(--sage);\n}\n.comment-block {\n  display: flex;\n  flex-direction: column;\n  align-items: flex-start;\n  gap: 4px;\n}\n.comment-block > .copy-text {\n  padding-left: 12px;\n  border-left: 2px solid var(--border-strong);\n  font-size: 13px;\n  line-height: 1.5;\n  color: var(--muted);\n  text-decoration: none;\n}\n.comment-block > .copy-text:hover {\n  border-left-color: var(--text);\n}\n.comment-block > .copy-note {\n  margin-left: 14px;\n}\n.comment-waiting,\n.comment-waiting .case-label {\n  color: var(--muted);\n}\n.case-section + .comment-to-add {\n  margin-top: -8px;\n}\n.discard-dialog [autofocus]:focus {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 2px;\n}\n.dialog-choices {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n}\n.dialog-choices > .button {\n  width: 100%;\n}\n.case-box {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n.case-box > .status-line:first-child {\n  font-weight: 600;\n}\n.case-box > .button {\n  width: 100%;\n}\n.done-row {\n  display: flex;\n  gap: 8px;\n}\n.done-row > .button {\n  min-width: 0;\n  padding: 8px 6px;\n}\n.done-row > .button.primary {\n  flex: 2;\n}\n.done-row > .button.quiet {\n  flex: 1;\n}\n.status-line {\n  margin: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  overflow-wrap: anywhere;\n}\n.status-line.good {\n  color: var(--sage);\n}\n.status-line.warn {\n  color: var(--amber);\n}\n.status-line.bad {\n  color: var(--coral);\n}\n.status-line.neutral {\n  color: var(--muted);\n}\n.note-fold {\n  border-top: 1px solid var(--border-soft);\n  padding-top: 10px;\n  font-size: 12px;\n}\n.note-fold > summary {\n  width: max-content;\n  list-style: none;\n  color: var(--muted);\n  cursor: pointer;\n}\n.note-fold > summary::-webkit-details-marker {\n  display: none;\n}\n.note-fold[open] > summary {\n  margin-bottom: 8px;\n}\n.note-fold textarea {\n  width: 100%;\n}\n.decided {\n  font-size: 12px;\n  color: var(--muted);\n}\n.decided summary {\n  cursor: pointer;\n}\n.decided h5 {\n  margin: 8px 0 2px;\n  font-size: 11px;\n  font-weight: 600;\n  color: var(--text);\n}\n.decided ul {\n  margin: 0;\n  padding-left: 18px;\n}\n.decided .values-heading { margin: 8px 0 2px; font-size: 11px; font-weight: 600; }\n.decided .hint, .comment-to-add .hint { font-size: 11px; font-weight: 400; color: var(--muted); }\n.decided li.sign-problem { color: var(--coral); }\n.decided li.sign-fine { color: var(--sage); }\n.decided li.sign-info { color: var(--blue); }\n.decided li.attention { color: var(--amber); }\n.note-flag {\n  margin-left: 6px;\n  padding: 0 2px;\n  border: 0;\n  background: none;\n  color: var(--amber);\n  font: inherit;\n  cursor: pointer;\n}\ndialog.small-window {\n  position: fixed;\n  inset: auto;\n  z-index: 30;\n  width: 230px;\n  max-width: calc(100vw - 16px);\n  max-height: 60vh;\n  margin: 0;\n  padding: 10px;\n  overflow: hidden auto;\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  background: var(--bg);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 12px;\n  box-shadow: var(--shadow);\n  outline: none;\n  font-size: 12px;\n}\n.small-window h2 {\n  margin: 0;\n  font-size: 14px;\n}\n.small-window p {\n  margin: 0;\n  line-height: 1.4;\n}\n.small-window p.notice {\n  color: var(--muted);\n  font-size: 11px;\n}\n.small-window .actions {\n  gap: 6px;\n}\n.small-window .button {\n  min-width: 0;\n  min-height: 0;\n  margin: 0;\n  padding: 6px 8px;\n  font-size: 12px;\n  border-radius: 8px;\n}\n.small-window .actions > .button {\n  flex: 1 1 calc(50% - 3px);\n}\n.small-window .actions > .danger {\n  flex-basis: 100%;\n}\n.wrong-mark {\n  margin-top: 10px;\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.wrong-mark select {\n  background: var(--surface);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 6px;\n  padding: 4px 6px;\n  font-size: 12px;\n}\n.wrong-mark.marked,\n.wrong-mark.marked select {\n  color: var(--amber);\n}\n.health-line {\n  margin: 0;\n  font-size: 12px;\n  color: var(--amber);\n}\n",".auto-page { width: 100%; box-sizing: border-box; max-width: 680px; margin: 0 auto; padding-bottom: 24px; }\n.auto-actions { display: flex; gap: 8px; margin-bottom: 16px; }\n.auto-actions > .button { width: auto; flex: 0 0 auto; }\n.auto-actions > .primary { flex: 1; }\n.auto-page > .case-section, .auto-results { margin-top: 24px; }\n.auto-page progress { width: 100%; height: 8px; accent-color: var(--lavender); border: 0; border-radius: 8px; overflow: hidden; }\n.auto-page progress::-webkit-progress-bar { background: var(--border); }\n.auto-page progress::-webkit-progress-value { background: var(--lavender); }\n.auto-person { font-weight: 600; margin: 8px 0; }\n.auto-before { margin: 12px 0; }\n.auto-done { color: var(--lavender); }\n.auto-page .case-line { overflow-wrap: anywhere; }\n"];
+const __transfersStyles = [":root {\n  color-scheme: dark;\n  --bg: #151515;\n  --surface: #1c1c1c;\n  --surface-2: #1e1e1e;\n  --surface-3: #242424;\n  --border: #3a3a3a;\n  --border-strong: #4b4b4b;\n  --text: #eeeeee;\n  --muted: #a8a8a8;\n  --faint: #969696;\n  --sage: #a9c77d;\n  --sage-ink: #151515;\n  --blue: #86b8c8;\n  --amber: #c9aa68;\n  --coral: #c97972;\n  --shadow: 0 12px 36px rgba(0, 0, 0, .5);\n  --radius: 10px;\n  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;\n}\n* { box-sizing: border-box; }\n[hidden] { display: none !important; }\nbody { margin: 0; min-width: 300px; background: var(--bg); color: var(--text); }\nbutton, input { font: inherit; }\nbutton { color: inherit; }\n",":root {\n  --border: #303030;\n  --border-strong: #3a3a3a;\n  --selected-text: #c6d9a8;\n  font-size: 13px;\n  line-height: 1.5;\n}\nbody {\n  min-width: 280px;\n}\nbutton,\ninput,\ntextarea,\nselect {\n  font: inherit;\n}\nbutton,\nsummary {\n  cursor: pointer;\n}\nbutton:focus-visible,\nsummary:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\na:focus-visible,\n.summary-card:focus-within,\n.queue-row:focus-within {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 3px;\n}\nbutton:disabled {\n  opacity: 0.5;\n  cursor: not-allowed;\n}\n.button {\n  border: 0;\n  border-radius: 8px;\n  padding: 8px 10px;\n  background: var(--border-strong);\n  color: var(--text);\n  font-size: 13px;\n  font-weight: 700;\n  line-height: 1.4;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 7px;\n  min-height: 36px;\n  transition:\n    transform 120ms,\n    filter 120ms,\n    box-shadow 120ms;\n}\n.button:hover:not(:disabled),\n.drop-card:hover:not(:disabled) {\n  filter: brightness(1.1);\n  transform: translateY(-1px);\n  box-shadow: 0 3px 8px rgb(0 0 0 / 0.2);\n}\n.button:active:not(:disabled),\n.drop-card:active:not(:disabled) {\n  transform: scale(0.985);\n  filter: brightness(0.95);\n}\n.button.primary {\n  background: var(--sage);\n  color: var(--bg);\n}\n.button.secondary {\n  background: var(--blue);\n  color: var(--bg);\n}\n.button.warn {\n  background: var(--amber);\n  color: var(--bg);\n}\n.button.danger {\n  background: var(--coral);\n  color: var(--bg);\n  width: 100%;\n}\n.button-row,\n.actions {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 8px;\n  align-items: center;\n}\n.button-row > .button,\n.actions > .button {\n  flex: 1 1 calc(50% - 4px);\n  min-width: 0;\n  padding: 8px 6px;\n}\n.actions > .primary {\n  flex-basis: 100%;\n  order: -1;\n}\n.actions > .danger {\n  flex-basis: 100%;\n  order: 2;\n}\n.tool-head {\n  display: flex;\n  align-items: center;\n  gap: 12px;\n  min-height: 48px;\n  padding: 8px 14px;\n  background: var(--surface);\n  border-bottom: 1px solid var(--border);\n}\n.tool-head strong {\n  font-size: 14px;\n  font-weight: 700;\n}\n.tool-head > span {\n  margin-left: auto;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  color: var(--muted);\n  font-size: 12px;\n}\n.tool-menu {\n  margin-left: auto;\n  position: relative;\n  flex-shrink: 0;\n}\n.tool-head > span + .tool-menu {\n  margin-left: 0;\n}\n.tool-menu > summary {\n  list-style: none;\n  padding: 7px 10px;\n  border-radius: 8px;\n  background: var(--border-strong);\n  color: var(--text);\n  font-size: 12px;\n  font-weight: 700;\n}\n.tool-menu > summary::-webkit-details-marker {\n  display: none;\n}\n.menu-body {\n  position: absolute;\n  top: calc(100% + 8px);\n  right: 0;\n  z-index: 20;\n  width: min(310px, calc(100vw - 28px));\n  max-height: calc(100vh - 80px);\n  overflow-y: auto;\n  padding: 12px;\n  border: 1px solid var(--border-strong);\n  border-radius: 10px;\n  background: var(--surface);\n  box-shadow: var(--shadow);\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.menu-body hr {\n  width: 100%;\n  border: 0;\n  border-top: 1px solid var(--border);\n  margin: 0;\n}\n.menu-body details[open] {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\nh1,\nh2,\nh3,\nh4,\np {\n  margin: 0;\n}\nh2 {\n  font-size: 18px;\n  line-height: 1.3;\n  font-weight: 600;\n}\nh3 {\n  font-size: 20px;\n  font-weight: 600;\n}\nh4 {\n  font-size: 13px;\n  font-weight: 600;\n}\np {\n  color: var(--muted);\n}\nsmall,\n.notice,\n.session-warning {\n  color: var(--muted);\n  font-size: 12px;\n  line-height: 1.5;\n}\ndetails > summary {\n  font-size: 12px;\n  color: var(--muted);\n  padding: 5px 0;\n}\n.session-warning {\n  padding: 12px 0;\n  border-top: 1px solid var(--border);\n}\n.error,\n.error-panel {\n  color: var(--coral);\n  border-left: 2px solid var(--coral);\n  padding: 8px 10px;\n  overflow-wrap: anywhere;\n}\n.error-panel ul {\n  margin: 4px 0 0;\n  padding-left: 18px;\n}\n#diagnostic-log {\n  max-height: 190px;\n  overflow: auto;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  font:\n    11px/1.5 ui-monospace,\n    Consolas,\n    monospace;\n  color: var(--muted);\n}\ntextarea {\n  width: 100%;\n  min-height: 70px;\n  resize: vertical;\n  background: var(--surface);\n  border: 1px solid var(--border-strong);\n  border-radius: 8px;\n  color: var(--text);\n  padding: 8px 10px;\n}\n.session-note {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.discard-dialog {\n  max-width: min(390px, calc(100vw - 24px));\n  margin: auto;\n  border: 1px solid var(--border-strong);\n  border-radius: 12px;\n  padding: 20px;\n  background: var(--bg);\n  color: var(--text);\n}\n.discard-dialog[open] {\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n}\n.discard-dialog::backdrop {\n  background: rgb(0 0 0 / 0.6);\n}\n.sr-only {\n  position: absolute;\n  width: 1px;\n  height: 1px;\n  overflow: hidden;\n  clip-path: inset(50%);\n  white-space: nowrap;\n}\n.selection-input {\n  position: absolute;\n  width: 1px;\n  height: 1px;\n  opacity: 0;\n}\n@media (pointer: coarse) {\n  button,\n  summary,\n  .summary-card,\n  .queue-row {\n    min-height: 44px;\n  }\n  input,\n  textarea,\n  select {\n    font-size: 16px;\n  }\n}\n@media (prefers-reduced-motion: reduce) {\n  *,\n  *::before,\n  *::after {\n    scroll-behavior: auto !important;\n    transition: none !important;\n    transform: none !important;\n  }\n}\n",":root {\n  --head: #1b1b1b;\n  --border-soft: #242424;\n  --lavender: #a58ecc;\n}\nhtml {\n  scrollbar-width: none;\n}\nhtml::-webkit-scrollbar {\n  display: none;\n}\nbutton:focus-visible,\nsummary:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\na:focus-visible {\n  outline-offset: 2px;\n}\nmain {\n  max-width: 1120px;\n  margin: auto;\n  padding: 12px;\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.tool-head {\n  position: sticky;\n  top: 0;\n  z-index: 10;\n  min-height: 36px;\n  gap: 8px;\n  padding: 3px 6px 3px 12px;\n  background: var(--head);\n  border-bottom-color: var(--border-soft);\n}\n.tool-head > .close-transfers,\n.tool-head > .header-back {\n  min-height: 0;\n  padding: 3px 10px;\n  font-size: 13px;\n  line-height: 1.25;\n}\n.case-steps {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.case-steps[hidden] {\n  display: none;\n}\n.tool-head .header-step {\n  min-height: 0;\n  padding: 3px 8px;\n  font-size: 13px;\n  line-height: 1.25;\n}\n.queue-row .row-number {\n  color: var(--muted);\n  font-variant-numeric: tabular-nums;\n  margin-right: 6px;\n}\n.tool-head:has(> .header-back:not([hidden])) > strong {\n  display: none;\n}\n.header-space { flex: 1; }\n.tool-head > .header-action { width: auto; min-height: 0; padding: 3px 10px; font-size: 13px; line-height: 1.25; }\n.mail-signoff { display: flex; flex-direction: column; gap: 7px; margin-top: 20px; color: var(--muted); font-size: 12px; }\n.mail-signoff input { width: 100%; padding: 9px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); color: var(--text); box-sizing: border-box; }\n.loading-help { display: flex; align-items: center; gap: 12px; margin-top: 36px; color: var(--muted); font-size: 10px; }\n.loading-help .button { width: auto; min-height: 0; padding: 3px 0; font-size: 11px; background: transparent; color: var(--muted); }\n.optional {\n  font-weight: 400;\n  opacity: 0.8;\n}\n#file-check {\n  align-self: flex-start;\n}\n.field-names {\n  max-height: 180px;\n  overflow: auto;\n  margin: 0;\n  padding: 8px;\n  border: 1px solid var(--border);\n  border-radius: 6px;\n  background: var(--bg);\n  white-space: pre-wrap;\n  font: 11px/1.5 ui-monospace, Consolas, monospace;\n}\n.intake {\n  width: 100%;\n  max-width: 600px;\n  margin: auto;\n  display: flex;\n  flex-direction: column;\n  gap: 18px;\n  scroll-margin-top: 64px;\n}\n.drop-grid {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.drop-card {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 14px;\n  width: 100%;\n  padding: 8px 10px;\n  background: var(--surface);\n  color: var(--muted);\n  border: 1px solid var(--border);\n  border-radius: 8px;\n  text-align: left;\n  cursor: pointer;\n  transition:\n    transform 120ms,\n    filter 120ms;\n}\n.drop-card.loaded {\n  color: var(--text);\n}\n.file-copy {\n  display: flex;\n  align-items: baseline;\n  gap: 8px;\n  flex: 1;\n  min-width: 0;\n}\n.file-sign {\n  flex-shrink: 0;\n}\n.loaded .file-sign {\n  color: var(--sage);\n}\n.file-name {\n  min-width: 0;\n  overflow-wrap: anywhere;\n}\n.file-separator {\n  display: none;\n}\n.loaded .file-separator {\n  display: inline;\n}\n.drop-card .file-state {\n  font-size: inherit;\n  max-width: none;\n  overflow: visible;\n  white-space: normal;\n}\n.file-control {\n  flex-shrink: 0;\n  padding: 3px 8px;\n  border: 1px solid var(--blue);\n  border-radius: 6px;\n  color: var(--blue);\n  font-size: 12px;\n}\n.drop-card.dragging {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 3px;\n}\n.file-state {\n  font-size: 12px;\n  max-width: 44%;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n.run-row {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.run-row .primary {\n  width: 100%;\n}\n#results {\n  display: flex;\n  flex-direction: column;\n  gap: 18px;\n  scroll-margin-top: 64px;\n}\n.queue {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.summary-grid {\n  display: flex;\n  gap: 2px;\n  flex-wrap: wrap;\n}\n.summary-card {\n  position: relative;\n  border: 0;\n  border-radius: 6px;\n  color: var(--muted);\n  padding: 6px 5px;\n  cursor: pointer;\n  font-size: 12px;\n  display: flex;\n  align-items: center;\n  gap: 5px;\n}\n.summary-card strong {\n  font-weight: 600;\n}\n.summary-card.active {\n  color: var(--selected-text);\n}\n.summary-card:hover {\n  background: var(--surface-3);\n}\n.summary-card:focus-within,\n.queue-row:focus-within {\n  outline: none;\n}\n.summary-card:has(:focus-visible),\n.queue-row:has(:focus-visible) {\n  outline: 2px solid var(--selected-text);\n  outline-offset: -2px;\n}\n.batch-warning {\n  margin: 4px 0 0;\n  font-size: 12px;\n  color: var(--amber);\n}\n.search-box input {\n  width: 100%;\n  border: 1px solid var(--border-strong);\n  background: var(--surface);\n  color: var(--text);\n  border-radius: 8px;\n  padding: 9px 10px;\n}\n.filter-row {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.queue-row {\n  position: relative;\n  display: flex;\n  align-items: baseline;\n  gap: 10px;\n  width: 100%;\n  padding: 8px 10px;\n  border-bottom: 1px solid var(--border-soft);\n  background: transparent;\n  color: var(--text);\n  cursor: pointer;\n  border-radius: 6px;\n}\n.queue-row:hover {\n  background: var(--surface-3);\n}\n.row-top {\n  display: flex;\n  flex: none;\n  justify-content: space-between;\n  gap: 8px;\n}\n.row-top > div {\n  text-align: right;\n}\n.queue-row .person {\n  display: block;\n  font-size: 13px;\n}\n.status-note {\n  display: block;\n  font-size: 11px;\n  color: var(--muted);\n  line-height: 1.4;\n}\n.list-heading {\n  margin: 8px 0 0;\n  font-size: 11px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  color: var(--blue);\n}\n.case-pane {\n  min-width: 0;\n}\n.case-card {\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.case-head {\n  display: flex;\n  justify-content: space-between;\n  align-items: baseline;\n  gap: 12px;\n}\n.ticket-number {\n  font-size: 12px;\n  color: var(--muted);\n}\n.badge {\n  font-size: 11px;\n  color: var(--muted);\n}\n.badge.ready,\n.badge.deactivation {\n  color: var(--sage);\n}\n.badge.done {\n  color: var(--lavender);\n}\n.badge.manual {\n  color: var(--amber);\n}\n.badge.later {\n  color: var(--blue);\n}\n.case-identity {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.case-name {\n  margin: 0;\n  font-size: 20px;\n  font-weight: 600;\n}\n.case-meta {\n  margin: 0;\n  font-size: 12px;\n  color: var(--muted);\n  overflow-wrap: anywhere;\n}\n.case-section {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n}\n.case-label {\n  display: block;\n  margin: 0 0 2px;\n  font-size: 12px;\n  font-weight: 600;\n  color: var(--text);\n}\n.manual-section > .case-label {\n  color: var(--amber);\n}\n.case-lines {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n}\n.case-line {\n  margin: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  overflow-wrap: anywhere;\n}\n.case-line strong {\n  font-weight: 600;\n}\n.case-line.attention {\n  color: var(--amber);\n}\n.case-line.sign-problem {\n  color: var(--coral);\n}\n.case-line.sign-fine {\n  color: var(--sage);\n}\n.case-line.sign-info {\n  color: var(--blue);\n}\n.case-line.good {\n  color: var(--sage);\n}\n.case-line.noticed,\n.case-line.noticed strong,\n.case-line.noticed .sub-line {\n  color: var(--sage);\n}\n.edit-cue {\n  margin-left: 8px;\n  font-size: 0.9em;\n  font-weight: 600;\n}\n.schedule-step {\n  padding-left: 20px;\n}\n.schedule-step label {\n  cursor: pointer;\n}\n.information-list .case-line {\n  color: var(--muted);\n}\n.date-sensitive > strong {\n  color: var(--muted);\n}\n.date-sensitive .sub-line {\n  margin: 0;\n  padding-left: 12px;\n}\n.date-sensitive .sub-line.attention {\n  color: var(--amber);\n}\n.copy-text {\n  padding: 0;\n  border: 0;\n  background: none;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  cursor: copy;\n  text-decoration: underline dotted var(--faint);\n  text-underline-offset: 3px;\n}\n.copy-text:hover {\n  color: var(--text);\n  text-decoration-color: var(--text);\n}\n.copy-note {\n  margin-left: 6px;\n  font-size: 11px;\n  color: var(--sage);\n}\n.comment-block {\n  display: flex;\n  flex-direction: column;\n  align-items: flex-start;\n  gap: 4px;\n}\n.comment-block > .copy-text {\n  padding-left: 12px;\n  border-left: 2px solid var(--border-strong);\n  font-size: 13px;\n  line-height: 1.5;\n  color: var(--muted);\n  text-decoration: none;\n}\n.comment-block > .copy-text:hover {\n  border-left-color: var(--text);\n}\n.comment-block > .copy-note {\n  margin-left: 14px;\n}\n.comment-waiting,\n.comment-waiting .case-label {\n  color: var(--muted);\n}\n.case-section + .comment-to-add {\n  margin-top: -8px;\n}\n.discard-dialog [autofocus]:focus {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 2px;\n}\n.dialog-choices {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n}\n.dialog-choices > .button {\n  width: 100%;\n}\n.case-box {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n.case-box > .status-line:first-child {\n  font-weight: 600;\n}\n.case-box > .button {\n  width: 100%;\n}\n.done-row {\n  display: flex;\n  gap: 8px;\n}\n.done-row > .button {\n  min-width: 0;\n  padding: 8px 6px;\n}\n.done-row > .button.primary {\n  flex: 2;\n}\n.done-row > .button.quiet {\n  flex: 1;\n}\n.status-line {\n  margin: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  overflow-wrap: anywhere;\n}\n.status-line.good {\n  color: var(--sage);\n}\n.status-line.warn {\n  color: var(--amber);\n}\n.status-line.bad {\n  color: var(--coral);\n}\n.status-line.neutral {\n  color: var(--muted);\n}\n.note-fold {\n  border-top: 1px solid var(--border-soft);\n  padding-top: 10px;\n  font-size: 12px;\n}\n.note-fold > summary {\n  width: max-content;\n  list-style: none;\n  color: var(--muted);\n  cursor: pointer;\n}\n.note-fold > summary::-webkit-details-marker {\n  display: none;\n}\n.note-fold[open] > summary {\n  margin-bottom: 8px;\n}\n.note-fold textarea {\n  width: 100%;\n}\n.decided {\n  font-size: 12px;\n  color: var(--muted);\n}\n.decided summary {\n  cursor: pointer;\n}\n.decided h5 {\n  margin: 8px 0 2px;\n  font-size: 11px;\n  font-weight: 600;\n  color: var(--text);\n}\n.decided ul {\n  margin: 0;\n  padding-left: 18px;\n}\n.decided .values-heading { margin: 8px 0 2px; font-size: 11px; font-weight: 600; }\n.decided .hint, .comment-to-add .hint { font-size: 11px; font-weight: 400; color: var(--muted); }\n.decided li.sign-problem { color: var(--coral); }\n.decided li.sign-fine { color: var(--sage); }\n.decided li.sign-info { color: var(--blue); }\n.decided li.attention { color: var(--amber); }\n.note-flag {\n  margin-left: 6px;\n  padding: 0 2px;\n  border: 0;\n  background: none;\n  color: var(--amber);\n  font: inherit;\n  cursor: pointer;\n}\ndialog.small-window {\n  position: fixed;\n  inset: auto;\n  z-index: 30;\n  width: 230px;\n  max-width: calc(100vw - 16px);\n  max-height: 60vh;\n  margin: 0;\n  padding: 10px;\n  overflow: hidden auto;\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  background: var(--bg);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 12px;\n  box-shadow: var(--shadow);\n  outline: none;\n  font-size: 12px;\n}\n.small-window h2 {\n  margin: 0;\n  font-size: 14px;\n}\n.small-window p {\n  margin: 0;\n  line-height: 1.4;\n}\n.small-window p.notice {\n  color: var(--muted);\n  font-size: 11px;\n}\n.small-window .actions {\n  gap: 6px;\n}\n.small-window .button {\n  min-width: 0;\n  min-height: 0;\n  margin: 0;\n  padding: 6px 8px;\n  font-size: 12px;\n  border-radius: 8px;\n}\n.small-window .actions > .button {\n  flex: 1 1 calc(50% - 3px);\n}\n.small-window .actions > .danger {\n  flex-basis: 100%;\n}\n.wrong-mark {\n  margin-top: 10px;\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.wrong-mark select {\n  background: var(--surface);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 6px;\n  padding: 4px 6px;\n  font-size: 12px;\n}\n.wrong-mark.marked,\n.wrong-mark.marked select {\n  color: var(--amber);\n}\n.health-line {\n  margin: 0;\n  font-size: 12px;\n  color: var(--amber);\n}\n",".auto-page { width: 100%; box-sizing: border-box; max-width: 680px; margin: 0 auto; padding-bottom: 24px; }\n.auto-actions { display: flex; gap: 8px; margin-bottom: 16px; }\n.auto-actions > .button { width: auto; flex: 0 0 auto; }\n.auto-actions > .primary { flex: 1; }\n.auto-page > .case-section, .auto-results { margin-top: 24px; }\n.auto-page progress { width: 100%; height: 8px; accent-color: var(--lavender); border: 0; border-radius: 8px; overflow: hidden; }\n.auto-page progress::-webkit-progress-bar { background: var(--border); }\n.auto-page progress::-webkit-progress-value { background: var(--lavender); }\n.auto-person { font-weight: 600; margin: 8px 0; }\n.auto-before { margin: 12px 0; }\n.auto-done { color: var(--lavender); }\n.auto-page .case-line { overflow-wrap: anywhere; }\n"];
 const __transfersEmailHelpers = __transfersCreateModuleSystem({ document, window })('rules/prepare.js');
 __transfersCreateModuleSystem({ document, window })('run/start.js').start({
-  version: "0.7.0-console.62",
+  version: "0.7.0-console.63",
   styles: __transfersStyles,
   screens: __transfersScreens,
   pageReaders: __transfersPageReaders,
