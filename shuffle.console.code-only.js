@@ -1,4 +1,4 @@
-// 0.7.0-console.63
+// 0.7.0-console.67
 (() => {
 'use strict';
 const __transfersModules = {
@@ -836,7 +836,7 @@ const { COLUMNS_NOT_USED, pageHealthWarning, ROSTER_NAME, RULES_DATE } = __requi
 const { usDateOf } = __require("../rules/prepare.js");
 const { checkTickets, manualOrder } = __require("../rules/rulebook.js");
 const { employeeIdOf } = __require("../rules/gates.js");
-const { LATER_HEADINGS, caseChanges, endPoint, laterHeading, opensReview, personName, statusTag } = __require("./case-summary.js");
+const { WAITING_HEADING, caseChecks, closesByItself, endPoint, opensReview, personName, statusTag, waitingForMySource } = __require("./case-summary.js");
 const { button, caseBox, caseScreen, changeLines, changesList, changesSection, copyToClipboard, doneRow, element } = __require("./case-view.js");
 const { confirmClose, confirmDiscard } = __require("./confirm.js");
 const { TOOL_NAME } = __require("./wording.js");
@@ -856,8 +856,8 @@ const TAB_EMPTY = {
   action: 'All Action cases are done.',
   deactivation: 'No deactivations left in this batch.',
   'by-hand': 'No cases to handle by hand in this batch.',
+  'no-change': 'No cases here in this batch.',
   later: 'Nothing waiting for a later import.',
-  'no-action': 'No cases need no action.',
   done: 'No cases done in this session yet.',
 };
 function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
@@ -885,6 +885,8 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     done: new Set(),
     outcomes: new Map(),
     skipped: new Set(),
+    selfClosed: new Set(),
+    reopened: new Set(),
     notes: new Map(),
     findings: new Map(),
     scheduleConfirmed: new Set(),
@@ -1005,7 +1007,7 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     state.warning = '';
   }
   function clearWhatWasDone() {
-    for (const store of [state.done, state.outcomes, state.skipped, state.notes, state.findings, state.wrong, state.scheduleConfirmed]) store.clear();
+    for (const store of [state.selfClosed, state.reopened, state.done, state.outcomes, state.skipped, state.notes, state.findings, state.wrong, state.scheduleConfirmed]) store.clear();
   }
   async function startOver() {
     if (state.building) return;
@@ -1055,6 +1057,18 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
       clearBatch();
       state.read = { service, profile, dp, roster };
       state.cases = checkTickets({ tickets: service.rows, profiles: profile.rows, dpMapping: dp, roster: roster.rows });
+      for (const key of state.selfClosed) state.done.delete(key);
+      state.selfClosed.clear();
+      for (const item of state.cases) {
+        if (closesByItself(item) && !state.reopened.has(item.key)) {
+          state.done.add(item.key);
+          state.selfClosed.add(item.key);
+        }
+        if (item.status === 'later' || waitingForMySource(item)) {
+          state.done.delete(item.key);
+          state.outcomes.delete(item.key);
+        }
+      }
       state.exportCases = [];
       state.warning = fileWarnings([
         { kind: 'service', file: state.files.service, unknown: service.unknownHeaders },
@@ -1098,21 +1112,21 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     return warnings.join(' ');
   }
   const isDone = item => state.done.has(item.key);
-  const WORK = ['action', 'deactivation', 'by-hand'];
+  const WORK = ['action', 'deactivation', 'by-hand', 'no-change'];
   function inTab(item, tab) {
     if (tab === 'done') return isDone(item) && ['ready', 'manual', 'no-action'].includes(item.status);
     return endPoint(item) === tab && !isDone(item);
   }
   function counts() {
     const tally = tab => state.cases.filter(item => inTab(item, tab)).length;
-    return Object.fromEntries(['action', 'deactivation', 'by-hand', 'later', 'no-action', 'done'].map(tab => [tab, tally(tab)]));
+    return Object.fromEntries(['action', 'deactivation', 'by-hand', 'no-change', 'later', 'done'].map(tab => [tab, tally(tab)]));
   }
-  const END_ORDER = ['action', 'deactivation', 'by-hand', 'later', 'no-action'];
+  const END_ORDER = ['action', 'deactivation', 'by-hand', 'no-change', 'later'];
   const byTicket = (one, two) => String(one.ticketNumber).localeCompare(String(two.ticketNumber), undefined, { numeric: true });
   const byGroup = (one, two) => END_ORDER.indexOf(endPoint(one)) - END_ORDER.indexOf(endPoint(two))
+    || waitingForMySource(one) - waitingForMySource(two)
     || (endPoint(one) === 'by-hand' ? manualOrder(one) - manualOrder(two) : 0)
-    || (endPoint(one) === 'later' ? LATER_HEADINGS.indexOf(laterHeading(one)) - LATER_HEADINGS.indexOf(laterHeading(two)) : 0)
-      || byTicket(one, two);
+    || byTicket(one, two);
   function visibleCases() {
     const query = state.query.trim().toLocaleLowerCase();
     const cases = state.cases.filter(item => {
@@ -1165,16 +1179,16 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
       card.classList.toggle('active', tab === state.filter);
       card.querySelector('input').checked = tab === state.filter;
     }
-    const outstanding = state.cases.filter(item => WORK.includes(endPoint(item)));
+    const outstanding = state.cases.filter(item => WORK.includes(endPoint(item)) && !waitingForMySource(item) && !closesByItself(item));
     const done = outstanding.filter(isDone).length;
     refs.reviewProgress.textContent = outstanding.length ? `${done} of ${outstanding.length} done. ${outstanding.length - done} left.` : '';
     const warning = [state.pageHealth?.length ? pageHealthWarning(state.pageHealth) : '', state.warning].filter(Boolean).join(' ');
     refs.batchWarning.textContent = warning;
     refs.batchWarning.hidden = !warning;
     const rows = visibleCases();
-    const headed = state.filter === 'later' && !state.query;
+    const headingOf = item => (state.query ? '' : endPoint(item) === 'later' ? 'Date to come' : waitingForMySource(item) ? WAITING_HEADING : '');
     refs.worklistCases.replaceChildren(...rows.flatMap((item, index) => {
-      const heading = headed && (index === 0 || laterHeading(rows[index - 1]) !== laterHeading(item)) ? [element('p', 'list-heading', laterHeading(item))] : [];
+      const heading = headingOf(item) && !(index && headingOf(rows[index - 1]) === headingOf(item)) ? [element('p', 'list-heading', headingOf(item))] : [];
       return [...heading, rowFor(item, index)];
     }));
     showCaseSteps(rows);
@@ -1205,7 +1219,7 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     if (isDone(item) && state.outcomes.get(item.key) === 'edited, not saved') {
       badges.append(element('span', 'status-note', 'Edited, not saved'));
     }
-    if (state.query || state.filter === 'no-action') {
+    if (state.query) {
       const tag = statusTag(item, isDone(item));
       badges.append(element('span', `badge ${tag.key}`, tag.label));
     }
@@ -1269,7 +1283,7 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     refs.casePreview.hidden = false;
     const done = isDone(item);
     const card = element('article', 'case-card');
-    const list = changesList(changeLines(caseChanges(item)));
+    const list = changesList(changeLines(caseChecks(item)));
     card.append(...caseScreen(item, {
       done,
       outcome: state.outcomes.get(item.key) === 'edited, not saved' ? 'edited, not saved' : '',
@@ -1283,13 +1297,14 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     if (done) {
       const reopen = button('Reopen case', 'quiet');
       reopen.addEventListener('click', () => {
+        if (state.selfClosed.delete(item.key)) state.reopened.add(item.key);
         state.done.delete(item.key);
         state.outcomes.delete(item.key);
         selectCase(item);
       });
       return caseBox(reopen);
     }
-    if (endPoint(item) === 'later') {
+    if (endPoint(item) === 'later' || waitingForMySource(item)) {
       const onward = button('Next', 'primary');
       onward.title = 'Ctrl+Enter';
       onward.addEventListener('click', () => continueQueue(listOrderFrom(item), item.key));
@@ -1380,7 +1395,7 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     const outstanding = () => {
       const cases = visibleCases().sort((one, two) => (rank.get(one.key) ?? order.length) - (rank.get(two.key) ?? order.length));
       return cases.find(item => !isDone(item) && !state.skipped.has(item.key) && item.key !== passed
-        && (WORK.includes(endPoint(item)) || (state.filter === endPoint(item) && ['later', 'no-action'].includes(state.filter) && item.status !== 'later')));
+        && WORK.includes(endPoint(item)) && !waitingForMySource(item));
     };
     let next = outstanding();
     if (!next && !state.query) {
@@ -1517,7 +1532,7 @@ const { sundayBefore } = __require("./prepare.js");
 const { FLOW_FIELDS } = __require("./checks.js");
 const { button, caseBox, caseScreen, changeLine, changesSection, dateSensitiveLine, doneRow, element, showChanges, statusLine, textLines } = __require("../screen/case-view.js");
 const { TOOL_NAME } = __require("../screen/wording.js");
-const { caseChanges, personName } = __require("../screen/case-summary.js");
+const { caseChecks, personName } = __require("../screen/case-summary.js");
 const { confirmDoneAnyway, confirmReturn } = __require("../screen/confirm.js");
 const { OTHER_COMMENT, pageHealthWarning } = __require("./mappings.js");
 const { MESSAGES } = __require("../mysource/mysource-window.js");
@@ -1533,7 +1548,7 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
   const manual = item.status === 'manual' && !item.deadEnd;
   const noAction = item.status === 'no-action';
   const completedDeactivation = isCompletedDeactivation(item);
-  const { informationOnly, changes: plannedChanges, dateSensitive: plannedRow, dateNote } = caseChanges(item);
+  const { informationOnly, changes: plannedChanges, dateSensitive: plannedRow, dateNote, onlyToCheck } = caseChecks(item);
   const rules = liveChecks(item, pageDescription);
   const comparable = !(manual && !rules);
   const canCheck = Boolean(item.email);
@@ -1589,7 +1604,8 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
     const inPageOrder = plannedChanges.map((change, index) => index).sort((one, two) => place(one) - place(two) || one - two);
     const lines = [
       rowLeft && markNoticed(rowLine(rowShown, !rowNoticed && latest?.rowDiffers), rowNoticed),
-      ...inPageOrder.map(index => (found?.planned[index] && latest?.planned[index] ? null : markNoticed(changeLine(plannedChanges[index]), Boolean(noticed?.planned[index])))),
+      ...inPageOrder.map(index => (onlyToCheck ? markNoticed(changeLine(plannedChanges[index]), Boolean(latest?.planned[index]))
+        : found?.planned[index] && latest?.planned[index] ? null : markNoticed(changeLine(plannedChanges[index]), Boolean(noticed?.planned[index])))),
       ...[...(found?.extra || []), ...(latest?.extra || []).filter(change => !found?.extra.some(other => other.field === change.field))]
         .map(change => markNoticed(changeLine(change), extraNoticed(change))),
     ].filter(Boolean);
@@ -1636,7 +1652,7 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
   function markNoticed(line, onPage) {
     if (onPage) {
       line.classList.add('noticed');
-      line.title = 'On the page. It comes off the list once saved.';
+      line.title = onlyToCheck ? 'On the page.' : 'On the page. It comes off the list once saved.';
       if (page.edited) line.append(element('span', 'edit-cue', editCue()));
     }
     return line;
@@ -1812,7 +1828,7 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
   }
   async function comparePage(isCurrent) {
     if (!comparable) return null;
-    const planned = plannedChanges.map(({ field, target, check, anyOf, absentOf }) => ({ field, target, check, ...(anyOf ? { anyOf } : {}), ...(absentOf ? { absentOf } : {}) }));
+    const planned = plannedChanges.map(({ field, target, check, anyOf, absentOf, compare, cut }) => ({ field, target, check, ...(anyOf ? { anyOf } : {}), ...(absentOf ? { absentOf } : {}), ...(compare ? { compare } : {}), ...(cut ? { cut } : {}), ...(onlyToCheck && FLOW_FIELDS.has(field) ? { giveReading: true } : {}) }));
     const extra = (rules?.fields || []).filter(rule => !plannedChanges.some(change => change.field === rule.field)
       && !(rules?.costCenterDescription && rule.field === 'Cost Center Description'))
       .map(rule => (FLOW_FIELDS.has(rule.field) ? { ...rule, giveReading: true } : rule));
@@ -1846,8 +1862,8 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
         otherComment: values.slice(0, planned.length).some(value => value?.otherText),
         positions: values.slice(0, planned.length).map(value => (Number.isFinite(value?.position) ? value.position : null)),
         extra: extra.filter((rule, index) => !rule.giveReading && extraValues[index]?.available && !extraValues[index].matches),
-        waiting: extra.flatMap((rule, index) => (rule.giveReading && extraValues[index]?.available && !extraValues[index].matches
-          ? [{ field: rule.field, current: extraValues[index].text || 'blank', target: rule.display || rule.target }] : [])),
+        waiting: [...planned, ...extra].flatMap((rule, index) => (rule.giveReading && values[index]?.available && !values[index].matches
+          ? [{ field: rule.field, current: values[index].text || 'blank', target: rule.display || rule.target }] : [])),
         commentOnPage: extra.some((rule, index) => rule.field === 'Comment' && rule.contains && onPage(extraValues[index])),
         row: plannedRow ? onPage(rowValue) : false,
         neededRow: !plannedRow && rowValue?.available && !rowValue.matches ? rules.dateSensitive : null,
@@ -1919,6 +1935,7 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
       || reading.otherComment || reading.managerEmailWrong || reading.blockedHeadcount === false));
   }
   function doneWarnings() {
+    if (item.deadEnd && !person?.verified) return { reasons: [], outcome: '' };
     if (!canCheck) return { reasons: [`${TOOL_NAME} could not check the profile for this case.`], outcome: 'profile not seen' };
     if (person && !person.verified) return { reasons: [`MySource is not showing ${name}'s profile.`], outcome: 'profile not seen' };
     if (!person?.verified) return { reasons: [`${TOOL_NAME} has not checked ${name}'s profile yet.`], outcome: 'profile not seen' };
@@ -2742,7 +2759,7 @@ function createProfileFill({ mySource, onState = () => {}, saveTimeoutMs = 10000
         canNavigate = false;
         const identity = { email: item.profileEmail || item.email || '', employeeId: item.employeeId || '' };
         const profileKey = identity.employeeId;
-        if (savedProfiles.has(profileKey)) throw new Error('Save: already pressed for this profile in this run; check it by hand.');
+        if (savedProfiles.has(profileKey)) throw new Error('By hand: Save was already pressed for this profile in this run; check it by hand.');
         const save = identify(seen.doc, identity);
         const form = save.form || save.closest('[data-profile-form]');
         const plans = (item.changes || []).filter(change => change.field !== 'Comment');
@@ -3295,7 +3312,7 @@ function createAutoRun({mySource,worklist,onChange=()=>{},beforeWrite=()=>new Pr
       for(const item of worklist.getBatch().cases) {
         if(token!==epoch || !fill.enabled || fill.state==='stopped')break;
         if(worklist.getBatch().done.has(item.key) || records.has(item.key))continue;
-        if(endPoint(item)==='no-action') {record(item,{state:'not-run',reason:'No action: left for the operator to mark Done.'});continue;}
+        if(item.status==='no-action') {record(item,{state:'not-run',reason:'No action: left for the operator to mark Done.'});continue;}
         if(endPoint(item)!=='action' || fillBlocker(item)) {record(item,{state:'by-hand',reason:fillBlocker(item)});continue;}
         if(!await boundary(token))break;
         current=item;identity='Checking Email and Employee ID';status='Opening profile';publish();
@@ -3503,9 +3520,9 @@ function whatToDoLines(item, steps) {
   const lines = textLines(steps);
   if (!lines) return lines;
   for (const line of lines.children) {
-    const note = /^Write "(No Change|RM is not applicable)" in the ticket's Resolution Notes\./.exec(line.textContent)?.[1];
+    const [, before, note] = /^(.*\b[Ww]rite ")(No Change|RM is not applicable|Business area not supported|Deactivated)" in the ticket's Resolution Notes\./.exec(line.textContent) || [];
     if (!note) continue;
-    line.replaceChildren('Write "', copyText(note, 'Resolution Notes'), line.textContent.slice(`Write "${note}`.length));
+    line.replaceChildren(before, copyText(note, 'Resolution Notes'), line.textContent.slice(`${before}${note}`.length));
   }
   return lines;
 }
@@ -3800,7 +3817,7 @@ __exports.caseScreen = caseScreen;
 const { manualHeadings } = __require("../rules/rulebook.js");
 const { DP_LINE_BREAK, RETURN_DP_FROM, withOutcome } = __require("../rules/checks.js");
 const { regionKey, sameValue } = __require("../rules/prepare.js");
-const { isConsultingServices } = __require("../rules/facts.js");
+const { isConsultingServices, KIND } = __require("../rules/facts.js");
 const { STEP_BREAK } = __require("./wording.js");
 const { deactivationSchedule } = __require("../rules/mappings.js");
 const CANNOT_PLAN_STEP = 'Follow the ✗ line above.';
@@ -3810,44 +3827,60 @@ function personName(item) {
 }
 function opensReview(item) {
   if (item.deadEnd) return true;
-  if (item.pendingCostCenterDescription && !item.deadEnd && !item.cannotPlan && item.status !== 'later') return true;
+  if (item.pendingCostCenterDescription && !item.deadEnd && !item.cannotPlan && item.status !== 'later' && !waitingForMySource(item)) return true;
   if (item.status === 'ready' || item.status === 'no-action') return true;
   return item.status === 'manual' && !item.cannotPlan && !item.manualReasons.includes('not-updated')
     && (PROFILE_WORK.has(item.specialCase) || Boolean(item.employeeId));
 }
-const END_POINTS = { action: 'Action', deactivation: 'Deactivation', 'by-hand': 'By hand', later: 'Later', 'no-action': 'No action' };
+const END_POINTS = { action: 'Action', deactivation: 'Deactivation', 'by-hand': 'By hand', 'no-change': 'No change', later: 'Later' };
 function endPoint(item) {
-  if (item.deadEnd) return 'by-hand';
+  if (item.deadEnd) return item.businessNotSupported ? 'no-change' : 'deactivation';
   if (item.status === 'later') return 'later';
-  if (item.status === 'no-action') return 'no-action';
+  if (item.status === 'no-action') return noChange(item) ? (closesByItself(item) ? 'no-change' : 'by-hand') : item.specialCase === 'deactivation' ? 'deactivation' : 'action';
   if (item.status === 'ready') return item.specialCase === 'deactivation' ? 'deactivation' : 'action';
+  if (item.leavingNotFound) return 'deactivation';
   const reasons = item.cannotPlan ? [] : item.manualReasons || [];
-  if (reasons.includes('not-updated')) return 'later';
   if (reasons.includes('reactivation')) return 'action';
+  if (reasons.includes('replaced-by-newer')) return 'no-change';
   return 'by-hand';
 }
-const LATER_HEADINGS = ['Date to come', 'Waiting for MySource'];
-const laterHeading = item => (item.status === 'later' ? LATER_HEADINGS[0] : LATER_HEADINGS[1]);
+const WAITING_HEADING = 'Waiting for MySource';
+const waitingForMySource = item => item.status === 'manual' && !item.cannotPlan && (item.manualReasons || []).includes('not-updated');
+function noChange(item) {
+  return item.status === 'no-action' && !item.deadEnd && !item.specialCase && item.scenario === KIND.none;
+}
+const alreadyUpdated = item => item.status === 'no-action' && !item.deadEnd && !item.specialCase && item.scenario !== KIND.none;
+const onlyToCheck = item => alreadyUpdated(item) || (item.status === 'no-action' && !item.deadEnd && item.specialCase === 'product');
+const closesByItself = item => noChange(item) && !item.pendingCostCenterDescription && !item.checkCostCenterDescription;
 const RM_NOT_APPLICABLE_NOTE = 'RM is not applicable';
 const NO_ONE_DP = new Set(['no-row', 'several', 'blank', 'no-sheet']);
-const rmNotApplicable = item => !item.deadEnd && (item.specialCase === 'deactivation' || Boolean(item.noResourceManager)
+const notOnReport = item => Boolean(item.notOnReport) || ['no-profile', 'no-email'].some(reason => (item.manualReasons || []).includes(reason));
+const replacedByNewer = item => (item.manualReasons || []).includes('replaced-by-newer');
+const rmNotApplicable = item => !item.deadEnd && (item.specialCase === 'deactivation' || item.specialCase === 'product' || Boolean(item.noResourceManager)
   || normalizeResourceManager(item) || NO_ONE_DP.has(item.dp?.status));
 const normalizeResourceManager = item => (item.pageChecks?.fields || item.changes || []).some(change => change.field === 'Resource Manager' && /^not applicable$/i.test(String(change.target ?? '').trim()));
 function resolutionNote(item) {
-  if (item.deadEnd) return 'No Change';
-  if (endPoint(item) === 'later') return '';
-  if (rmNotApplicable(item)) return RM_NOT_APPLICABLE_NOTE;
-  return endPoint(item) === 'no-action' ? 'No Change' : '';
+  if (item.deadEnd) return item.businessNotSupported ? 'Business area not supported' : 'Deactivated';
+  if (endPoint(item) === 'later' || waitingForMySource(item)) return '';
+  if (item.specialCase === 'deactivation') return 'Deactivated';
+  if (notOnReport(item)) return item.leavingNotFound ? 'Deactivated' : '';
+  if (replacedByNewer(item)) return '';
+  if (noChange(item)) return 'No Change';
+  return rmNotApplicable(item) ? RM_NOT_APPLICABLE_NOTE : '';
 }
-const NO_CHANGE_STEP = 'Write "No Change" in the ticket\'s Resolution Notes.';
-const resolutionStep = item => (resolutionNote(item) ? `Write "${resolutionNote(item)}" in the ticket's Resolution Notes.` : '');
+const resolutionStep = item => (!resolutionNote(item) ? '' : item.leavingNotFound
+  ? `Once you've confirmed the profile is deactivated, write "${resolutionNote(item)}" in the ticket's Resolution Notes.`
+  : `Write "${resolutionNote(item)}" in the ticket's Resolution Notes.`);
+const NOTHING_TO_DO = 'Nothing to do.';
+const NO_CHANGE = 'No change.';
 function endPointDetail(item) {
   if (item.deadEnd) return 'Dead end';
   const end = endPoint(item);
-  if (end === 'later') return item.status === 'later' ? '' : LATER_HEADINGS[1];
+  if (waitingForMySource(item)) return WAITING_HEADING;
+  if (end === 'later') return '';
   return item.status === 'manual' ? manualHeadings(item).join(' · ') : '';
 }
-const TAG_KEYS = { action: 'ready', deactivation: 'deactivation', 'by-hand': 'manual', later: 'later', 'no-action': 'no-action' };
+const TAG_KEYS = { action: 'ready', deactivation: 'deactivation', 'by-hand': 'manual', 'no-change': 'no-change', later: 'later' };
 function statusTag(item, done = false, outcome = '') {
   if (item.status === 'later') return { key: 'later', label: END_POINTS.later };
   if (done) return { key: 'done', label: 'Done' + (outcome ? ` (${outcome})` : '') };
@@ -3871,16 +3904,18 @@ function differences(item) {
   return item.notes.filter(note => note.field && !note.expected).map(noteText);
 }
 function nextStep(item) {
-  if (item.deadEnd) return item.whatToDo && item.whatToDo !== 'Nothing to do.' ? item.whatToDo : 'Nothing to do in MySource.';
+  if (item.deadEnd) return item.whatToDo || NOTHING_TO_DO;
   if (item.specialCase === 'deactivation') return `${item.whatToDo} Confirm the schedule step: ${deactivationSchedule(item.effectiveMonday)} Add in Comments 4: ${item.comment}`;
   return item.cannotPlan ? CANNOT_PLAN_STEP : item.whatToDo;
 }
 function whatToDo(item) {
   if (item.pendingCostCenterDescription) return nextStep(item);
-  const steps = item.specialCase === 'deactivation' ? item.whatToDo : item.status === 'ready' ? '' : nextStep(item);
   const note = resolutionStep(item);
-  if (!note || steps.includes(note)) return steps;
-  return steps === NO_CHANGE_STEP ? note : [steps, note].filter(Boolean).join(STEP_BREAK);
+  if (onlyToCheck(item)) return note;
+  if (noChange(item)) return `${NO_CHANGE}${STEP_BREAK}${note}`;
+  if (item.deadEnd) return `${NOTHING_TO_DO}${STEP_BREAK}${note}`;
+  const steps = item.specialCase === 'deactivation' ? item.whatToDo : item.status === 'ready' ? '' : nextStep(item);
+  return [steps, note].filter(Boolean).join(STEP_BREAK);
 }
 function caseChanges(item) {
   if (item.pendingCostCenterDescription) return { title: 'Changes to make', informationOnly: false, changes: [], dateSensitive: null, dateNote: dateNote(item) };
@@ -3895,6 +3930,8 @@ function caseChanges(item) {
     dateNote: dateNote(item),
   };
 }
+const askedOf = item => (item.pageChecks?.fields || []).filter(check => check.asked || (item.specialCase === 'product' && check.field === 'Resource Manager'));
+const caseChecks = item => (onlyToCheck(item) ? { ...caseChanges(item), onlyToCheck: true, changes: askedOf(item) } : caseChanges(item));
 const onItsLine = note => note.answersTheMissingDate;
 function attention(item) {
   const step = whatToDo(item);
@@ -3925,7 +3962,9 @@ function caseTop(item) {
   const howTo = steps.filter(line => !BY_HAND_ONLY(line));
   if (!flagged.length) return { label, lines: howTo, steps: [], tucked: [], withChanges: [] };
   const pointsOn = flagged.filter(line => /^✗/.test(line)).every(line => line.includes('→'));
-  return { label, lines: flagged, steps: pointsOn ? [] : howTo, tucked: pointsOn ? howTo : [], withChanges: [] };
+  const isNote = line => /Resolution Notes\.$/.test(line);
+  return pointsOn ? { label, lines: [...flagged, ...howTo.filter(isNote)], steps: [], tucked: howTo.filter(line => !isNote(line)), withChanges: [] }
+    : { label, lines: flagged, steps: howTo, tucked: [], withChanges: [] };
 }
 const DP_STATES = {
   not_applicable: 'Not used',
@@ -3939,18 +3978,20 @@ function dpExplanation(dp) {
 const PLAIN_WHY = {
   action: 'Action · the profile needs the changes at the top',
   deactivation: 'Deactivation · the steps at the top take the profile out of Consulting Services',
-  'no-action': 'No action · MySource shows everything the ticket and the rules ask for',
+  'by-hand': 'No change · the ticket asks for no change',
+  'no-change': 'No change · the ticket asks for no change',
 };
+const ONLY_TO_CHECK_WHY = 'Action · the report already shows what the ticket asked for → check it on the page';
 const USED_ORDER = ['Business', 'Practice', 'Business Area', 'Business Line', 'Talent Group', 'Talent Sub Group', 'Cost Center', 'Cost Center Description',
   'Position Title', 'Level', 'New level', 'Level Group', 'Region', 'Hire Type', 'Department', 'Active'];
 const usedRank = entry => (USED_ORDER.includes(entry.field) ? USED_ORDER.indexOf(entry.field) : USED_ORDER.length);
 function howDecided(item) {
   const said = differences(item);
-  const topSaysIt = item.status === 'manual' || (item.deadEnd && !item.notes.length);
+  const topSaysIt = item.status === 'manual' || (item.deadEnd && !item.notes.length && !item.businessNotSupported);
   const plain = !caseHeading(item) && item.status !== 'later' && !item.deadEnd;
   const why = topSaysIt || (plain && !said.length) ? [] : [
-    item.status === 'later' ? `${END_POINTS.later} · ${LATER_HEADINGS[0]} (${item.effectiveMonday || 'the effective date'})`
-      : item.deadEnd ? `Dead end: ${String(noteText(item.notes[0])).split(' · ')[0].split(' → ')[0].replace(/^[✓\s]+/, '')}` : PLAIN_WHY[endPoint(item)],
+    item.status === 'later' ? `${END_POINTS.later} · Date to come (${item.effectiveMonday || 'the effective date'})`
+      : item.deadEnd ? `Dead end: ${item.notes.length ? String(noteText(item.notes[0])).split(' · ')[0].split(' → ')[0].replace(/^[✓\s]+/, '') : item.whatToDo.replace(/^Nothing to do:\s*/, '')}` : onlyToCheck(item) ? ONLY_TO_CHECK_WHY : PLAIN_WHY[endPoint(item)],
     ...said,
   ];
   const explained = dpExplanation(item.dp);
@@ -3992,11 +4033,14 @@ __exports.personName = personName;
 __exports.opensReview = opensReview;
 __exports.END_POINTS = END_POINTS;
 __exports.endPoint = endPoint;
-__exports.LATER_HEADINGS = LATER_HEADINGS;
-__exports.laterHeading = laterHeading;
+__exports.WAITING_HEADING = WAITING_HEADING;
+__exports.waitingForMySource = waitingForMySource;
+__exports.alreadyUpdated = alreadyUpdated;
+__exports.closesByItself = closesByItself;
+__exports.notOnReport = notOnReport;
+__exports.replacedByNewer = replacedByNewer;
 __exports.rmNotApplicable = rmNotApplicable;
 __exports.resolutionNote = resolutionNote;
-__exports.resolutionStep = resolutionStep;
 __exports.endPointDetail = endPointDetail;
 __exports.statusTag = statusTag;
 __exports.manualReasons = manualReasons;
@@ -4005,6 +4049,7 @@ __exports.differences = differences;
 __exports.nextStep = nextStep;
 __exports.whatToDo = whatToDo;
 __exports.caseChanges = caseChanges;
+__exports.caseChecks = caseChecks;
 __exports.attention = attention;
 __exports.warnings = warnings;
 __exports.dateNote = dateNote;
@@ -4019,7 +4064,7 @@ __exports.allNotes = allNotes;
 const { csvCell } = __require("../common.js");
 const { RULES_DATE } = __require("../rules/mappings.js");
 const { oneLine } = __require("../rules/checks.js");
-const { allNotes, caseChanges, dpExplanation, endPointDetail, laterHeading, nextStep, statusTag } = __require("../screen/case-summary.js");
+const { WAITING_HEADING, allNotes, caseChanges, dpExplanation, endPointDetail, nextStep, statusTag, waitingForMySource } = __require("../screen/case-summary.js");
 const { rowColumns } = __require("../screen/wording.js");
 const HEADERS = [
   'Ticket Number', 'Subject Person', 'Email', 'Kind of Change', 'Status', 'Why',
@@ -4049,7 +4094,8 @@ function dateSensitiveCell(item) {
 function statusCell(item, { done, outcomes, skipped }) {
   if (!done.has(item.key) && skipped.has(item.key)) return 'Skipped';
   const { key, label } = statusTag(item, done.has(item.key), outcomes.get(item.key) || '');
-  return key === 'later' ? `${label}: ${laterHeading(item)}` : label;
+  if (key === 'later') return `${label}: Date to come`;
+  return !done.has(item.key) && waitingForMySource(item) ? `${label}: ${WAITING_HEADING}` : label;
 }
 function worklistRows({ cases, done = new Set(), outcomes = new Map(), skipped = new Set(), notes = new Map(), findings = new Map(), wrong = new Map() }) {
   cases = cases.map(item => ({ corrections:[], changes:[], notes:[], planNotes:[], blockers:[], used:[], checks:{ticket:{total:0},profile:{total:0}}, dp:null, ...item }));
@@ -4109,25 +4155,24 @@ __exports.downloadBlob = downloadBlob;
 "files/run-workbook.js": function (__require, __exports, document, window) {
 'use strict';
 const { worklistRows } = __require("./export.js");
-const { endPoint, resolutionNote, rmNotApplicable } = __require("../screen/case-summary.js");
+const { alreadyUpdated, closesByItself, endPoint, notOnReport, replacedByNewer, resolutionNote, rmNotApplicable } = __require("../screen/case-summary.js");
 const { descriptionToText } = __require("../rules.js");
-const { DEACTIVATED_ALREADY } = __require("../rules/gates.js");
 const { xlsxBytes } = __require("./xlsx-writer.js");
 const person = item => item.rosterName || item.profileName || item.subjectPerson || '';
-const mailDp = item => ((item.deadEnd ? item.mailDp : item.dp)?.status === 'matched' ? (item.deadEnd ? item.mailDp : item.dp) : null);
+const mailDp = item => (item.dp?.status === 'matched' ? item.dp : null);
 const firstName = name => (String(name ?? '').includes(',') ? String(name).split(',')[1] : String(name ?? '')).trim().split(/\s+/)[0] || '';
 const mailEligible = (item, record) => record?.state === 'done'
   && (record.manual || record.mailConfirmed)
-  && endPoint(item) !== 'no-action' && item.specialCase !== 'deactivation'
-  && !rmNotApplicable(item) && !(item.deadEnd && !mailDp(item))
-  && !(item.notes || []).some(note => note.text?.startsWith(DEACTIVATED_ALREADY));
+  && endPoint(item) === 'action'
+  && !rmNotApplicable(item) && !notOnReport(item) && !replacedByNewer(item);
+const CLOSED_ALONE = 'No change on the ticket';
 function runMail(item, record, context = {}, signOff = '') {
   if (!mailEligible(item, record)) return null;
   const dp = mailDp(item);
   const to = dp?.email || '';
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to) || !signOff.trim() || !person(item) || !item.ticketNumber || !firstName(dp.name)) return null;
   let body;
-  if (context.newProfile && !item.deadEnd) {
+  if (context.newProfile && !alreadyUpdated(item)) {
     if (!context.source || !context.destination) return null;
     body = `The profile has been created in ${context.destination}, following the transfer from ${context.source}. The ${context.source} profile will be deactivated after the transfer effective date.\n\nPlease let us know if anything changes.`;
   } else {
@@ -4149,7 +4194,8 @@ function runSheets({ cases, results = new Map(), contexts = new Map(), signOff =
   const summary = [['Ticket','Person','Email','Result','What was done','Resolution note','Needs attention']];
   const mails = [['Ticket','To','Subject','Mail','Resolution note']];
   for (const item of cases) {
-    const record = done?.has(item.key) ? { ...results.get(item.key), state:'done', manual:true, outcome:outcomes.get(item.key) || '' } : (done && results.get(item.key)?.state==='done' ? {state:'not-run',reason:'Reopened; not Done.'} : results.get(item.key)) || { state: 'not-run', reason: item.manualReasons?.join('; ') || 'Not run' };
+    const passedOver = results.get(item.key)?.state === 'not-run' ? { reason:'' } : {};
+    const record = done?.has(item.key) ? { ...results.get(item.key), ...passedOver, state:'done', manual:true, outcome:outcomes.get(item.key) || '' } : (done && results.get(item.key)?.state==='done' ? {state:'not-run',reason:'Reopened; not Done.'} : results.get(item.key)) || { state: 'not-run', reason: item.manualReasons?.join('; ') || 'Not run' };
     const proved = record.state === 'done' && record.confirmed;
     const result = record.state === 'done' ? record.manual ? `Done${record.outcome ? ` (${record.outcome})` : ''}` : proved ? 'Done' : 'Unproved Done' : record.state === 'by-hand' ? 'By hand' : record.state;
     const mail = runMail(item, record, contexts.get(item.key), signOff);
@@ -4158,8 +4204,8 @@ function runSheets({ cases, results = new Map(), contexts = new Map(), signOff =
     const reason = [record.reason, missing].filter(Boolean).join('; ');
     const note = record.state === 'done' ? resolutionNote(item) || record.resolution || '' : record.resolution || '';
     const attention = (!proved && !record.manual) || reason || record.outcome ? reason || record.outcome || 'No proved outcome' : '';
-    summary.push([item.ticketNumber,person(item),item.email,result,record.what || '',note,attention]);
-    if (mailEligible(item, record) || (record.state === 'done' && note)) mails.push([item.ticketNumber,mail?.to || '',mail?.subject || '',mail?.body || '',note]);
+    summary.push([item.ticketNumber,person(item),item.email,result,record.what || (record.state === 'done' && closesByItself(item) ? CLOSED_ALONE : ''),note,attention]);
+    if (mailEligible(item, record) || note) mails.push([item.ticketNumber,mail?.to || '',mail?.subject || '',mail?.body || '',note]);
   }
   return [{ name:'Cases',rows:summary }, { name:'Mails',rows:mails }, { name:'Worklist',rows:worklistRows({cases,done:marks,outcomes,...worklist}) }];
 }
@@ -4371,11 +4417,12 @@ function worklistItems(items, asOfDate, levelGroups, people = {}) {
       ...(item.pendingCostCenterDescription ? { pendingCostCenterDescription: true } : {}),
       ...(item.watchCostCenterDescription ? { checkCostCenterDescription: true } : {}),
       deadEnd: Boolean(item.deadEnd),
+      ...(item.businessNotSupported ? { businessNotSupported: true } : {}),
+      ...(item.leavingNotFound ? { leavingNotFound: true } : {}),
+      ...(item.notOnReport ? { notOnReport: true } : {}),
       scenario: item.scenario,
       whatToDo: `${item.pendingCostCenterDescription ? 'Cost Center Description not known yet - open the right profile; the page check reads it.' : status === 'ready' && !item.specialCase ? 'Make the changes listed.'
-        : item.whatToDo}${alsoCloseStep(item)}`,
-      ...(item.alsoClose ? { alsoClose: item.alsoClose } : {}),
-      ...(item.closedWith ? { closedWith: item.closedWith } : {}),
+        : item.whatToDo}`,
       comment: item.comment || '',
       notes: (plan.planNotes.some(note => note.answersTheMissingDate) ? item.notes.filter(note => !note.aboutTheMissingDate) : item.notes)
         .map(note => (status === 'no-action' && !item.deadEnd && note.text === NO_DATE_FOUND ? { text: 'No effective date on the ticket: not needed, as nothing changes', aside: true } : note)),
@@ -4391,11 +4438,6 @@ function worklistItems(items, asOfDate, levelGroups, people = {}) {
       sourceRow: item.sourceRow,
     };
   });
-}
-function alsoCloseStep(item) {
-  if (!item.alsoClose?.length) return '';
-  const tickets = item.alsoClose.map(({ number, date }) => `${number} (effective ${date})`).join(', ');
-  return ` Also close ${tickets} with this one: ${item.alsoClose.length === 1 ? 'an older ticket' : 'older tickets'} for them.`;
 }
 __exports.fieldWithoutRule = fieldWithoutRule;
 __exports.manualHeadings = manualHeadings;
@@ -4815,6 +4857,7 @@ function pageTicketValues(fields) {
     compare: name === 'Cost Center' ? 'code' : 'text',
     ...(name !== 'Cost Center' && field.should.length >= TICKET_CUT_LENGTH - 2 ? { cut: true } : {}),
     ...(field.shouldFrom.startsWith('ticket') ? {} : { quiet: true }),
+    ...(field.moving ? { asked: true } : {}),
   }));
 }
 __exports.rosterByEmail = rosterByEmail;
@@ -4837,7 +4880,7 @@ __exports.pageTicketValues = pageTicketValues;
 "rules/gates.js": function (__require, __exports, document, window) {
 'use strict';
 const { containsAuditOrTax, extractLevelCode, isAwaitingEffectiveDate, meaningfulFutureFields, normalizeText, profileKind, withoutLeadingCode } = __require("../rules.js");
-const { BLOCKED_HEADCOUNT, CLOSING_BUSINESS_AREA, UNSUPPORTED_BUSINESS_AREAS, DATE_SENSITIVE_LEVEL_OPTIONS, deactivationComment, deactivationSteps, GPS_NATIONAL_OFFICE, IGNORED_TICKET_FIELDS, mySourceName, NO_RESOURCE_MANAGER, OPEN_TERMINATION_DATE, PROFILE_NOT_FOUND_STEPS, reactivationSteps, ROSTER_SHOULD_SHOW, TICKET_FIELD_CHECKS } = __require("./mappings.js");
+const { BLOCKED_HEADCOUNT, CLOSING_BUSINESS_AREA, UNSUPPORTED_BUSINESS_AREAS, DATE_SENSITIVE_LEVEL_OPTIONS, deactivationComment, deactivationSteps, GPS_NATIONAL_OFFICE, IGNORED_TICKET_FIELDS, LEAVING_NOT_FOUND_STEPS, mySourceName, NO_RESOURCE_MANAGER, OPEN_TERMINATION_DATE, PROFILE_NOT_FOUND_STEPS, reactivationSteps, ROSTER_SHOULD_SHOW, TICKET_FIELD_CHECKS } = __require("./mappings.js");
 const { emailCandidates, emailIndex, emailKey, exactEmployeeId, findByEmail, onOrBefore, plainEmail, readDay, sameDay, sameValue } = __require("./prepare.js");
 const { sundayBefore } = __require("./prepare.js");
 const { STEP_BREAK, ticketSaysNoDate } = __require("../screen/wording.js");
@@ -4855,24 +4898,25 @@ function sortTickets(serviceNowRows, mySourceRows, asOfDate, roster, decide, pag
   const allGroups = groupsByEmail(tickets, item => plainEmail(item.parsed.email));
   const profileGroups = groupsByEmail(mySourceRows, row => row.Email);
   const profileIndex = emailIndex(profileGroups, entry => entry[0]);
-  const { latest, older } = latestTickets(allGroups, asOfDate);
+  const onTheirOwn = ticketsWithTheirOwnDate(allGroups, asOfDate);
   return tickets.map(item => {
     const { row, parsed } = item;
     const key = emailKey(parsed.email);
     const profileMatch = findByEmail(key, profileIndex);
     const profiles = onceEach(profileMatch.match?.[1] || []);
     const inRoster = key ? matchRoster(roster, key, profiles.length === 1 ? profiles[0] : null) : null;
-    if (older.has(item)) return olderTicket(baseRecord(row, parsed), older.get(item));
-    const ticketGroups = latest.has(item) ? new Map([...allGroups, [plainEmail(key), [item]]]) : allGroups;
+    const ticketGroups = onTheirOwn.has(item) ? new Map([...allGroups, [plainEmail(key), [item]]]) : allGroups;
     const byId = !profiles.length && !profileMatch.unclear && !inRoster?.conflicts ? deactivatedById(mySourceRows, inRoster) : null;
     const matchedProfiles = byId ? [byId] : profiles;
-    const worked = sortTicket(row, parsed, key, { ticketGroups, profiles: matchedProfiles, profileUnclear: profileMatch.unclear, asOfDate, inRoster, decide, pageDescription: pageDescriptions?.get(row.Number) || '' });
+    const newerTickets = onTheirOwn.has(item) ? (allGroups.get(plainEmail(key)) || []).filter(other => other !== item
+      && !isAwaitingEffectiveDate(other.parsed.phase3EffectiveDate, asOfDate) && !onOrBefore(other.parsed.phase3EffectiveDate, parsed.phase3EffectiveDate)) : [];
+    const worked = sortTicket(row, parsed, key, { newerTickets, ticketGroups, profiles: matchedProfiles, profileUnclear: profileMatch.unclear, asOfDate, inRoster, decide, pageDescription: pageDescriptions?.get(row.Number) || '' });
     const note = byId ? FOUND_BY_ID_NOTE : profiles.length === 1 && profileMatch.form !== 'exact'
       ? emailMatchNote(profileMatch.form, profiles[0].Email) : '';
     const withEmail = profiles.length === 1 && emailKey(profiles[0].Email) !== key
       ? { ...worked, profileEmail: profiles[0].Email } : worked;
     const found = note ? { ...withEmail, notes: [{ text: note }, ...(worked.notes || [])] } : withEmail;
-    const result = latest.get(item)?.length ? { ...found, alsoClose: latest.get(item) } : found;
+    const result = found;
     if (!key || inRoster?.conflicts || matchedProfiles.length || profileMatch.unclear || result.sorted === 'later') return result;
     return { ...result, notes: [...(result.notes || []), { text: rosterSays(inRoster) }] };
   });
@@ -4891,28 +4935,33 @@ function deactivatedById(mySourceRows, inRoster) {
   }));
   return found.length === 1 ? found[0] : null;
 }
-function latestTickets(groups, asOfDate) {
-  const latest = new Map();
-  const older = new Map();
-  const effective = item => ({ number: item.row.Number || '', date: item.parsed.transferEffectiveDate || '' });
+function ticketsWithTheirOwnDate(groups, asOfDate) {
+  const alone = new Set();
   for (const group of groups.values()) {
     const current = group.filter(item => !isAwaitingEffectiveDate(item.parsed.phase3EffectiveDate, asOfDate));
     if (current.length === 1 && group.length > 1) {
-      latest.set(current[0], []);
+      alone.add(current[0]);
       continue;
     }
     if (current.length < 2 || current.some(item => !item.parsed.phase3EffectiveDate)) continue;
-    const newest = current.reduce((best, item) => (onOrBefore(best.parsed.phase3EffectiveDate, item.parsed.phase3EffectiveDate) ? item : best));
-    const rest = current.filter(item => item !== newest);
-    if (rest.some(item => sameDay(item.parsed.phase3EffectiveDate, newest.parsed.phase3EffectiveDate))) continue;
-    latest.set(newest, rest.map(effective));
-    for (const item of rest) older.set(item, effective(newest));
+    if (current.some((item, index) => current.slice(index + 1).some(other => sameDay(item.parsed.phase3EffectiveDate, other.parsed.phase3EffectiveDate)))) continue;
+    for (const item of current) alone.add(item);
   }
-  return { latest, older };
+  return alone;
 }
-function olderTicket(base, later) {
-  const ended = deadEnd(base, `✓ An older ticket for this person (effective ${base.ticketEffectiveDate}) → the later one, ${later.number} (effective ${later.date}), is worked`);
-  return { ...ended, whatToDo: `Close this ticket with ${later.number}: that later ticket is the one worked.`, closedWith: later.number };
+function replacedByNewer(facts, profile, inRoster, newerTickets) {
+  for (const newer of newerTickets) {
+    const theirs = collate(newer.parsed, profile, inRoster).fields;
+    for (const [field, mine] of Object.entries(facts.fields)) {
+      const next = theirs[field]?.future;
+      const same = TICKET_FIELD_CHECKS[field].compare;
+      if (!mine.moving || !filled(next) || same(mine.future, next)) continue;
+      if ([mine.mySource, mine.roster].some(value => filled(value) && same(next, value))) {
+        return `⚠ ${mine.column}: MySource ${mine.mySource || 'blank'} → ticket ${mine.future} · a newer ticket (${newer.row.Number}) sets this field`;
+      }
+    }
+  }
+  return '';
 }
 function rosterSays(inRoster) {
   if (!inRoster) return 'Roster: not in the roster either';
@@ -4920,7 +4969,7 @@ function rosterSays(inRoster) {
   const said = shownFields.filter(field => inRoster.values[field]).map(field => `${field} ${inRoster.values[field]}`);
   return `Roster: ${said.length ? said.join(' · ') : 'found, nothing filled in'}`;
 }
-function sortTicket(row, parsed, key, { ticketGroups, profiles, profileUnclear = false, asOfDate, inRoster, decide, pageDescription = '' }) {
+function sortTicket(row, parsed, key, { newerTickets = [], ticketGroups, profiles, profileUnclear = false, asOfDate, inRoster, decide, pageDescription = '' }) {
   const base = baseRecord(row, parsed);
   if (emailCandidates(parsed.email).length > 1) return manualRecord(base, 'no-email', '✗ More than one email on the ticket → email is unclear; handle this case by hand');
   if (inRoster?.conflicts) return manualRecord(base, 'roster-conflict', rosterConflictNote(inRoster));
@@ -4937,18 +4986,16 @@ function sortTicket(row, parsed, key, { ticketGroups, profiles, profileUnclear =
   if (!matches.length) {
     const facts = { ...collate(parsed, null, inRoster), pageDescription };
     const unsupported = unsupportedMove(facts);
-    if (!facts.inExport && unsupported.deactivate && /\btax\b/.test(normalizeText(facts.fields['Operating Model'].going))) {
-      return { ...manualRecord(base, 'no-profile', `✗ Not found by email · ${unsupported.deactivate} → not confirmed deactivated`, PROFILE_NOT_FOUND_STEPS), used: usedFrom(facts) };
+    if (deadEndWhy(facts, unsupported)) {
+      return { ...manualRecord(base, 'no-profile', `✗ Not found by email · ${unsupported.deactivate || unsupported.where} → not confirmed deactivated`, LEAVING_NOT_FOUND_STEPS), leavingNotFound: true, used: usedFrom(facts) };
     }
-    const ended = deadEndWhy(facts, unsupported);
-    if (ended) return { ...deadEnd(base, ended), used: usedFrom(facts) };
     const first = businessWording(base, facts) || businessDeadEnd(base, businessMove(facts));
     if (first) return { ...first, used: usedFrom(facts) };
     const business = facts.fields['Operating Model'];
     const intoConsulting = isConsultingServices(business.going)
       && (isConsultingServices(business.future) || (filled(business.now) && !isConsultingServices(business.now)));
     if (intoConsulting) {
-      if (kindOf(facts.profile, inRoster) === 'unknown') return { ...manualRecord(base, 'gps-indicator-unknown', unknownIndicator(inRoster)), used: usedFrom(facts) };
+      if (kindOf(facts.profile, inRoster) === 'unknown') return { ...manualRecord(base, 'gps-indicator-unknown', unknownIndicator(inRoster)), notOnReport: true, used: usedFrom(facts) };
       const found = returnFoundLive({ ...base, region: rosterRegion(inRoster), rosterEmployeeId: rosterEmployeeId(inRoster), rosterLevel: inRoster?.level || '', ...(unsupported.pendingCostCenterDescription ? { pendingCostCenterDescription: true } : {}), ...(unsupported.checkCostCenterDescription ? { checkCostCenterDescription: true, watchCostCenterDescription: true } : {}) }, parsed, kindOf(facts.profile, inRoster), returnMappingValues(facts, inRoster));
       const fromTax = comesFromTax(facts);
       return { ...found, ...(fromTax ? { whatToDo: `${FROM_TAX_NOTE}${STEP_BREAK}${found.whatToDo}` } : {}), used: usedFrom(facts) };
@@ -4957,6 +5004,8 @@ function sortTicket(row, parsed, key, { ticketGroups, profiles, profileUnclear =
   }
   if (matches.length > 1) return manualRecord(base, 'duplicate-profile', '✗ More than one MySource profile has this email');
   const facts = collate(parsed, matches[0], inRoster);
+  const replaced = replacedByNewer(facts, matches[0], inRoster, newerTickets);
+  if (replaced) return { ...manualRecord(base, 'replaced-by-newer', replaced), used: usedFrom(facts) };
   const result = decide(row, facts);
   const level = result.newLevelFrom ? [{ field: 'New level', value: result.newLevel, from: result.newLevelFrom }] : [];
   return { ...result, used: [...usedFrom(facts), ...level] };
@@ -5152,11 +5201,11 @@ function businessWording(base, { fields, inExport }) {
   const sides = [['on the ticket', future], ['on the ticket', current], ['in MySource', inExport ? mySource : '']];
   const wrong = sides.find(([, value]) => namesConsulting(value) && !isConsultingServices(value));
   if (!wrong) return null;
-  return deadEnd(base, `✓ Not a business Shuffle covers → nothing to do · Business "${withoutLeadingCode(wrong[1]).trim()}" ${wrong[0]}`);
+  return { ...deadEnd(base, `✓ Not a business Shuffle covers → nothing to do · Business "${withoutLeadingCode(wrong[1]).trim()}" ${wrong[0]}`), businessNotSupported: true };
 }
 function businessDeadEnd(base, move) {
-  if (move.auditOrTax) return deadEnd(base, '', move.auditOrTax);
-  return move.unknown ? deadEnd(base, move.unknown) : null;
+  if (move.auditOrTax) return { ...deadEnd(base, '', move.auditOrTax), businessNotSupported: true };
+  return move.unknown ? { ...deadEnd(base, move.unknown), businessNotSupported: true } : null;
 }
 const LEVEL_WORDS = Object.keys(DATE_SENSITIVE_LEVEL_OPTIONS).map(code => code.slice(1)).join('|');
 const levelPrefix = new RegExp(`^\\s*L\\s*(?:[_-]\\s*)?(?:${LEVEL_WORDS})(?![A-Za-z0-9])\\s*(?:[_-]\\s*)?`, 'i');
@@ -5345,8 +5394,7 @@ __exports.MATCHED_PLAIN_EMAIL_NOTE = MATCHED_PLAIN_EMAIL_NOTE;
 __exports.UNCLEAR_DATED_EMAIL_NOTE = UNCLEAR_DATED_EMAIL_NOTE;
 __exports.emailMatchNote = emailMatchNote;
 __exports.deactivatedById = deactivatedById;
-__exports.latestTickets = latestTickets;
-__exports.olderTicket = olderTicket;
+__exports.ticketsWithTheirOwnDate = ticketsWithTheirOwnDate;
 __exports.rosterSays = rosterSays;
 __exports.sortTicket = sortTicket;
 __exports.rosterById = rosterById;
@@ -5387,7 +5435,7 @@ const { findResourceManager } = __require("./dp-mapping.js");
 const { correction, dateSensitiveTarget, EMPLOYEE_ID_BY_HAND, isProductSubGroup, EMPLOYEE_ID_WITH_ONE_BY_HAND, filled, idWithOne, inConsultingDepartment, inProductDepartment, isDeactivatedProfile, isInactive, KIND, NOT_UPDATED_STEP, notMatched, returnMappingValues, ROSTER_NOT_UPDATED_STEP, rosterEmployeeId, trimmed, waitUntil } = __require("./facts.js");
 const { pageTicketValues } = __require("./collate.js");
 const { returnRowNote } = __require("./gates.js");
-const { comesFromTax, DEACTIVATED_ALREADY, FROM_TAX_NOTE } = __require("./gates.js");
+const { comesFromTax, FROM_TAX_NOTE } = __require("./gates.js");
 const { STEP_BREAK } = __require("../screen/wording.js");
 function shouldShowFor(level, kind, intern) {
   const grade = GRADES[level]?.[kind];
@@ -5477,6 +5525,7 @@ function checkCase(facts, { base, move, unsupported, product, kind, kindNote = '
     backFromProductRow: productRow,
     returnWaiting,
     pageTicketValues: pageTicketValues(facts.fields),
+    levelAsked: Boolean(facts.fields.Title?.moving),
     ticketCostCenter: facts.fields['Cost Center'].to,
     rosterCostCenterDescription: trimmed(facts.roster?.values['Cost Center Description']),
     rosterLevelGroup: trimmed(facts.roster?.values['Level Group']),
@@ -5558,9 +5607,7 @@ function addDpAssignments(results, mapping) {
     const unlooked = extra => ({ ...item, ...extra });
     if (notMatched(item)) return unlooked({ dp: NOT_USED });
     if (item.noResourceManager || item.dpNotUsed) {
-      const mailDp = item.deadEnd && !(item.notes || []).some(note => note.text?.startsWith(DEACTIVATED_ALREADY))
-        ? findResourceManager(mapping, { region: item.region, values: item.mappingValues || {}, level: item.newLevel || extractLevelCode(item.currentLevel) }) : null;
-      return unlooked({ dp: NOT_USED, ...(mailDp ? { mailDp } : {}), checks: item.noResourceManager ? withResourceManagerCheck(item, NO_RESOURCE_MANAGER) : item.checks });
+      return unlooked({ dp: NOT_USED, checks: item.noResourceManager ? withResourceManagerCheck(item, NO_RESOURCE_MANAGER) : item.checks });
     }
     if (item.sorted === 'later' || (item.manualReasons || []).includes('not-updated')) return unlooked({ dp: { ...NOT_USED, status: 'not_yet' } });
     if (item.blockedHeadcount) {
@@ -5785,7 +5832,7 @@ function returnChecklist(item) {
 }
 function pageChecksFor(item, asOfDate, levelGroups = {}) {
   if ((item.manualReasons || []).includes('roster-conflict')) return null;
-  if (item.deadEnd || item.sorted === 'later') return null;
+  if (item.deadEnd || item.leavingNotFound || item.sorted === 'later') return null;
   if (item.pendingCostCenterDescription) return { fields: [], dateSensitive: null, costCenterDescription: BLOCKED_HEADCOUNT };
   if (item.specialCase === 'deactivation') {
     const stillDone = { 'Profile Status': 'No', 'Resource Manager': NO_RESOURCE_MANAGER };
@@ -5822,7 +5869,7 @@ function pageChecksFor(item, asOfDate, levelGroups = {}) {
   fields.push({ field: 'Profile Status', target: 'Yes', quiet: true });
   if (item.email && SITUATION_CHECKS[situationOf(item)].includes('Email')) fields.push({ field: 'Email', target: item.email, quiet: true });
   fields.push(...(item.pageTicketValues || []));
-  fields.push(...everythingElse(item, levelGroups));
+  fields.push(...everythingElse(item, levelGroups).map(check => (item.levelAsked && check.field === 'Position Title' ? { ...check, asked: true } : check)));
   const dateSensitive = dateSensitiveTarget(item, item.newLevel, sundayBefore(item.effectiveMonday) || 'not stated in the ticket');
   const checks = { fields, dateSensitive };
   if (item.checkCostCenterDescription) checks.costCenterDescription = BLOCKED_HEADCOUNT;
@@ -6231,6 +6278,7 @@ const MANUAL_REASONS = {
   'no-email': { group: 'Profile not matched', detail: 'No email on the ticket' },
   'duplicate-ticket': { group: 'Profile not matched', detail: 'More than one ticket' },
   'no-profile': { group: 'Profile not matched', detail: 'No profile found' },
+  'replaced-by-newer': { group: 'Replaced by a newer ticket' },
   'duplicate-profile': { group: 'Profile not matched', detail: 'More than one profile' },
   'business-unclear': { group: 'Not covered by the rules', detail: 'GPS and M&A both' },
   'gps-indicator-unknown': { group: 'Not covered by the rules', detail: 'GPS Indicator not recognised' },
@@ -6264,6 +6312,7 @@ const X_TERM_DEPARTMENT = '999 - X-Term Professional/Client';
 const deactivationComment = ticketNumber => `*DSS*-As per the notification, we have cleared the schedules and deactivated the profile${ticketNumber ? ` - ${ticketNumber}` : ''}`;
 const reactivationSteps = (monday, found = true) => `Reactivate${found ? '' : ' · find the old profile in MySource by name (none? → create the profile)'} → make the changes below so HXM's data can flow. ⏳ Nothing more today: once MySource shows the ticket (about a day), it comes in again in a later import, and anything it still doesn't show is an Action case then. Keep the ServiceNow ticket open until then.`;
 const PROFILE_NOT_FOUND_STEPS ='Deactivated this profile in an earlier batch? → nothing to do. Otherwise: check the ticket\'s email → find the profile in MySource by name and handle this case by hand. No profile at all? → create the profile. ⏳ Nothing more today: once MySource shows it with HXM\'s data (about a day), it comes in again in a later import, and the rest is an Action case then. Keep the ServiceNow ticket open until then.';
+const LEAVING_NOT_FOUND_STEPS = 'Find the profile in MySource by name and check it is deactivated. Still active? → handle this case by hand.';
 __exports.GRADES = GRADES;
 __exports.SCHEDULE_NO_LEVELS = SCHEDULE_NO_LEVELS;
 __exports.INTERN = INTERN;
@@ -6326,6 +6375,7 @@ __exports.X_TERM_DEPARTMENT = X_TERM_DEPARTMENT;
 __exports.deactivationComment = deactivationComment;
 __exports.reactivationSteps = reactivationSteps;
 __exports.PROFILE_NOT_FOUND_STEPS = PROFILE_NOT_FOUND_STEPS;
+__exports.LEAVING_NOT_FOUND_STEPS = LEAVING_NOT_FOUND_STEPS;
 },
 "screen/wording.js": function (__require, __exports, document, window) {
 'use strict';
@@ -9595,11 +9645,11 @@ function readDateSensitiveRow(expected) {
 }
 return { readIdentity, readProfileControls, readValues, listFields, fieldControl, readDateSensitiveRow, profileFieldControls };
 }
-const __transfersScreens = [["header",{"class":"tool-head"},[["button",{"class":"button quiet header-back","id":"header-back","type":"button","hidden":""},["← Worklist"]],["span",{"class":"case-steps","id":"case-steps","hidden":""},[["button",{"class":"button quiet header-step","id":"case-previous","type":"button","title":"Previous case (Alt+↑)","aria-label":"Previous case"},["↑"]],["span",{"class":"case-position","id":"case-position"},[]],["button",{"class":"button quiet header-step","id":"case-next","type":"button","title":"Next case (Alt+↓)","aria-label":"Next case"},["↓"]]]],["strong",{},["Shuffle"]],["span",{"class":"header-space"},[]],["button",{"class":"button secondary header-action","id":"auto-mode","type":"button","hidden":""},["Auto"]],["button",{"class":"button secondary header-action","id":"download","type":"button","title":"Download workbook","aria-label":"Download workbook","hidden":""},["⬇"]],["button",{"class":"button quiet close-transfers","id":"close","type":"button","title":"Close Shuffle","aria-label":"Close Shuffle"},["✕"]]]],["main",{},[["section",{"class":"intake","id":"intake","aria-labelledby":"intake-title"},[["h2",{"id":"intake-title"},["Add the four files"]],["div",{"class":"drop-grid"},[["button",{"class":"drop-card","id":"service-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["ServiceNow export"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"service-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"service-file","accept":".csv,.xlsx","hidden":""},[]],["button",{"class":"drop-card","id":"profile-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["MySource export"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"profile-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"profile-file","accept":".csv,.xlsx","hidden":""},[]],["button",{"class":"drop-card","id":"dp-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["DP mapping"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"dp-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"dp-file","accept":".xlsx","hidden":""},[]],["button",{"class":"drop-card","id":"roster-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["Roster"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"roster-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"roster-file","accept":".csv,.xlsx","hidden":""},[]]]],["label",{"class":"mail-signoff"},["Your name (mail sign-off)",["input",{"id":"run-signoff","type":"text","autocomplete":"off"},[]]]],["div",{"class":"run-row"},[["button",{"class":"button primary","id":"run","type":"button","disabled":""},["Build worklist"]],["p",{"class":"notice","id":"run-status","role":"status"},[]]]],["div",{"class":"loading-help"},[["button",{"class":"button quiet","id":"file-check","type":"button"},["Copy check"]],["span",{"id":"self-check"},[]]]],["pre",{"class":"field-names","id":"file-check-output","hidden":""},[]]]],["div",{"class":"error-panel","id":"error-panel","role":"alert","hidden":""},[["strong",{"id":"error-title"},[]],["ul",{"id":"error-details"},[]]]],["section",{"id":"results","aria-label":"Worklist","hidden":""},[["section",{"class":"queue","id":"queue","aria-label":"Cases"},[["div",{"class":"summary-grid","id":"summary-grid"},[["label",{"class":"summary-card","data-filter":"action"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"action"},[]],["span",{},["Action"]],["strong",{"id":"count-action"},["0"]]]],["label",{"class":"summary-card","data-filter":"deactivation"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"deactivation"},[]],["span",{},["Deactivation"]],["strong",{"id":"count-deactivation"},["0"]]]],["label",{"class":"summary-card","data-filter":"by-hand"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"by-hand"},[]],["span",{},["By hand"]],["strong",{"id":"count-by-hand"},["0"]]]],["label",{"class":"summary-card","data-filter":"later"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"later"},[]],["span",{},["Later"]],["strong",{"id":"count-later"},["0"]]]],["label",{"class":"summary-card","data-filter":"no-action"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"no-action"},[]],["span",{},["No action"]],["strong",{"id":"count-no-action"},["0"]]]],["label",{"class":"summary-card","data-filter":"done"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"done"},[]],["span",{},["Done"]],["strong",{"id":"count-done"},["0"]]]]]],["p",{"class":"batch-warning","id":"batch-warning","role":"status","hidden":""},[]],["label",{"class":"search-box"},[["span",{"class":"sr-only"},["Search cases"]],["input",{"id":"search","type":"search","placeholder":"Search cases"},[]]]],["div",{"class":"filter-row","id":"filter-row","hidden":""},[["span",{"id":"filter-label"},[]]]],["div",{"id":"worklist-cases"},[]],["p",{"id":"empty-filter","hidden":""},[]]]],["section",{"class":"case-pane","id":"case-pane","aria-label":"Selected case","hidden":""},[["div",{"id":"case-preview"},[]],["div",{"id":"profile-review","hidden":""},[["article",{"class":"case-card","id":"detail"},[]]]]]],["p",{"class":"sr-only","id":"review-progress","role":"status","aria-live":"polite"},[]]]]]]];
-const __transfersStyles = [":root {\n  color-scheme: dark;\n  --bg: #151515;\n  --surface: #1c1c1c;\n  --surface-2: #1e1e1e;\n  --surface-3: #242424;\n  --border: #3a3a3a;\n  --border-strong: #4b4b4b;\n  --text: #eeeeee;\n  --muted: #a8a8a8;\n  --faint: #969696;\n  --sage: #a9c77d;\n  --sage-ink: #151515;\n  --blue: #86b8c8;\n  --amber: #c9aa68;\n  --coral: #c97972;\n  --shadow: 0 12px 36px rgba(0, 0, 0, .5);\n  --radius: 10px;\n  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;\n}\n* { box-sizing: border-box; }\n[hidden] { display: none !important; }\nbody { margin: 0; min-width: 300px; background: var(--bg); color: var(--text); }\nbutton, input { font: inherit; }\nbutton { color: inherit; }\n",":root {\n  --border: #303030;\n  --border-strong: #3a3a3a;\n  --selected-text: #c6d9a8;\n  font-size: 13px;\n  line-height: 1.5;\n}\nbody {\n  min-width: 280px;\n}\nbutton,\ninput,\ntextarea,\nselect {\n  font: inherit;\n}\nbutton,\nsummary {\n  cursor: pointer;\n}\nbutton:focus-visible,\nsummary:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\na:focus-visible,\n.summary-card:focus-within,\n.queue-row:focus-within {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 3px;\n}\nbutton:disabled {\n  opacity: 0.5;\n  cursor: not-allowed;\n}\n.button {\n  border: 0;\n  border-radius: 8px;\n  padding: 8px 10px;\n  background: var(--border-strong);\n  color: var(--text);\n  font-size: 13px;\n  font-weight: 700;\n  line-height: 1.4;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 7px;\n  min-height: 36px;\n  transition:\n    transform 120ms,\n    filter 120ms,\n    box-shadow 120ms;\n}\n.button:hover:not(:disabled),\n.drop-card:hover:not(:disabled) {\n  filter: brightness(1.1);\n  transform: translateY(-1px);\n  box-shadow: 0 3px 8px rgb(0 0 0 / 0.2);\n}\n.button:active:not(:disabled),\n.drop-card:active:not(:disabled) {\n  transform: scale(0.985);\n  filter: brightness(0.95);\n}\n.button.primary {\n  background: var(--sage);\n  color: var(--bg);\n}\n.button.secondary {\n  background: var(--blue);\n  color: var(--bg);\n}\n.button.warn {\n  background: var(--amber);\n  color: var(--bg);\n}\n.button.danger {\n  background: var(--coral);\n  color: var(--bg);\n  width: 100%;\n}\n.button-row,\n.actions {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 8px;\n  align-items: center;\n}\n.button-row > .button,\n.actions > .button {\n  flex: 1 1 calc(50% - 4px);\n  min-width: 0;\n  padding: 8px 6px;\n}\n.actions > .primary {\n  flex-basis: 100%;\n  order: -1;\n}\n.actions > .danger {\n  flex-basis: 100%;\n  order: 2;\n}\n.tool-head {\n  display: flex;\n  align-items: center;\n  gap: 12px;\n  min-height: 48px;\n  padding: 8px 14px;\n  background: var(--surface);\n  border-bottom: 1px solid var(--border);\n}\n.tool-head strong {\n  font-size: 14px;\n  font-weight: 700;\n}\n.tool-head > span {\n  margin-left: auto;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  color: var(--muted);\n  font-size: 12px;\n}\n.tool-menu {\n  margin-left: auto;\n  position: relative;\n  flex-shrink: 0;\n}\n.tool-head > span + .tool-menu {\n  margin-left: 0;\n}\n.tool-menu > summary {\n  list-style: none;\n  padding: 7px 10px;\n  border-radius: 8px;\n  background: var(--border-strong);\n  color: var(--text);\n  font-size: 12px;\n  font-weight: 700;\n}\n.tool-menu > summary::-webkit-details-marker {\n  display: none;\n}\n.menu-body {\n  position: absolute;\n  top: calc(100% + 8px);\n  right: 0;\n  z-index: 20;\n  width: min(310px, calc(100vw - 28px));\n  max-height: calc(100vh - 80px);\n  overflow-y: auto;\n  padding: 12px;\n  border: 1px solid var(--border-strong);\n  border-radius: 10px;\n  background: var(--surface);\n  box-shadow: var(--shadow);\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.menu-body hr {\n  width: 100%;\n  border: 0;\n  border-top: 1px solid var(--border);\n  margin: 0;\n}\n.menu-body details[open] {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\nh1,\nh2,\nh3,\nh4,\np {\n  margin: 0;\n}\nh2 {\n  font-size: 18px;\n  line-height: 1.3;\n  font-weight: 600;\n}\nh3 {\n  font-size: 20px;\n  font-weight: 600;\n}\nh4 {\n  font-size: 13px;\n  font-weight: 600;\n}\np {\n  color: var(--muted);\n}\nsmall,\n.notice,\n.session-warning {\n  color: var(--muted);\n  font-size: 12px;\n  line-height: 1.5;\n}\ndetails > summary {\n  font-size: 12px;\n  color: var(--muted);\n  padding: 5px 0;\n}\n.session-warning {\n  padding: 12px 0;\n  border-top: 1px solid var(--border);\n}\n.error,\n.error-panel {\n  color: var(--coral);\n  border-left: 2px solid var(--coral);\n  padding: 8px 10px;\n  overflow-wrap: anywhere;\n}\n.error-panel ul {\n  margin: 4px 0 0;\n  padding-left: 18px;\n}\n#diagnostic-log {\n  max-height: 190px;\n  overflow: auto;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  font:\n    11px/1.5 ui-monospace,\n    Consolas,\n    monospace;\n  color: var(--muted);\n}\ntextarea {\n  width: 100%;\n  min-height: 70px;\n  resize: vertical;\n  background: var(--surface);\n  border: 1px solid var(--border-strong);\n  border-radius: 8px;\n  color: var(--text);\n  padding: 8px 10px;\n}\n.session-note {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.discard-dialog {\n  max-width: min(390px, calc(100vw - 24px));\n  margin: auto;\n  border: 1px solid var(--border-strong);\n  border-radius: 12px;\n  padding: 20px;\n  background: var(--bg);\n  color: var(--text);\n}\n.discard-dialog[open] {\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n}\n.discard-dialog::backdrop {\n  background: rgb(0 0 0 / 0.6);\n}\n.sr-only {\n  position: absolute;\n  width: 1px;\n  height: 1px;\n  overflow: hidden;\n  clip-path: inset(50%);\n  white-space: nowrap;\n}\n.selection-input {\n  position: absolute;\n  width: 1px;\n  height: 1px;\n  opacity: 0;\n}\n@media (pointer: coarse) {\n  button,\n  summary,\n  .summary-card,\n  .queue-row {\n    min-height: 44px;\n  }\n  input,\n  textarea,\n  select {\n    font-size: 16px;\n  }\n}\n@media (prefers-reduced-motion: reduce) {\n  *,\n  *::before,\n  *::after {\n    scroll-behavior: auto !important;\n    transition: none !important;\n    transform: none !important;\n  }\n}\n",":root {\n  --head: #1b1b1b;\n  --border-soft: #242424;\n  --lavender: #a58ecc;\n}\nhtml {\n  scrollbar-width: none;\n}\nhtml::-webkit-scrollbar {\n  display: none;\n}\nbutton:focus-visible,\nsummary:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\na:focus-visible {\n  outline-offset: 2px;\n}\nmain {\n  max-width: 1120px;\n  margin: auto;\n  padding: 12px;\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.tool-head {\n  position: sticky;\n  top: 0;\n  z-index: 10;\n  min-height: 36px;\n  gap: 8px;\n  padding: 3px 6px 3px 12px;\n  background: var(--head);\n  border-bottom-color: var(--border-soft);\n}\n.tool-head > .close-transfers,\n.tool-head > .header-back {\n  min-height: 0;\n  padding: 3px 10px;\n  font-size: 13px;\n  line-height: 1.25;\n}\n.case-steps {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.case-steps[hidden] {\n  display: none;\n}\n.tool-head .header-step {\n  min-height: 0;\n  padding: 3px 8px;\n  font-size: 13px;\n  line-height: 1.25;\n}\n.queue-row .row-number {\n  color: var(--muted);\n  font-variant-numeric: tabular-nums;\n  margin-right: 6px;\n}\n.tool-head:has(> .header-back:not([hidden])) > strong {\n  display: none;\n}\n.header-space { flex: 1; }\n.tool-head > .header-action { width: auto; min-height: 0; padding: 3px 10px; font-size: 13px; line-height: 1.25; }\n.mail-signoff { display: flex; flex-direction: column; gap: 7px; margin-top: 20px; color: var(--muted); font-size: 12px; }\n.mail-signoff input { width: 100%; padding: 9px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); color: var(--text); box-sizing: border-box; }\n.loading-help { display: flex; align-items: center; gap: 12px; margin-top: 36px; color: var(--muted); font-size: 10px; }\n.loading-help .button { width: auto; min-height: 0; padding: 3px 0; font-size: 11px; background: transparent; color: var(--muted); }\n.optional {\n  font-weight: 400;\n  opacity: 0.8;\n}\n#file-check {\n  align-self: flex-start;\n}\n.field-names {\n  max-height: 180px;\n  overflow: auto;\n  margin: 0;\n  padding: 8px;\n  border: 1px solid var(--border);\n  border-radius: 6px;\n  background: var(--bg);\n  white-space: pre-wrap;\n  font: 11px/1.5 ui-monospace, Consolas, monospace;\n}\n.intake {\n  width: 100%;\n  max-width: 600px;\n  margin: auto;\n  display: flex;\n  flex-direction: column;\n  gap: 18px;\n  scroll-margin-top: 64px;\n}\n.drop-grid {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.drop-card {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 14px;\n  width: 100%;\n  padding: 8px 10px;\n  background: var(--surface);\n  color: var(--muted);\n  border: 1px solid var(--border);\n  border-radius: 8px;\n  text-align: left;\n  cursor: pointer;\n  transition:\n    transform 120ms,\n    filter 120ms;\n}\n.drop-card.loaded {\n  color: var(--text);\n}\n.file-copy {\n  display: flex;\n  align-items: baseline;\n  gap: 8px;\n  flex: 1;\n  min-width: 0;\n}\n.file-sign {\n  flex-shrink: 0;\n}\n.loaded .file-sign {\n  color: var(--sage);\n}\n.file-name {\n  min-width: 0;\n  overflow-wrap: anywhere;\n}\n.file-separator {\n  display: none;\n}\n.loaded .file-separator {\n  display: inline;\n}\n.drop-card .file-state {\n  font-size: inherit;\n  max-width: none;\n  overflow: visible;\n  white-space: normal;\n}\n.file-control {\n  flex-shrink: 0;\n  padding: 3px 8px;\n  border: 1px solid var(--blue);\n  border-radius: 6px;\n  color: var(--blue);\n  font-size: 12px;\n}\n.drop-card.dragging {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 3px;\n}\n.file-state {\n  font-size: 12px;\n  max-width: 44%;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n.run-row {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.run-row .primary {\n  width: 100%;\n}\n#results {\n  display: flex;\n  flex-direction: column;\n  gap: 18px;\n  scroll-margin-top: 64px;\n}\n.queue {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.summary-grid {\n  display: flex;\n  gap: 2px;\n  flex-wrap: wrap;\n}\n.summary-card {\n  position: relative;\n  border: 0;\n  border-radius: 6px;\n  color: var(--muted);\n  padding: 6px 5px;\n  cursor: pointer;\n  font-size: 12px;\n  display: flex;\n  align-items: center;\n  gap: 5px;\n}\n.summary-card strong {\n  font-weight: 600;\n}\n.summary-card.active {\n  color: var(--selected-text);\n}\n.summary-card:hover {\n  background: var(--surface-3);\n}\n.summary-card:focus-within,\n.queue-row:focus-within {\n  outline: none;\n}\n.summary-card:has(:focus-visible),\n.queue-row:has(:focus-visible) {\n  outline: 2px solid var(--selected-text);\n  outline-offset: -2px;\n}\n.batch-warning {\n  margin: 4px 0 0;\n  font-size: 12px;\n  color: var(--amber);\n}\n.search-box input {\n  width: 100%;\n  border: 1px solid var(--border-strong);\n  background: var(--surface);\n  color: var(--text);\n  border-radius: 8px;\n  padding: 9px 10px;\n}\n.filter-row {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.queue-row {\n  position: relative;\n  display: flex;\n  align-items: baseline;\n  gap: 10px;\n  width: 100%;\n  padding: 8px 10px;\n  border-bottom: 1px solid var(--border-soft);\n  background: transparent;\n  color: var(--text);\n  cursor: pointer;\n  border-radius: 6px;\n}\n.queue-row:hover {\n  background: var(--surface-3);\n}\n.row-top {\n  display: flex;\n  flex: none;\n  justify-content: space-between;\n  gap: 8px;\n}\n.row-top > div {\n  text-align: right;\n}\n.queue-row .person {\n  display: block;\n  font-size: 13px;\n}\n.status-note {\n  display: block;\n  font-size: 11px;\n  color: var(--muted);\n  line-height: 1.4;\n}\n.list-heading {\n  margin: 8px 0 0;\n  font-size: 11px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  color: var(--blue);\n}\n.case-pane {\n  min-width: 0;\n}\n.case-card {\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.case-head {\n  display: flex;\n  justify-content: space-between;\n  align-items: baseline;\n  gap: 12px;\n}\n.ticket-number {\n  font-size: 12px;\n  color: var(--muted);\n}\n.badge {\n  font-size: 11px;\n  color: var(--muted);\n}\n.badge.ready,\n.badge.deactivation {\n  color: var(--sage);\n}\n.badge.done {\n  color: var(--lavender);\n}\n.badge.manual {\n  color: var(--amber);\n}\n.badge.later {\n  color: var(--blue);\n}\n.case-identity {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.case-name {\n  margin: 0;\n  font-size: 20px;\n  font-weight: 600;\n}\n.case-meta {\n  margin: 0;\n  font-size: 12px;\n  color: var(--muted);\n  overflow-wrap: anywhere;\n}\n.case-section {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n}\n.case-label {\n  display: block;\n  margin: 0 0 2px;\n  font-size: 12px;\n  font-weight: 600;\n  color: var(--text);\n}\n.manual-section > .case-label {\n  color: var(--amber);\n}\n.case-lines {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n}\n.case-line {\n  margin: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  overflow-wrap: anywhere;\n}\n.case-line strong {\n  font-weight: 600;\n}\n.case-line.attention {\n  color: var(--amber);\n}\n.case-line.sign-problem {\n  color: var(--coral);\n}\n.case-line.sign-fine {\n  color: var(--sage);\n}\n.case-line.sign-info {\n  color: var(--blue);\n}\n.case-line.good {\n  color: var(--sage);\n}\n.case-line.noticed,\n.case-line.noticed strong,\n.case-line.noticed .sub-line {\n  color: var(--sage);\n}\n.edit-cue {\n  margin-left: 8px;\n  font-size: 0.9em;\n  font-weight: 600;\n}\n.schedule-step {\n  padding-left: 20px;\n}\n.schedule-step label {\n  cursor: pointer;\n}\n.information-list .case-line {\n  color: var(--muted);\n}\n.date-sensitive > strong {\n  color: var(--muted);\n}\n.date-sensitive .sub-line {\n  margin: 0;\n  padding-left: 12px;\n}\n.date-sensitive .sub-line.attention {\n  color: var(--amber);\n}\n.copy-text {\n  padding: 0;\n  border: 0;\n  background: none;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  cursor: copy;\n  text-decoration: underline dotted var(--faint);\n  text-underline-offset: 3px;\n}\n.copy-text:hover {\n  color: var(--text);\n  text-decoration-color: var(--text);\n}\n.copy-note {\n  margin-left: 6px;\n  font-size: 11px;\n  color: var(--sage);\n}\n.comment-block {\n  display: flex;\n  flex-direction: column;\n  align-items: flex-start;\n  gap: 4px;\n}\n.comment-block > .copy-text {\n  padding-left: 12px;\n  border-left: 2px solid var(--border-strong);\n  font-size: 13px;\n  line-height: 1.5;\n  color: var(--muted);\n  text-decoration: none;\n}\n.comment-block > .copy-text:hover {\n  border-left-color: var(--text);\n}\n.comment-block > .copy-note {\n  margin-left: 14px;\n}\n.comment-waiting,\n.comment-waiting .case-label {\n  color: var(--muted);\n}\n.case-section + .comment-to-add {\n  margin-top: -8px;\n}\n.discard-dialog [autofocus]:focus {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 2px;\n}\n.dialog-choices {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n}\n.dialog-choices > .button {\n  width: 100%;\n}\n.case-box {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n.case-box > .status-line:first-child {\n  font-weight: 600;\n}\n.case-box > .button {\n  width: 100%;\n}\n.done-row {\n  display: flex;\n  gap: 8px;\n}\n.done-row > .button {\n  min-width: 0;\n  padding: 8px 6px;\n}\n.done-row > .button.primary {\n  flex: 2;\n}\n.done-row > .button.quiet {\n  flex: 1;\n}\n.status-line {\n  margin: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  overflow-wrap: anywhere;\n}\n.status-line.good {\n  color: var(--sage);\n}\n.status-line.warn {\n  color: var(--amber);\n}\n.status-line.bad {\n  color: var(--coral);\n}\n.status-line.neutral {\n  color: var(--muted);\n}\n.note-fold {\n  border-top: 1px solid var(--border-soft);\n  padding-top: 10px;\n  font-size: 12px;\n}\n.note-fold > summary {\n  width: max-content;\n  list-style: none;\n  color: var(--muted);\n  cursor: pointer;\n}\n.note-fold > summary::-webkit-details-marker {\n  display: none;\n}\n.note-fold[open] > summary {\n  margin-bottom: 8px;\n}\n.note-fold textarea {\n  width: 100%;\n}\n.decided {\n  font-size: 12px;\n  color: var(--muted);\n}\n.decided summary {\n  cursor: pointer;\n}\n.decided h5 {\n  margin: 8px 0 2px;\n  font-size: 11px;\n  font-weight: 600;\n  color: var(--text);\n}\n.decided ul {\n  margin: 0;\n  padding-left: 18px;\n}\n.decided .values-heading { margin: 8px 0 2px; font-size: 11px; font-weight: 600; }\n.decided .hint, .comment-to-add .hint { font-size: 11px; font-weight: 400; color: var(--muted); }\n.decided li.sign-problem { color: var(--coral); }\n.decided li.sign-fine { color: var(--sage); }\n.decided li.sign-info { color: var(--blue); }\n.decided li.attention { color: var(--amber); }\n.note-flag {\n  margin-left: 6px;\n  padding: 0 2px;\n  border: 0;\n  background: none;\n  color: var(--amber);\n  font: inherit;\n  cursor: pointer;\n}\ndialog.small-window {\n  position: fixed;\n  inset: auto;\n  z-index: 30;\n  width: 230px;\n  max-width: calc(100vw - 16px);\n  max-height: 60vh;\n  margin: 0;\n  padding: 10px;\n  overflow: hidden auto;\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  background: var(--bg);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 12px;\n  box-shadow: var(--shadow);\n  outline: none;\n  font-size: 12px;\n}\n.small-window h2 {\n  margin: 0;\n  font-size: 14px;\n}\n.small-window p {\n  margin: 0;\n  line-height: 1.4;\n}\n.small-window p.notice {\n  color: var(--muted);\n  font-size: 11px;\n}\n.small-window .actions {\n  gap: 6px;\n}\n.small-window .button {\n  min-width: 0;\n  min-height: 0;\n  margin: 0;\n  padding: 6px 8px;\n  font-size: 12px;\n  border-radius: 8px;\n}\n.small-window .actions > .button {\n  flex: 1 1 calc(50% - 3px);\n}\n.small-window .actions > .danger {\n  flex-basis: 100%;\n}\n.wrong-mark {\n  margin-top: 10px;\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.wrong-mark select {\n  background: var(--surface);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 6px;\n  padding: 4px 6px;\n  font-size: 12px;\n}\n.wrong-mark.marked,\n.wrong-mark.marked select {\n  color: var(--amber);\n}\n.health-line {\n  margin: 0;\n  font-size: 12px;\n  color: var(--amber);\n}\n",".auto-page { width: 100%; box-sizing: border-box; max-width: 680px; margin: 0 auto; padding-bottom: 24px; }\n.auto-actions { display: flex; gap: 8px; margin-bottom: 16px; }\n.auto-actions > .button { width: auto; flex: 0 0 auto; }\n.auto-actions > .primary { flex: 1; }\n.auto-page > .case-section, .auto-results { margin-top: 24px; }\n.auto-page progress { width: 100%; height: 8px; accent-color: var(--lavender); border: 0; border-radius: 8px; overflow: hidden; }\n.auto-page progress::-webkit-progress-bar { background: var(--border); }\n.auto-page progress::-webkit-progress-value { background: var(--lavender); }\n.auto-person { font-weight: 600; margin: 8px 0; }\n.auto-before { margin: 12px 0; }\n.auto-done { color: var(--lavender); }\n.auto-page .case-line { overflow-wrap: anywhere; }\n"];
+const __transfersScreens = [["header",{"class":"tool-head"},[["button",{"class":"button quiet header-back","id":"header-back","type":"button","hidden":""},["← Worklist"]],["span",{"class":"case-steps","id":"case-steps","hidden":""},[["button",{"class":"button quiet header-step","id":"case-previous","type":"button","title":"Previous case (Alt+↑)","aria-label":"Previous case"},["↑"]],["span",{"class":"case-position","id":"case-position"},[]],["button",{"class":"button quiet header-step","id":"case-next","type":"button","title":"Next case (Alt+↓)","aria-label":"Next case"},["↓"]]]],["strong",{},["Shuffle"]],["span",{"class":"header-space"},[]],["button",{"class":"button secondary header-action","id":"auto-mode","type":"button","hidden":""},["Auto"]],["button",{"class":"button secondary header-action","id":"download","type":"button","title":"Download workbook","aria-label":"Download workbook","hidden":""},["⬇"]],["button",{"class":"button quiet close-transfers","id":"close","type":"button","title":"Close Shuffle","aria-label":"Close Shuffle"},["✕"]]]],["main",{},[["section",{"class":"intake","id":"intake","aria-labelledby":"intake-title"},[["h2",{"id":"intake-title"},["Add the four files"]],["div",{"class":"drop-grid"},[["button",{"class":"drop-card","id":"service-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["ServiceNow export"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"service-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"service-file","accept":".csv,.xlsx","hidden":""},[]],["button",{"class":"drop-card","id":"profile-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["MySource export"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"profile-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"profile-file","accept":".csv,.xlsx","hidden":""},[]],["button",{"class":"drop-card","id":"dp-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["DP mapping"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"dp-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"dp-file","accept":".xlsx","hidden":""},[]],["button",{"class":"drop-card","id":"roster-drop","type":"button"},[["span",{"class":"file-copy"},[["span",{"class":"file-sign","aria-hidden":"true"},["○"]],["span",{"class":"file-name"},[["strong",{},["Roster"]],["span",{"class":"file-separator"},[" · "]],["span",{"class":"file-state","id":"roster-state"},[]]]]]],["span",{"class":"file-control"},["Choose file"]]]],["input",{"type":"file","id":"roster-file","accept":".csv,.xlsx","hidden":""},[]]]],["label",{"class":"mail-signoff"},["Your name (mail sign-off)",["input",{"id":"run-signoff","type":"text","autocomplete":"off"},[]]]],["div",{"class":"run-row"},[["button",{"class":"button primary","id":"run","type":"button","disabled":""},["Build worklist"]],["p",{"class":"notice","id":"run-status","role":"status"},[]]]],["div",{"class":"loading-help"},[["button",{"class":"button quiet","id":"file-check","type":"button"},["Copy check"]],["span",{"id":"self-check"},[]]]],["pre",{"class":"field-names","id":"file-check-output","hidden":""},[]]]],["div",{"class":"error-panel","id":"error-panel","role":"alert","hidden":""},[["strong",{"id":"error-title"},[]],["ul",{"id":"error-details"},[]]]],["section",{"id":"results","aria-label":"Worklist","hidden":""},[["section",{"class":"queue","id":"queue","aria-label":"Cases"},[["div",{"class":"summary-grid","id":"summary-grid"},[["label",{"class":"summary-card","data-filter":"action"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"action"},[]],["span",{},["Action"]],["strong",{"id":"count-action"},["0"]]]],["label",{"class":"summary-card","data-filter":"deactivation"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"deactivation"},[]],["span",{},["Deactivation"]],["strong",{"id":"count-deactivation"},["0"]]]],["label",{"class":"summary-card","data-filter":"by-hand"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"by-hand"},[]],["span",{},["By hand"]],["strong",{"id":"count-by-hand"},["0"]]]],["label",{"class":"summary-card","data-filter":"no-change"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"no-change"},[]],["span",{},["No change"]],["strong",{"id":"count-no-change"},["0"]]]],["label",{"class":"summary-card","data-filter":"later"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"later"},[]],["span",{},["Later"]],["strong",{"id":"count-later"},["0"]]]],["label",{"class":"summary-card","data-filter":"done"},[["input",{"class":"selection-input","type":"radio","name":"queue-filter","value":"done"},[]],["span",{},["Done"]],["strong",{"id":"count-done"},["0"]]]]]],["p",{"class":"batch-warning","id":"batch-warning","role":"status","hidden":""},[]],["label",{"class":"search-box"},[["span",{"class":"sr-only"},["Search cases"]],["input",{"id":"search","type":"search","placeholder":"Search cases"},[]]]],["div",{"class":"filter-row","id":"filter-row","hidden":""},[["span",{"id":"filter-label"},[]]]],["div",{"id":"worklist-cases"},[]],["p",{"id":"empty-filter","hidden":""},[]]]],["section",{"class":"case-pane","id":"case-pane","aria-label":"Selected case","hidden":""},[["div",{"id":"case-preview"},[]],["div",{"id":"profile-review","hidden":""},[["article",{"class":"case-card","id":"detail"},[]]]]]],["p",{"class":"sr-only","id":"review-progress","role":"status","aria-live":"polite"},[]]]]]]];
+const __transfersStyles = [":root {\n  color-scheme: dark;\n  --bg: #151515;\n  --surface: #1c1c1c;\n  --surface-2: #1e1e1e;\n  --surface-3: #242424;\n  --border: #3a3a3a;\n  --border-strong: #4b4b4b;\n  --text: #eeeeee;\n  --muted: #a8a8a8;\n  --faint: #969696;\n  --sage: #a9c77d;\n  --sage-ink: #151515;\n  --blue: #86b8c8;\n  --amber: #c9aa68;\n  --coral: #c97972;\n  --shadow: 0 12px 36px rgba(0, 0, 0, .5);\n  --radius: 10px;\n  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;\n}\n* { box-sizing: border-box; }\n[hidden] { display: none !important; }\nbody { margin: 0; min-width: 300px; background: var(--bg); color: var(--text); }\nbutton, input { font: inherit; }\nbutton { color: inherit; }\n",":root {\n  --border: #303030;\n  --border-strong: #3a3a3a;\n  --selected-text: #c6d9a8;\n  font-size: 13px;\n  line-height: 1.5;\n}\nbody {\n  min-width: 280px;\n}\nbutton,\ninput,\ntextarea,\nselect {\n  font: inherit;\n}\nbutton,\nsummary {\n  cursor: pointer;\n}\nbutton:focus-visible,\nsummary:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\na:focus-visible,\n.summary-card:focus-within,\n.queue-row:focus-within {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 3px;\n}\nbutton:disabled {\n  opacity: 0.5;\n  cursor: not-allowed;\n}\n.button {\n  border: 0;\n  border-radius: 8px;\n  padding: 8px 10px;\n  background: var(--border-strong);\n  color: var(--text);\n  font-size: 13px;\n  font-weight: 700;\n  line-height: 1.4;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 7px;\n  min-height: 36px;\n  transition:\n    transform 120ms,\n    filter 120ms,\n    box-shadow 120ms;\n}\n.button:hover:not(:disabled),\n.drop-card:hover:not(:disabled) {\n  filter: brightness(1.1);\n  transform: translateY(-1px);\n  box-shadow: 0 3px 8px rgb(0 0 0 / 0.2);\n}\n.button:active:not(:disabled),\n.drop-card:active:not(:disabled) {\n  transform: scale(0.985);\n  filter: brightness(0.95);\n}\n.button.primary {\n  background: var(--sage);\n  color: var(--bg);\n}\n.button.secondary {\n  background: var(--blue);\n  color: var(--bg);\n}\n.button.warn {\n  background: var(--amber);\n  color: var(--bg);\n}\n.button.danger {\n  background: var(--coral);\n  color: var(--bg);\n  width: 100%;\n}\n.button-row,\n.actions {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 8px;\n  align-items: center;\n}\n.button-row > .button,\n.actions > .button {\n  flex: 1 1 calc(50% - 4px);\n  min-width: 0;\n  padding: 8px 6px;\n}\n.actions > .primary {\n  flex-basis: 100%;\n  order: -1;\n}\n.actions > .danger {\n  flex-basis: 100%;\n  order: 2;\n}\n.tool-head {\n  display: flex;\n  align-items: center;\n  gap: 12px;\n  min-height: 48px;\n  padding: 8px 14px;\n  background: var(--surface);\n  border-bottom: 1px solid var(--border);\n}\n.tool-head strong {\n  font-size: 14px;\n  font-weight: 700;\n}\n.tool-head > span {\n  margin-left: auto;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  color: var(--muted);\n  font-size: 12px;\n}\n.tool-menu {\n  margin-left: auto;\n  position: relative;\n  flex-shrink: 0;\n}\n.tool-head > span + .tool-menu {\n  margin-left: 0;\n}\n.tool-menu > summary {\n  list-style: none;\n  padding: 7px 10px;\n  border-radius: 8px;\n  background: var(--border-strong);\n  color: var(--text);\n  font-size: 12px;\n  font-weight: 700;\n}\n.tool-menu > summary::-webkit-details-marker {\n  display: none;\n}\n.menu-body {\n  position: absolute;\n  top: calc(100% + 8px);\n  right: 0;\n  z-index: 20;\n  width: min(310px, calc(100vw - 28px));\n  max-height: calc(100vh - 80px);\n  overflow-y: auto;\n  padding: 12px;\n  border: 1px solid var(--border-strong);\n  border-radius: 10px;\n  background: var(--surface);\n  box-shadow: var(--shadow);\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.menu-body hr {\n  width: 100%;\n  border: 0;\n  border-top: 1px solid var(--border);\n  margin: 0;\n}\n.menu-body details[open] {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\nh1,\nh2,\nh3,\nh4,\np {\n  margin: 0;\n}\nh2 {\n  font-size: 18px;\n  line-height: 1.3;\n  font-weight: 600;\n}\nh3 {\n  font-size: 20px;\n  font-weight: 600;\n}\nh4 {\n  font-size: 13px;\n  font-weight: 600;\n}\np {\n  color: var(--muted);\n}\nsmall,\n.notice,\n.session-warning {\n  color: var(--muted);\n  font-size: 12px;\n  line-height: 1.5;\n}\ndetails > summary {\n  font-size: 12px;\n  color: var(--muted);\n  padding: 5px 0;\n}\n.session-warning {\n  padding: 12px 0;\n  border-top: 1px solid var(--border);\n}\n.error,\n.error-panel {\n  color: var(--coral);\n  border-left: 2px solid var(--coral);\n  padding: 8px 10px;\n  overflow-wrap: anywhere;\n}\n.error-panel ul {\n  margin: 4px 0 0;\n  padding-left: 18px;\n}\n#diagnostic-log {\n  max-height: 190px;\n  overflow: auto;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  font:\n    11px/1.5 ui-monospace,\n    Consolas,\n    monospace;\n  color: var(--muted);\n}\ntextarea {\n  width: 100%;\n  min-height: 70px;\n  resize: vertical;\n  background: var(--surface);\n  border: 1px solid var(--border-strong);\n  border-radius: 8px;\n  color: var(--text);\n  padding: 8px 10px;\n}\n.session-note {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.discard-dialog {\n  max-width: min(390px, calc(100vw - 24px));\n  margin: auto;\n  border: 1px solid var(--border-strong);\n  border-radius: 12px;\n  padding: 20px;\n  background: var(--bg);\n  color: var(--text);\n}\n.discard-dialog[open] {\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n}\n.discard-dialog::backdrop {\n  background: rgb(0 0 0 / 0.6);\n}\n.sr-only {\n  position: absolute;\n  width: 1px;\n  height: 1px;\n  overflow: hidden;\n  clip-path: inset(50%);\n  white-space: nowrap;\n}\n.selection-input {\n  position: absolute;\n  width: 1px;\n  height: 1px;\n  opacity: 0;\n}\n@media (pointer: coarse) {\n  button,\n  summary,\n  .summary-card,\n  .queue-row {\n    min-height: 44px;\n  }\n  input,\n  textarea,\n  select {\n    font-size: 16px;\n  }\n}\n@media (prefers-reduced-motion: reduce) {\n  *,\n  *::before,\n  *::after {\n    scroll-behavior: auto !important;\n    transition: none !important;\n    transform: none !important;\n  }\n}\n",":root {\n  --head: #1b1b1b;\n  --border-soft: #242424;\n  --lavender: #a58ecc;\n}\nhtml {\n  scrollbar-width: none;\n}\nhtml::-webkit-scrollbar {\n  display: none;\n}\nbutton:focus-visible,\nsummary:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\na:focus-visible {\n  outline-offset: 2px;\n}\nmain {\n  max-width: 1120px;\n  margin: auto;\n  padding: 12px;\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.tool-head {\n  position: sticky;\n  top: 0;\n  z-index: 10;\n  min-height: 36px;\n  gap: 8px;\n  padding: 3px 6px 3px 12px;\n  background: var(--head);\n  border-bottom-color: var(--border-soft);\n}\n.tool-head > .close-transfers,\n.tool-head > .header-back {\n  min-height: 0;\n  padding: 3px 10px;\n  font-size: 13px;\n  line-height: 1.25;\n}\n.case-steps {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.case-steps[hidden] {\n  display: none;\n}\n.tool-head .header-step {\n  min-height: 0;\n  padding: 3px 8px;\n  font-size: 13px;\n  line-height: 1.25;\n}\n.queue-row .row-number {\n  color: var(--muted);\n  font-variant-numeric: tabular-nums;\n  margin-right: 6px;\n}\n.tool-head:has(> .header-back:not([hidden])) > strong {\n  display: none;\n}\n.header-space { flex: 1; }\n.tool-head > .header-action { width: auto; min-height: 0; padding: 3px 10px; font-size: 13px; line-height: 1.25; }\n.mail-signoff { display: flex; flex-direction: column; gap: 7px; margin-top: 20px; color: var(--muted); font-size: 12px; }\n.mail-signoff input { width: 100%; padding: 9px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); color: var(--text); box-sizing: border-box; }\n.loading-help { display: flex; align-items: center; gap: 12px; margin-top: 36px; color: var(--muted); font-size: 10px; }\n.loading-help .button { width: auto; min-height: 0; padding: 3px 0; font-size: 11px; background: transparent; color: var(--muted); }\n.optional {\n  font-weight: 400;\n  opacity: 0.8;\n}\n#file-check {\n  align-self: flex-start;\n}\n.field-names {\n  max-height: 180px;\n  overflow: auto;\n  margin: 0;\n  padding: 8px;\n  border: 1px solid var(--border);\n  border-radius: 6px;\n  background: var(--bg);\n  white-space: pre-wrap;\n  font: 11px/1.5 ui-monospace, Consolas, monospace;\n}\n.intake {\n  width: 100%;\n  max-width: 600px;\n  margin: auto;\n  display: flex;\n  flex-direction: column;\n  gap: 18px;\n  scroll-margin-top: 64px;\n}\n.drop-grid {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.drop-card {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 14px;\n  width: 100%;\n  padding: 8px 10px;\n  background: var(--surface);\n  color: var(--muted);\n  border: 1px solid var(--border);\n  border-radius: 8px;\n  text-align: left;\n  cursor: pointer;\n  transition:\n    transform 120ms,\n    filter 120ms;\n}\n.drop-card.loaded {\n  color: var(--text);\n}\n.file-copy {\n  display: flex;\n  align-items: baseline;\n  gap: 8px;\n  flex: 1;\n  min-width: 0;\n}\n.file-sign {\n  flex-shrink: 0;\n}\n.loaded .file-sign {\n  color: var(--sage);\n}\n.file-name {\n  min-width: 0;\n  overflow-wrap: anywhere;\n}\n.file-separator {\n  display: none;\n}\n.loaded .file-separator {\n  display: inline;\n}\n.drop-card .file-state {\n  font-size: inherit;\n  max-width: none;\n  overflow: visible;\n  white-space: normal;\n}\n.file-control {\n  flex-shrink: 0;\n  padding: 3px 8px;\n  border: 1px solid var(--blue);\n  border-radius: 6px;\n  color: var(--blue);\n  font-size: 12px;\n}\n.drop-card.dragging {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 3px;\n}\n.file-state {\n  font-size: 12px;\n  max-width: 44%;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n.run-row {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.run-row .primary {\n  width: 100%;\n}\n#results {\n  display: flex;\n  flex-direction: column;\n  gap: 18px;\n  scroll-margin-top: 64px;\n}\n.queue {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.summary-grid {\n  display: flex;\n  gap: 2px;\n  flex-wrap: wrap;\n}\n.summary-card {\n  position: relative;\n  border: 0;\n  border-radius: 6px;\n  color: var(--muted);\n  padding: 6px 5px;\n  cursor: pointer;\n  font-size: 12px;\n  display: flex;\n  align-items: center;\n  gap: 5px;\n}\n.summary-card strong {\n  font-weight: 600;\n}\n.summary-card.active {\n  color: var(--selected-text);\n}\n.summary-card:hover {\n  background: var(--surface-3);\n}\n.summary-card:focus-within,\n.queue-row:focus-within {\n  outline: none;\n}\n.summary-card:has(:focus-visible),\n.queue-row:has(:focus-visible) {\n  outline: 2px solid var(--selected-text);\n  outline-offset: -2px;\n}\n.batch-warning {\n  margin: 4px 0 0;\n  font-size: 12px;\n  color: var(--amber);\n}\n.search-box input {\n  width: 100%;\n  border: 1px solid var(--border-strong);\n  background: var(--surface);\n  color: var(--text);\n  border-radius: 8px;\n  padding: 9px 10px;\n}\n.filter-row {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.queue-row {\n  position: relative;\n  display: flex;\n  align-items: baseline;\n  gap: 10px;\n  width: 100%;\n  padding: 8px 10px;\n  border-bottom: 1px solid var(--border-soft);\n  background: transparent;\n  color: var(--text);\n  cursor: pointer;\n  border-radius: 6px;\n}\n.queue-row:hover {\n  background: var(--surface-3);\n}\n.row-top {\n  display: flex;\n  flex: none;\n  justify-content: space-between;\n  gap: 8px;\n}\n.row-top > div {\n  text-align: right;\n}\n.queue-row .person {\n  display: block;\n  font-size: 13px;\n}\n.status-note {\n  display: block;\n  font-size: 11px;\n  color: var(--muted);\n  line-height: 1.4;\n}\n.list-heading {\n  margin: 8px 0 0;\n  font-size: 11px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  color: var(--blue);\n}\n.case-pane {\n  min-width: 0;\n}\n.case-card {\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.case-head {\n  display: flex;\n  justify-content: space-between;\n  align-items: baseline;\n  gap: 12px;\n}\n.ticket-number {\n  font-size: 12px;\n  color: var(--muted);\n}\n.badge {\n  font-size: 11px;\n  color: var(--muted);\n}\n.badge.ready,\n.badge.deactivation {\n  color: var(--sage);\n}\n.badge.done {\n  color: var(--lavender);\n}\n.badge.manual {\n  color: var(--amber);\n}\n.badge.no-change,\n.badge.later {\n  color: var(--blue);\n}\n.case-identity {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.case-name {\n  margin: 0;\n  font-size: 20px;\n  font-weight: 600;\n}\n.case-meta {\n  margin: 0;\n  font-size: 12px;\n  color: var(--muted);\n  overflow-wrap: anywhere;\n}\n.case-section {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n}\n.case-label {\n  display: block;\n  margin: 0 0 2px;\n  font-size: 12px;\n  font-weight: 600;\n  color: var(--text);\n}\n.manual-section > .case-label {\n  color: var(--amber);\n}\n.case-lines {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n}\n.case-line {\n  margin: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  overflow-wrap: anywhere;\n}\n.case-line strong {\n  font-weight: 600;\n}\n.case-line.attention {\n  color: var(--amber);\n}\n.case-line.sign-problem {\n  color: var(--coral);\n}\n.case-line.sign-fine {\n  color: var(--sage);\n}\n.case-line.sign-info {\n  color: var(--blue);\n}\n.case-line.good {\n  color: var(--sage);\n}\n.case-line.noticed,\n.case-line.noticed strong,\n.case-line.noticed .sub-line {\n  color: var(--sage);\n}\n.edit-cue {\n  margin-left: 8px;\n  font-size: 0.9em;\n  font-weight: 600;\n}\n.schedule-step {\n  padding-left: 20px;\n}\n.schedule-step label {\n  cursor: pointer;\n}\n.information-list .case-line {\n  color: var(--muted);\n}\n.date-sensitive > strong {\n  color: var(--muted);\n}\n.date-sensitive .sub-line {\n  margin: 0;\n  padding-left: 12px;\n}\n.date-sensitive .sub-line.attention {\n  color: var(--amber);\n}\n.copy-text {\n  padding: 0;\n  border: 0;\n  background: none;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  cursor: copy;\n  text-decoration: underline dotted var(--faint);\n  text-underline-offset: 3px;\n}\n.copy-text:hover {\n  color: var(--text);\n  text-decoration-color: var(--text);\n}\n.copy-note {\n  margin-left: 6px;\n  font-size: 11px;\n  color: var(--sage);\n}\n.comment-block {\n  display: flex;\n  flex-direction: column;\n  align-items: flex-start;\n  gap: 4px;\n}\n.comment-block > .copy-text {\n  padding-left: 12px;\n  border-left: 2px solid var(--border-strong);\n  font-size: 13px;\n  line-height: 1.5;\n  color: var(--muted);\n  text-decoration: none;\n}\n.comment-block > .copy-text:hover {\n  border-left-color: var(--text);\n}\n.comment-block > .copy-note {\n  margin-left: 14px;\n}\n.comment-waiting,\n.comment-waiting .case-label {\n  color: var(--muted);\n}\n.case-section + .comment-to-add {\n  margin-top: -8px;\n}\n.discard-dialog [autofocus]:focus {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 2px;\n}\n.dialog-choices {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n}\n.dialog-choices > .button {\n  width: 100%;\n}\n.case-box {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n.case-box > .status-line:first-child {\n  font-weight: 600;\n}\n.case-box > .button {\n  width: 100%;\n}\n.done-row {\n  display: flex;\n  gap: 8px;\n}\n.done-row > .button {\n  min-width: 0;\n  padding: 8px 6px;\n}\n.done-row > .button.primary {\n  flex: 2;\n}\n.done-row > .button.quiet {\n  flex: 1;\n}\n.status-line {\n  margin: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  overflow-wrap: anywhere;\n}\n.status-line.good {\n  color: var(--sage);\n}\n.status-line.warn {\n  color: var(--amber);\n}\n.status-line.bad {\n  color: var(--coral);\n}\n.status-line.neutral {\n  color: var(--muted);\n}\n.note-fold {\n  border-top: 1px solid var(--border-soft);\n  padding-top: 10px;\n  font-size: 12px;\n}\n.note-fold > summary {\n  width: max-content;\n  list-style: none;\n  color: var(--muted);\n  cursor: pointer;\n}\n.note-fold > summary::-webkit-details-marker {\n  display: none;\n}\n.note-fold[open] > summary {\n  margin-bottom: 8px;\n}\n.note-fold textarea {\n  width: 100%;\n}\n.decided {\n  font-size: 12px;\n  color: var(--muted);\n}\n.decided summary {\n  cursor: pointer;\n}\n.decided h5 {\n  margin: 8px 0 2px;\n  font-size: 11px;\n  font-weight: 600;\n  color: var(--text);\n}\n.decided ul {\n  margin: 0;\n  padding-left: 18px;\n}\n.decided .values-heading { margin: 8px 0 2px; font-size: 11px; font-weight: 600; }\n.decided .hint, .comment-to-add .hint { font-size: 11px; font-weight: 400; color: var(--muted); }\n.decided li.sign-problem { color: var(--coral); }\n.decided li.sign-fine { color: var(--sage); }\n.decided li.sign-info { color: var(--blue); }\n.decided li.attention { color: var(--amber); }\n.note-flag {\n  margin-left: 6px;\n  padding: 0 2px;\n  border: 0;\n  background: none;\n  color: var(--amber);\n  font: inherit;\n  cursor: pointer;\n}\ndialog.small-window {\n  position: fixed;\n  inset: auto;\n  z-index: 30;\n  width: 230px;\n  max-width: calc(100vw - 16px);\n  max-height: 60vh;\n  margin: 0;\n  padding: 10px;\n  overflow: hidden auto;\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  background: var(--bg);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 12px;\n  box-shadow: var(--shadow);\n  outline: none;\n  font-size: 12px;\n}\n.small-window h2 {\n  margin: 0;\n  font-size: 14px;\n}\n.small-window p {\n  margin: 0;\n  line-height: 1.4;\n}\n.small-window p.notice {\n  color: var(--muted);\n  font-size: 11px;\n}\n.small-window .actions {\n  gap: 6px;\n}\n.small-window .button {\n  min-width: 0;\n  min-height: 0;\n  margin: 0;\n  padding: 6px 8px;\n  font-size: 12px;\n  border-radius: 8px;\n}\n.small-window .actions > .button {\n  flex: 1 1 calc(50% - 3px);\n}\n.small-window .actions > .danger {\n  flex-basis: 100%;\n}\n.wrong-mark {\n  margin-top: 10px;\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.wrong-mark select {\n  background: var(--surface);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 6px;\n  padding: 4px 6px;\n  font-size: 12px;\n}\n.wrong-mark.marked,\n.wrong-mark.marked select {\n  color: var(--amber);\n}\n.health-line {\n  margin: 0;\n  font-size: 12px;\n  color: var(--amber);\n}\n",".auto-page { width: 100%; box-sizing: border-box; max-width: 680px; margin: 0 auto; padding-bottom: 24px; }\n.auto-actions { display: flex; gap: 8px; margin-bottom: 16px; }\n.auto-actions > .button { width: auto; flex: 0 0 auto; }\n.auto-actions > .primary { flex: 1; }\n.auto-page > .case-section, .auto-results { margin-top: 24px; }\n.auto-page progress { width: 100%; height: 8px; accent-color: var(--lavender); border: 0; border-radius: 8px; overflow: hidden; }\n.auto-page progress::-webkit-progress-bar { background: var(--border); }\n.auto-page progress::-webkit-progress-value { background: var(--lavender); }\n.auto-person { font-weight: 600; margin: 8px 0; }\n.auto-before { margin: 12px 0; }\n.auto-done { color: var(--lavender); }\n.auto-page .case-line { overflow-wrap: anywhere; }\n"];
 const __transfersEmailHelpers = __transfersCreateModuleSystem({ document, window })('rules/prepare.js');
 __transfersCreateModuleSystem({ document, window })('run/start.js').start({
-  version: "0.7.0-console.63",
+  version: "0.7.0-console.67",
   styles: __transfersStyles,
   screens: __transfersScreens,
   pageReaders: __transfersPageReaders,
