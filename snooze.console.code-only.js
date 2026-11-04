@@ -4461,8 +4461,9 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
     const from = termDayOf(findDateBox(form, 'Start').value.trim());
     const to = termDayOf(findDateBox(form, 'End').value.trim());
     const selected = [...fieldByLabel(form, clientsLabel).selectedOptions].filter(option => option.value);
-    if (!from || !to || !sameDay(from, today) || !sameDay(to, today)
-        || compareDays(to, from) < 0 || selected.length > 1 || anchor && selected.some(option => !sameText(text(option), anchor.client))) {
+    const monday = mondayOf(anchor ? anchor.day : today);
+    if (weekBoxes || !from || !to || !sameDay(from, compareDays(monday, today) < 0 ? today : monday) || !sameDay(to, addDays(monday, 4))
+        || (anchor ? selected.length > 1 || selected.some(option => !sameText(text(option), anchor.client)) : selected.length > 0)) {
       throw futureReadRefusal('Find Assignments did not prove its from-today prefill.');
     }
   }
@@ -7212,7 +7213,9 @@ function rowWarnings(row) {
   const planWords = reasonLine(one.personStop || one.decision, row.prepared);
   const notDone = row.state === 'skipped' || failedRow(row) || ['pending', 'ready'].includes(row.state);
   const hasPlan = notDone && !one.personStop && ['add', 'shorten', 'dns', 'clearClients'].includes(one.decision.plan?.action);
-  const plan = hasPlan ? planWords.replace(/^Removed entries/, 'remove entries').replace(/^([A-Z])/, letter => letter.toLowerCase()).replace(/[.!?]+$/, '') : '';
+  const greyedPlan = hasPlan && one.decision.plan.action === 'dns' && (one.greyedAtStart && !row.prepared || one.decision.plan.greyed && !row.prepared?.addDns && row.prepared?.removing?.length);
+  const plan = greyedPlan ? `remove entries from ${usDate(one.decision.plan.dnsStart)}; no DNS (greyed schedule)`
+    : hasPlan ? planWords.replace(/^Removed entries/, 'remove entries').replace(/^([A-Z])/, letter => letter.toLowerCase()).replace(/[.!?]+$/, '') : '';
   const words = joinReasons([...new Set([
     hasPlan ? `Planned, not done: ${plan}.` : planWords,
     row.message,
@@ -7235,7 +7238,7 @@ function rowWarnings(row) {
   if (!hasPlan) return words;
   const unchanged = ['skipped', 'pending', 'ready'].includes(row.state) || row.state === 'failed' && row.diagnostic?.changeAttempted === false;
   if (!unchanged) return words;
-  const reason = words.replace(/\s*Nothing (?:was (?:read or )?)?changed\.?/g, '').trim().replace(/[;\s]+$/, '');
+  const reason = words.replace(/\s*Nothing (?:was (?:read or )?)?changed\.?/g, '').trim().replace(/[;\s]+$/, '').replace(/\.;\s*/g, '. ');
   return `${reason}${/[.!?]$/.test(reason) ? '' : '.'} Nothing changed.`;
 }
 function rowMail(row) {
@@ -14527,7 +14530,7 @@ function attachReport(cases, input, pull) {
       if (checked.outcome !== one.decision.outcome || checked.code !== one.decision.code || one.record.subcategory?.business === 'audit') one.decision = checked;
       if (one.record.subcategory?.business === 'audit' && one.slice.status === 'ready') one.personStop = checkPerson({ ...one.record.person, resourceManager: one.slice.resourceManager }, one.decision);
     }
-    delete one.reportHint;
+    delete one.reportHint; delete one.greyedAtStart;
     if (one.record.subcategory?.site === 'tax' && !one.personStop && one.slice.status === 'ready' && one.slice.mode === 'day' && one.decision.plan?.action === 'add') {
       const proposal = planTaxWeeks({ plan: one.decision.plan, today: todayOf(), rows: reportDays({ ...one.slice, entries: one.slice.backupEntries }, { start: mondayOf(todayOf()), end: reportEnd }) });
       if (proposal.code === 'taxPastEnd') one.decision = { ...one.decision, outcome: 'noReport', code: proposal.code };
@@ -14554,7 +14557,8 @@ function attachReport(cases, input, pull) {
     const termText = String(one.slice.person?.termDate || '').trim();
     const term = termText ? termDayOf(termText) : null;
     const dnsEnd = compareDays(plan.dnsEnd, reportEnd) < 0 ? plan.dnsEnd : reportEnd;
-    if (term && compareDays(term, plan.dnsStart) < 0) one.reportHint = 'Schedule greyed out: no schedule change.';
+    if (term && compareDays(todayOf(), term) >= 0) one.greyedAtStart = true;
+    else if (term && compareDays(term, plan.dnsStart) < 0) one.reportHint = 'Schedule greyed out: no schedule change.';
     else if (alreadyAdded({ days }, plan.dnsStart, dnsEnd, DNS_CLIENT, true)) one.reportHint = 'DNS already there; no change';
   }
 }
