@@ -1,46 +1,32 @@
-(() => {
-  const iso = value => {
-    if (!value) return null;
-    if (typeof value.format === 'function') return value.format('YYYY-MM-DD');
-    if (value instanceof Date) return value.toISOString().slice(0, 10);
-    return /^\d{4}-\d{2}-\d{2}/.test(String(value)) ? String(value).slice(0, 10) : 'unreadable';
-  };
-  const kind = text => /leave of absence|\(loa\)/i.test(text) ? 'LOA' : /do not schedule|\(dns\)/i.test(text) ? 'DNS' : /holiday|\(hol\)/i.test(text) ? 'Holiday' : 'client/other';
-  const shown = node => { const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
-  const view = [...document.querySelectorAll('.fc-view')].find(v => shown(v) && v.querySelector('.fc-event'));
-  if (!view) { console.log('No shown calendar view with tiles.'); return; }
-  const columnOf = (td) => {
-    const table = td.closest('table'), rows = [...table.querySelectorAll(':scope > tbody > tr, :scope > tr')];
-    const taken = [];
-    for (let r = 0; r < rows.length; r++) {
-      let col = 0;
-      for (const cell of rows[r].children) {
-        while (taken[r]?.[col]) col++;
-        if (cell === td) return col;
-        const span = cell.colSpan || 1, down = cell.rowSpan || 1;
-        for (let dr = 0; dr < down; dr++) for (let dc = 0; dc < span; dc++) (taken[r + dr] ||= [])[col + dc] = true;
-        col += span;
-      }
-    }
-    return null;
-  };
-  const rows = [...view.querySelectorAll('.fc-row')];
-  const tiles = [...view.querySelectorAll('.fc-event')].map(tile => {
-    const row = tile.closest('.fc-row'), td = tile.closest('td');
-    const dates = row ? [...row.querySelectorAll('.fc-bg td[data-date]')].map(cell => cell.getAttribute('data-date')) : [];
-    const col = td ? columnOf(td) : null;
-    let seg = null, event = null, error = null;
-    try { const $ = window.jQuery; seg = $ ? $(tile).data('fcSeg') : null; event = $ ? $(tile).data('event') || seg?.event : null; } catch (e) { error = e.name; }
-    return {
-      kind: kind(tile.textContent || ''), row: rows.indexOf(row), gridColumn: col, gridDate: col === null ? null : dates[col] ?? 'no cell',
-      segColumns: seg ? [seg.leftCol ?? seg.firstCol ?? null, seg.rightCol ?? seg.lastCol ?? null] : null,
-      segDate: seg && Number.isInteger(seg.leftCol ?? seg.firstCol) ? dates[seg.leftCol ?? seg.firstCol] ?? 'no cell' : null,
-      eventStart: iso(event?.start), eventEnd: iso(event?.end), segStart: iso(seg?.start), segEnd: iso(seg?.end),
-      idParts: (tile.getAttribute('data-event-id') || '').split('|').map(part => /^\d{4}-?\d{2}-?\d{2}/.test(part) ? part.slice(0, 10) : `${part.length} chars`),
-      rowDates: dates.length ? [dates[0], dates.at(-1), dates.length] : [], error,
-    };
-  });
-  const text = JSON.stringify({ probe: 'tile-week 2026-10-30', rows: rows.length, tiles }, null, 1);
-  console.log(text);
-  try { copy(text); console.log('Copied to the clipboard.'); } catch {   }
-})();
+Hey! Got a few mins? We're looking at doing US A&A transfers the same way we do Consulting ones. The SOP only covers profile creation though, so I pieced together how I think it should work. Can you tell me if this sounds right?
+
+Basically the same steps as Consulting: wait till MySource shows the move, add the Date Sensitive row, check Security, Authorization, Schedule Compliance, Assign Period and the DP, then close it and send the mail. Values come from the SOP's Audit and Assurance tables, based on Business Area.
+
+US only for now (US - US, Central, East, West). USI, National Office and contractors go by hand.
+
+- Consulting to A&A: update the same profile, no deactivation
+- Within A&A, including Audit to Assurance: normal update, new row and values
+- A&A to Consulting: a return, like today
+- A&A to Tax or others: deactivate, same as leaving Consulting
+- Row date: same as Consulting, from the effective date
+- Mail: same wording as Consulting, sent to the A&A DP
+- Interns: goes by level per the SOP filter, so an L20 intern in Assurance gets Schedule Compliance Yes
+
+Does that sound right? Anything I'm missing or that's different for A&A?
+
+Also a few things I couldn't find:
+
+1. Consulting one, affects current work: the SOP says Schedule Compliance is No for Operations Talent Model L45 and below, and for the Jupiter cost center. Still current?
+2. Consulting to A&A: do future Consulting schedules get cleared or stay? Any comment needed?
+3. A&A to Tax or others: same deactivation comment as Consulting? And do we do it or someone else?
+4. Can A&A people go to 400 - Other Non Deployment like Product in Consulting? What are the steps?
+5. Anything to do with Independence or the Clearance Info tab when someone moves into A&A?
+6. Assurance shift for L20s, L15, L10, L5, and for LPP, LCEO, LMD, LL? They're not in the table.
+7. Assign Period for LCEO, LL, L5, L10, L15? Also missing.
+8. L5 in Assurance shows Authorization AA_Prof, not Asu_Prof. Is that right?
+9. Collective Teams cost centers: just Audit or all of A&A? Any Region limit?
+10. L10 and L15 aren't in any Schedule Compliance filter, so No?
+11. Where's the A&A DP mapping file, how do you pick the row, and who do we set if nothing fits?
+12. "USI - RADC" and "Finance professionals (including EFAs)" in the exceptions: excluded from what exactly? And how do I spot a Finance person in the export?
+
+No rush, whatever you know is great. Thanks!
