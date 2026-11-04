@@ -4292,6 +4292,8 @@ async function menuItem(spots, label, again = true, inspect = false, optional = 
     const item = [...menu.querySelectorAll(':scope > li.context-menu-item')].find(li => shown(li) && sameText(text(li), label));
     if (optional && (!item || item.classList.contains('context-menu-disabled'))
         && [...menu.querySelectorAll(':scope > li.context-menu-item')].some(li => shown(li) && ['New Assignment', 'Close Schedule', 'Edit', 'Delete', label].some(known => sameText(text(li), known)))) {
+      recordRun({ type: 'findMenu', spot: spot.entry ? 'entry' : 'empty', find: item ? 'greyed out' : 'missing',
+        items: [...menu.querySelectorAll(':scope > li.context-menu-item')].filter(shown).map(li => text(li)) });
       document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
       await click(document.body);
       await closeContextLayer();
@@ -4426,7 +4428,7 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
     const day = readIsoDay(cell.getAttribute('data-date'));
     return day && sameDay(mondayOf(day), mondayOf(today));
   });
-  let anchor = null;
+  let anchor = null, entriesTried = 0;
   let opened = spots.length ? await menuItem(spots, 'Find Assignments', true, false, greyed) : false;
   if (!opened && greyed) {
     const view = calendarView();
@@ -4437,11 +4439,13 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
     for (const spot of candidates.filter(spot => compareDays(spot.day, today) >= 0 && !/^holiday|\(hol\)/i.test(spot.client)
         && (anchors === null || anchors.some(row => sameText(row.client, spot.client) && sameDay(mondayOf(row.day), mondayOf(spot.day)))))
       .sort((a, b) => rank(a.client) - rank(b.client) || compareDays(a.day, b.day))) {
+      entriesTried += 1;
       opened = await menuItem([spot], 'Find Assignments', true, false, true);
       if (opened) { anchor = spot; break; }
     }
   }
   if (!opened) {
+    recordRun({ type: 'findUnavailable', emptySpaces: spots.length, entriesTried });
     if (greyed && allowUnavailable) return null;
     throw futureReadRefusal('Find Assignments cannot be opened from the current week or a future entry.');
   }
@@ -4627,6 +4631,7 @@ function displayedTableRowCount(edit) {
   const [from, to, total] = match.slice(1).map(value => Number(value.replace(/,/g, '')));
   return [from, to, total].every(Number.isSafeInteger) && from === (total ? 1 : 0) && to === total ? total : null;
 }
+const EXIT_CALENDAR_UNPROVED = 'The Exit delete could not be proved from the calendar. By hand.';
 function exitCalendarSnapshot(today) {
   const view = calendarView();
   return { weeks: [...(view?.querySelectorAll('td.fc-day[data-date]') || [])].filter(screenReader(document))
@@ -4636,14 +4641,14 @@ function exitCalendarSnapshot(today) {
 function proveExitCalendar(before, removed, kept, today) {
   const after = exitCalendarSnapshot(today), current = mondayOf(today);
   const last = removed.reduce((day, row) => compareDays(row.day, day) > 0 ? row.day : day, today);
-  const fail = () => { throw new PageError('The Exit delete could not be proved from the calendar. By hand.'); };
-  if (after.weeks.some(day => !day)) fail();
-  if (!before.weeks.some(day => day && sameDay(day, current))) fail();
+  const fail = part => { throw Object.assign(new PageError(EXIT_CALENDAR_UNPROVED), { calendarPart: part }); };
+  if (after.weeks.some(day => !day)) fail('weekUnreadable');
+  if (!before.weeks.some(day => day && sameDay(day, current))) fail('currentWeekNotShownBefore');
   const weekly = after.weeks.every(day => sameDay(day, mondayOf(day)));
   for (let day = current; compareDays(day, weekly ? mondayOf(last) : last) <= 0; day = addDays(day, weekly ? 7 : 1)) {
-    if (!after.weeks.some(shown => sameDay(shown, day))) fail();
+    if (!after.weeks.some(shown => sameDay(shown, day))) fail('weekNotShown');
   }
-  if ([...before.tiles, ...after.tiles].some(tile => !tile.day || !tile.client || !Number.isFinite(tile.hours) || tile.hours <= 0)) fail();
+  if ([...before.tiles, ...after.tiles].some(tile => !tile.day || !tile.client || !Number.isFinite(tile.hours) || tile.hours <= 0)) fail('tileUnreadable');
   const sums = calendarSums;
   const expected = sums(before.tiles.filter(tile => sameDay(mondayOf(tile.day), current)));
   for (const row of removed.filter(row => sameDay(mondayOf(row.day), current))) {
@@ -4651,13 +4656,30 @@ function proveExitCalendar(before, removed, kept, today) {
     expected.set(key, (expected.get(key) || 0) - row.hours);
   }
   const later = kept.filter(row => compareDays(mondayOf(row.day), current) > 0 && compareDays(mondayOf(row.day), mondayOf(last)) <= 0);
-  if (later.some(row => !sameText(row.client, DNS_CLIENT))) fail();
+  if (later.some(row => !sameText(row.client, DNS_CLIENT))) fail('keptEntryNotDns');
   for (const [key, hours] of sums(later)) expected.set(key, hours);
   const actual = sums(after.tiles.filter(tile => compareDays(mondayOf(tile.day), mondayOf(last)) <= 0));
   for (const key of new Set([...expected.keys(), ...actual.keys()])) {
-    if (Math.abs((expected.get(key) || 0) - (actual.get(key) || 0)) > 0.001 || (expected.get(key) || 0) < -0.001) fail();
+    if (Math.abs((expected.get(key) || 0) - (actual.get(key) || 0)) > 0.001 || (expected.get(key) || 0) < -0.001) fail(expected.has(key) ? 'hoursDiffer' : 'entryStillShown');
   }
   return after;
+}
+async function settledExitCalendar(before, removed, kept, today) {
+  let part = null;
+  try {
+    return await waitFor(() => {
+      try { return proveExitCalendar(before, removed, kept, today); }
+      catch (error) {
+        if (!error.calendarPart) throw error;
+        part = error.calendarPart;
+        return null;
+      }
+    }, 'the calendar to show the delete', WAIT.window);
+  } catch (error) {
+    if (!error.timeout || !part) throw error;
+    recordRun({ type: 'exitCalendarCheck', part });
+    throw new PageError(EXIT_CALENDAR_UNPROVED);
+  }
 }
 function calendarSums(tiles) {
   const result = new Map();
@@ -4776,6 +4798,7 @@ __exports.findAssignmentsRange = findAssignmentsRange;
 __exports.findAssignments = findAssignments;
 __exports.exitCalendarSnapshot = exitCalendarSnapshot;
 __exports.proveExitCalendar = proveExitCalendar;
+__exports.settledExitCalendar = settledExitCalendar;
 __exports.sameExitCalendar = sameExitCalendar;
 __exports.buttonIn = buttonIn;
 __exports.closeEdit = closeEdit;
@@ -7217,7 +7240,7 @@ function rowWarnings(row) {
   const plan = greyedPlan ? `remove entries from ${usDate(one.decision.plan.dnsStart)}; no DNS (greyed schedule)`
     : hasPlan ? planWords.replace(/^Removed entries/, 'remove entries').replace(/^([A-Z])/, letter => letter.toLowerCase()).replace(/[.!?]+$/, '') : '';
   const words = joinReasons([...new Set([
-    hasPlan ? `Planned, not done: ${plan}.` : planWords,
+    hasPlan ? greyedPlan && row.prepared?.deletedDays?.length ? `Removed entries from ${usDate(one.decision.plan.dnsStart)}; no DNS (greyed schedule).` : `Planned, not done: ${plan}.` : planWords,
     row.message,
     description && (sameReason(planWords, description) ? duplicates.length && `also ${duplicates.map(ticket => ticket.number).join(', ')}`
       : `${description}${duplicates.length ? ` · also ${duplicates.map(ticket => ticket.number).join(', ')}` : ''}`),
@@ -7773,6 +7796,9 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       if (!recordingPicture && ['pageUnreadable', 'pageTimeout', 'reportUnreadable', 'backupReadFailed', 'screenshotUnreadable'].includes(event.code)) run.unread.push({ person: batch.rows.indexOf(row) + 1, code: event.code, sentence: event.sentence, stage: data.currentStage || 'prepare' });
     }
     if (event.type === 'comparison' && data) data.comparison = event.summary;
+    if (event.type === 'findMenu' && data) (data.findMenus ||= []).push({ spot: event.spot, find: event.find, items: event.items });
+    if (event.type === 'findUnavailable' && data) data.findUnavailable = { emptySpaces: event.emptySpaces, entriesTried: event.entriesTried };
+    if (event.type === 'exitCalendarCheck' && data) data.calendarCheck = event.part;
     if (event.type === 'restoreRead' && event.purpose === 'completedRun' && data && typeof event.reused === 'boolean') {
       const reads = data.runReads ||= { reused: 0, fresh: 0 };
       reads[event.reused ? 'reused' : 'fresh']++;
@@ -8862,7 +8888,7 @@ const { addDays, compareDays, mondayOf, reportWindow, todayOf, usDate, workingDa
 const { entryKind } = __require("../rules/entries.js");
 const { emailKey, valueKey, rememberPageName, professionalName } = __require("../rules/prepare.js");
 const { PageError, withPersonGuard, stopFlagged, cleanupAfter } = __require("../mysource/dom.js");
-const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, beginScheduleTurn, exitCalendarSnapshot, proveExitCalendar } = __require("../mysource/schedule.js");
+const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, beginScheduleTurn, exitCalendarSnapshot, settledExitCalendar } = __require("../mysource/schedule.js");
 const { leaveRuns, leavePeriod, loaBlocks, dayRanges, inRange } = __require("../rules/leaves.js");
 const { deleteAll, deleteRange, splitDeleteWeeks, addAssignment, preflightDates, refreshNotes, setAssignmentHours } = __require("../mysource/write.js");
 const { compareCopies, copyWindow, entriesToAdd, dayOf, ENTRY_FIELDS, knownAssignmentRows } = __require("../mysource/copy.js");
@@ -9412,7 +9438,7 @@ async function removeExitEntries(query, matches, prepared, before, step, onWrite
       const after = await copyWindow(prepared.watchedWindow, { future: true,
         ...(prepared.greyedExit ? { anchors: kept.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT)), allowUnavailable: true } : {}) });
       if (after) return after;
-      prepared.calendarAfter = proveExitCalendar(calendarBefore, before.days.filter(matches), kept, prepared.watchedWindow.start);
+      prepared.calendarAfter = await settledExitCalendar(calendarBefore, before.days.filter(matches), kept, prepared.watchedWindow.start);
       return { ...before, days: kept, calendarChecked: true };
     };
     const deleteNotice = async () => {
@@ -12532,6 +12558,10 @@ const STRUCTURES = new Set(['select[id^="ScheduleAddForm_Staff_Form_field_"]', '
 const PAGE_LIBRARIES = ['jQuery', 'Select2', 'FullCalendar', 'DataTables', 'daterangepicker', 'bootbox', 'window.moment'];
 const PAGE_SELECTORS = ['select[id^="ScheduleAddForm_Staff_Form_field_"]', '.select2-container', '.calendar-name', '.fc-view', 'td.fc-day', '.fc-event', 'div.loading', '.modal', '.bootbox', '#FindAssignmentsModal', '#editEventGridModal', '#addShiftEventModal', 'table#editGrid', 'input.shift-date-picker-dates'];
 const FIELDS = new Set(['Hours', 'Client', 'WBS', 'Billable', 'Utilization Generating', 'Job Code', 'Assign Code', 'Assign Code 1', 'Assign Code 2', 'Pricing ID', 'Notes', 'Date', 'Start Date', 'End Date', 'Clients', 'Include All Clients', 'Include All Future Assignments', 'Hours Per Day', 'Mode', 'Professional']);
+const MENU_ITEMS = new Set(['New Assignment', 'Paste', 'Select Assignments', 'Deselect Assignments', 'Find Assignments', 'Clear Selection', 'Close Schedule', 'Edit', 'Delete']);
+const CALENDAR_CHECK_PARTS = { weekUnreadable: 'a shown week could not be read', currentWeekNotShownBefore: 'this week was not shown before the delete',
+  weekNotShown: 'a week up to the last deleted day is not shown', tileUnreadable: 'a calendar entry could not be read', keptEntryNotDns: 'a kept later entry is not DNS',
+  hoursDiffer: 'a week shows other hours than expected', entryStillShown: 'an entry not expected is still shown' };
 function reasonCode(message) {
   const text = String(message || '');
   const rules = [
@@ -12873,6 +12903,8 @@ __exports.STRUCTURES = STRUCTURES;
 __exports.PAGE_LIBRARIES = PAGE_LIBRARIES;
 __exports.PAGE_SELECTORS = PAGE_SELECTORS;
 __exports.FIELDS = FIELDS;
+__exports.MENU_ITEMS = MENU_ITEMS;
+__exports.CALENDAR_CHECK_PARTS = CALENDAR_CHECK_PARTS;
 __exports.reasonCode = reasonCode;
 __exports.afterWriteSentence = afterWriteSentence;
 __exports.stopSentence = stopSentence;
@@ -13226,7 +13258,7 @@ const { saveFile } = __require("../screen/ui.js");
 const { runReportDocx, runReportName } = __require("./run-report-docx.js");
 const { failedRow } = __require("../screen/compact.js");
 const { chooseMail } = __require("../rules/mails.js");
-const { RULE_CODES, REASON_CODES, STAGES, WINDOWS, FIELDS, STRUCTURES, PAGE_LIBRARIES, PAGE_SELECTORS, stopSentence } = __require("../core/run-records.js");
+const { RULE_CODES, REASON_CODES, STAGES, WINDOWS, FIELDS, STRUCTURES, PAGE_LIBRARIES, PAGE_SELECTORS, MENU_ITEMS, CALENDAR_CHECK_PARTS, stopSentence } = __require("../core/run-records.js");
 const number = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 const amount = value => number(value) === null ? 'not recorded' : String(Math.round(value * 1000) / 1000);
 const code = value => RULE_CODES.has(value) || REASON_CODES.has(value) ? value : 'unknownFailure';
@@ -13306,6 +13338,12 @@ function runReportText(batch, version, now = Date.now()) {
     for (const step of data.steps || []) lines.push(`Step: ${stage(step.stage)} ${amount(step.seconds)} s; ${step.ok === true ? 'ok' : 'failed'}${step.retry === true ? '; retry' : ''}`);
     if (data.reason || row.state === 'skipped' || failedRow(row)) lines.push(`Reason: ${code(data.reason || one.personStop?.code)}${sentence ? '; ' + sentence : ''}; failed stage: ${stage(data.failedStage)}`);
     if (data.deletedDates?.length) lines.push(`Deleted days to check by hand: ${data.deletedDates.join(', ')}`);
+    for (const menu of data.findMenus || []) {
+      const items = (menu.items || []).filter(item => MENU_ITEMS.has(item));
+      lines.push(`Find menu from ${menu.spot === 'entry' ? 'an entry' : 'empty space'}: Find Assignments ${menu.find === 'greyed out' ? 'greyed out' : 'missing'}; items: ${items.join(', ') || 'none known'}; other items: ${amount((menu.items || []).length - items.length)}`);
+    }
+    if (data.findUnavailable) lines.push(`Find could not open: empty spaces this week ${amount(data.findUnavailable.emptySpaces)}; entries tried ${amount(data.findUnavailable.entriesTried)}`);
+    if (Object.hasOwn(CALENDAR_CHECK_PARTS, data.calendarCheck ?? '')) lines.push(`Calendar check failed: ${CALENDAR_CHECK_PARTS[data.calendarCheck]}`);
     if (data.recovery) {
       const recovery = data.recovery;
       lines.push(`By hand; restore ${recovery.confirmed ? 'confirmed' : 'UNCONFIRMED'}; watched period: ${offset(recovery.window?.start, today)} .. ${offset(recovery.window?.end, today)}`);
