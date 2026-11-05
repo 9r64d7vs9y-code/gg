@@ -13601,10 +13601,10 @@ function mailText(one, mail, { dpName = '', dpEmail = '', signOff = '' } = {}) {
     missing: [!greeting && (rmNotApplicable ? 'RM not applicable' : 'the Resource Manager'), greeting && !dpEmail.trim() && 'Resource Manager email missing: add the recipient before sending', !signOff.trim() && 'your name for mail sign-off'].filter(Boolean),
   };
 }
-const AUDIT_LOA_ASK = "We have received the ELE notification for this professional's Leave of Absence. As per the Audit process, we update the LOA only with your approval. Please let us know if we should add the LOA for the dates below and remove the scheduled hours in that period.";
+const AUDIT_LOA_ASK = "We have received the ELE notification for this professional's Leave of Absence. As per the Audit & Assurance process, we update the LOA only with your approval. Please let us know if we should add the LOA for the dates below and remove the scheduled hours in that period.";
 function chooseAuditMail(one, worked) {
   if (one.personStop?.code === 'auditMissingDp') return { template: 'AAMissingDp', attachReport: false, paragraphs: [
-    'This profile in MySource does not have a Deployment Professional aligned. As per the instructions from A&A Deployment Leadership, we are forwarding this to you for further action.',
+    'This profile in MySource does not have a Deployment Professional aligned. As per the instructions from Audit & Assurance Deployment Leadership, we are forwarding this to you for further action.',
     HELP,
   ] };
   if (one.personStop || ['byHand', 'notHandled'].includes(one.decision.outcome) || !worked) return null;
