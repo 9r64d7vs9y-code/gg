@@ -1,4 +1,4 @@
-// 0.7.0-console.86
+// 0.7.0-console.89
 (() => {
 'use strict';
 const __transfersModules = {
@@ -487,8 +487,10 @@ function showStartSteps(win) {
   intro.append(header, content);
   body.append(intro);
 }
+const PROFILE_FORM_FIELD = 'MaintenanceStaffEdit_Form_field_42';
 const profileShown = readers => {
   try {
+    if (!document.getElementById(PROFILE_FORM_FIELD)) return false;
     return Boolean(readers(document, window.CSS).readIdentity({ email: '', employeeId: '' }).pageDetected);
   } catch {
     return false;
@@ -856,7 +858,7 @@ __exports.describeMySourcePage = describeMySourcePage;
 const { InputFileError, MY_SOURCE_HEADERS, SERVICE_NOW_HEADERS, readRowRecords } = __require("../common.js");
 const { readDpMapping } = __require("../rules/dp-mapping.js");
 const { readRoster, rosterPeople } = __require("../files/roster.js");
-const { COLUMNS_NOT_USED, pageHealthWarning, ROSTER_NAME } = __require("../rules/mappings.js");
+const { pageHealthWarning, ROSTER_NAME } = __require("../rules/mappings.js");
 const { usDateOf } = __require("../rules/prepare.js");
 const { checkTickets, manualOrder } = __require("../rules/rulebook.js");
 const { employeeIdOf } = __require("../rules/gates.js");
@@ -916,6 +918,7 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     pageDescriptions: new Map(),
     pageProfiles: new Map(),
     leavingAnswers: new Map(),
+    pageEmails: new Map(),
     wrong: new Map(),
     pageHealth: null,
   };
@@ -928,7 +931,9 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     roster: { drop: refs.rosterDrop, input: refs.rosterFile, state: refs.rosterState },
   };
   let stopReview = null, pageBack = null;
-  const getBatch = () => ({version,cases:exportCases(),done:state.done,outcomes:state.outcomes,
+  const withPageEmail = item => (state.pageEmails.has(item.key) && item.dp?.status === 'matched' && !item.dp.email
+    ? { ...item, dp: { ...item.dp, email: state.pageEmails.get(item.key) } } : item);
+  const getBatch = () => ({version,cases:exportCases().map(withPageEmail),done:state.done,outcomes:state.outcomes,
     skipped:state.skipped,notes:state.notes,findings:state.findings,wrong:state.wrong,
     contexts:new Map(exportCases().map(item => {
       const tickets=(state.read?.service.rows || []).filter(row=>row.Number===item.ticketNumber && (!item.sourceRow || row.__row===item.sourceRow));
@@ -990,11 +995,16 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     return true;
   }
   const FILE_READERS = {
-    service: file => readRowRecords(file, SERVICE_NOW_HEADERS, 'ServiceNow export'),
+    service: readServiceNow,
     profile: file => readRowRecords(file, MY_SOURCE_HEADERS, 'MySource report'),
     dp: file => readDpMapping(file),
     roster: file => readRoster(file, 'The roster'),
   };
+  async function readServiceNow(file) {
+    const read = await readRowRecords(file, SERVICE_NOW_HEADERS, 'ServiceNow export');
+    const hasEmail = read.unknownHeaders.some(header => header.trim().toLocaleLowerCase() === 'email');
+    return hasEmail ? readRowRecords(file, [...SERVICE_NOW_HEADERS, 'Email'], 'ServiceNow export') : read;
+  }
   async function kindsOf(file) {
     const kinds = await Promise.all(Object.entries(FILE_READERS).map(async ([kind, read]) => {
       try {
@@ -1069,7 +1079,7 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     state.warning = '';
   }
   function clearWhatWasDone() {
-    for (const store of [state.pageProfiles, state.leavingAnswers, state.selfClosed, state.reopened, state.done, state.outcomes, state.skipped, state.notes, state.findings, state.wrong, state.scheduleConfirmed]) store.clear();
+    for (const store of [state.pageProfiles, state.pageEmails, state.leavingAnswers, state.selfClosed, state.reopened, state.done, state.outcomes, state.skipped, state.notes, state.findings, state.wrong, state.scheduleConfirmed]) store.clear();
   }
   async function startOver() {
     if (state.building) return;
@@ -1106,7 +1116,7 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     refs.runStatus.textContent = 'Checking the files…';
     try {
       const [service, profile, dp] = await Promise.all([
-        readRowRecords(state.files.service, SERVICE_NOW_HEADERS, 'ServiceNow export'),
+        readServiceNow(state.files.service),
         readRowRecords(state.files.profile, MY_SOURCE_HEADERS, 'MySource report'),
         readDpMapping(state.files.dp),
       ]);
@@ -1165,11 +1175,6 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     const warnings = [...notToday(inputs)];
     if (when('service') && when('profile') && when('profile') + 60_000 < when('service')) {
       warnings.push('The MySource file is older than the ServiceNow file. Check it is the right export.');
-    }
-    const names = { service: 'The ServiceNow file', profile: 'The MySource file', dp: 'The DP mapping' };
-    for (const input of inputs) {
-      const unknown = (input.unknown || []).filter(header => !COLUMNS_NOT_USED.includes(header));
-      if (unknown.length) warnings.push(`${names[input.kind]} has columns the tool does not recognise: ${unknown.slice(0, 4).join(', ')}.`);
     }
     return warnings.join(' ');
   }
@@ -1437,6 +1442,7 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
       onWaiting: waiting => waitCase(item, waiting),
       onLeavingPage: reading => leavingFromPage(item, reading),
       onLeavingAnswer: answer => answerLeaving(item, answer),
+      onPageEmail: email => state.pageEmails.set(item.key, email),
       pageDescription: state.pageDescriptions.get(item.ticketNumber) || '',
     });
   }
@@ -1577,7 +1583,7 @@ function startWorklist({ version, mySource, onClose, describeMySourcePage }) {
     const [mySource, mapping, tickets] = await Promise.all([
       read(profile, file => readRowRecords(file, MY_SOURCE_HEADERS, 'MySource report')),
       read(dp, file => readDpMapping(file)),
-      read(service, file => readRowRecords(file, SERVICE_NOW_HEADERS, 'ServiceNow export')),
+      read(service, readServiceNow),
     ]);
     const people = mySource.value || tickets.value ? rosterPeople(mySource.value?.rows, tickets.value?.rows) : null;
     const list = await read(roster, file => readRoster(file, 'The roster', { people }));
@@ -1649,7 +1655,7 @@ const LOOK_EVERY = 300;
 const SETTLE_TIME = 500;
 const SECOND_LOOK = 2000;
 const READ_AGAIN = 1000;
-function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFinding, wrong = '', onWrong = null, pageHealth = null, onReplan = null, onWaiting = null, onLeavingPage = null, onLeavingAnswer = null, pageDescription = '', scheduleConfirmed = false, onScheduleConfirmed = null }) {
+function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFinding, wrong = '', onWrong = null, pageHealth = null, onReplan = null, onWaiting = null, onLeavingPage = null, onLeavingAnswer = null, onPageEmail = null, pageDescription = '', scheduleConfirmed = false, onScheduleConfirmed = null }) {
   const manual = item.status === 'manual' && !item.deadEnd;
   const noAction = item.status === 'no-action';
   const { informationOnly, changes: plannedChanges, dateSensitive: plannedRow, dateNote } = caseChanges(item);
@@ -1938,6 +1944,7 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
   }
   function recordFinding() {
     if (!found) return;
+    if (found.managerEmail) onPageEmail?.(found.managerEmail);
     onFinding([
       ...(item.specialCase === 'deactivation' ? [`Schedule change ${scheduleConfirmed ? 'confirmed by operator' : 'not confirmed'}`] : []),
       ...found.extra.map(change => `${change.field}: ${change.display || change.target}`),
@@ -1962,9 +1969,11 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
     const rowRule = plannedRow || (rules?.dateSensitive ? { ...rules.dateSensitive, newestRow: true } : null);
     const descriptionRule = rules?.costCenterDescription || null;
     const emailRule = rules?.resourceManagerEmail || null;
+    const readEmail = !emailRule && Boolean(rules?.readResourceManagerEmail);
     const asks = [...planned, ...extra, ...(rowRule ? [{ field: 'Date Sensitive row', target: '', dateSensitive: rowRule }] : []),
       ...(descriptionRule ? [{ field: 'Cost Center Description', target: descriptionRule, contains: true, giveText: true }] : []),
-      ...(emailRule ? [{ field: 'Resource Manager Email', target: emailRule, whenFilled: true }] : [])];
+      ...(emailRule ? [{ field: 'Resource Manager Email', target: emailRule, whenFilled: true }] : []),
+      ...(readEmail ? [{ field: 'Resource Manager Email', target: '', quiet: true, giveText: true }] : [])];
     if (!asks.length) return null;
     const result = await page.readValues(asks);
     if (!isCurrent() || !Array.isArray(result?.values)) return null;
@@ -1977,6 +1986,7 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
     const rowValue = rowRule ? values[planned.length + extra.length] : null;
     const descriptionValue = descriptionRule ? values[asks.findIndex(ask => ask.giveText)] : null;
     const emailValue = emailRule ? values[values.length - 1] : null;
+    const shownEmail = readEmail && values[values.length - 1]?.available ? String(values[values.length - 1].text || '').replace(/\s+/g, '') : '';
     const onPage = value => Boolean(value?.available && value.matches);
     const managerOnPage = onPage(values.find(value => value.label === 'Resource Manager'));
     return {
@@ -1998,6 +2008,7 @@ function openReview({ item, into, mySource, note, onNote, onDone, onSkip, onFind
           && !(item.pendingCostCenterDescription && !descriptionValue.text?.trim()) ? descriptionValue.matches : null,
         description: descriptionValue?.available ? descriptionValue.text || '' : '',
         managerEmailWrong: Boolean(managerOnPage && emailValue?.available && !emailValue.matches),
+        managerEmail: managerOnPage && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(shownEmail) ? shownEmail : '',
         rowChecked: Boolean(rowValue?.available),
         rowDiffers: rowValue?.available && !rowValue.matches ? rowValue.differs || '' : '',
         shiftNow: rowValue?.shiftNow || '',
@@ -4386,7 +4397,7 @@ function runMail(item, record, context = {}, signOff = '') {
   }
   const dp = mailDp(item);
   const to = dp?.email || '';
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to) || !signOff.trim() || !person(item) || !item.ticketNumber || !firstName(dp.name) || !context.notificationText) return null;
+  if ((to && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) || !signOff.trim() || !person(item) || !item.ticketNumber || !firstName(dp.name) || !context.notificationText) return null;
   return { to, subject,
     body: `Hi ${firstName(dp.name)},\n\nMySource has been updated following the transfer notification below. Please let us know if you have any concerns.\n\n${context.notificationText}\n\nRegards,\n${signOff}` };
 }
@@ -4411,7 +4422,8 @@ function runSheets({ cases, results = new Map(), contexts = new Map(), signOff =
     const mail = runMail(item, record, contexts.get(item.key), signOff);
     const missing = mailEligible(item, record) && !mail
       ? item.specialCase === 'product' ? 'Mail not made: check the ticket notification and sign-off.' : 'Mail not made: check Deployment Professional email, ticket notification, source/destination and sign-off.' : '';
-    const reason = [record.reason, missing].filter(Boolean).join('; ');
+    const noAddress = mail && !mail.to && item.specialCase !== 'product' ? 'Mail To blank: no email for the DP in the DP mapping or on the page; fill it in.' : '';
+    const reason = [record.reason, missing, noAddress].filter(Boolean).join('; ');
     const note = record.state === 'done' ? resolutionNote(item) || record.resolution || '' : record.resolution || '';
     const attention = (!proved && !record.manual) || reason || record.outcome ? reason || record.outcome || 'No proved outcome' : '';
     summary.push([item.ticketNumber,person(item),item.email,result,record.what || (record.state === 'done' && closesByItself(item) ? closedReason(item) : ''),note,attention]);
@@ -5158,8 +5170,15 @@ const onceEach = rows => {
   for (const row of rows) if (!seen.has(rowValues(row))) seen.set(rowValues(row), row);
   return [...seen.values()];
 };
+function withEmailColumn(parsed, row) {
+  const column = trimmed(row.Email);
+  if (!column) return parsed;
+  const described = trimmed(parsed.email);
+  const differs = Boolean(described) && emailKey(column) !== emailKey(described);
+  return { ...parsed, email: column, ...(differs ? { emailDiffers: described } : {}) };
+}
 function sortTickets(serviceNowRows, mySourceRows, asOfDate, roster, decide, pageDescriptions = null, pageProfiles = null) {
-  const tickets = serviceNowRows.map(row => ({ row, parsed: readTicket(row.Description, row.Opened) }));
+  const tickets = serviceNowRows.map(row => ({ row, parsed: withEmailColumn(readTicket(row.Description, row.Opened), row) }));
   const allGroups = groupsByEmail(tickets, item => plainEmail(item.parsed.email));
   const profileGroups = groupsByEmail(mySourceRows, row => row.Email);
   const profileIndex = emailIndex(profileGroups, entry => entry[0]);
@@ -5241,6 +5260,7 @@ function rosterSays(inRoster) {
 function sortTicket(row, parsed, key, { newerTickets = [], ticketGroups, profiles, profileUnclear = false, twoById = false, asOfDate, inRoster, decide, pageDescription = '', pageProfile = null }) {
   const base = baseRecord(row, parsed);
   if (emailCandidates(parsed.email).length > 1) return manualRecord(base, 'no-email', '✗ More than one email on the ticket → email is unclear; handle this case by hand');
+  if (parsed.emailDiffers) return manualRecord(base, 'email-differs', `✗ The ticket's Email column says ${parsed.email}, its Description says ${parsed.emailDiffers} → check which is right`);
   if (inRoster?.conflicts) return manualRecord(base, 'roster-conflict', rosterConflictNote(inRoster));
   const found = profiles;
   const tickets = ticketGroups.get(plainEmail(key)) || [];
@@ -6158,6 +6178,7 @@ function pageChecksFor(item, asOfDate, levelGroups = {}) {
     const undone = [['Profile Status', 'Yes'], ['Termination Date', OPEN_TERMINATION_DATE]].filter(([field]) => !listed.has(field));
     const checks = { fields: item.foundLive ? [] : undone.map(([field, target]) => ({ field, target, quiet: true })), dateSensitive: null };
     if (resourceManagerTarget(item) && item.dp?.status === 'matched' && item.dp.email) checks.resourceManagerEmail = item.dp.email;
+    else if (resourceManagerTarget(item) && item.dp?.status === 'matched') checks.readResourceManagerEmail = true;
     if (item.checkCostCenterDescription) checks.costCenterDescription = BLOCKED_HEADCOUNT;
     return checks;
   }
@@ -6182,6 +6203,7 @@ function pageChecksFor(item, asOfDate, levelGroups = {}) {
   const checks = { fields, dateSensitive };
   if (item.checkCostCenterDescription) checks.costCenterDescription = BLOCKED_HEADCOUNT;
   if (manager && item.dp?.status === 'matched' && item.dp.email) checks.resourceManagerEmail = item.dp.email;
+  else if (manager && item.dp?.status === 'matched') checks.readResourceManagerEmail = true;
   return checks;
 }
 const EXPORT_ON_THE_PAGE = ['Practice', 'Job Family', 'Job Sub Family', 'Talent Model', 'People Leader', 'Major/Minor', 'Primary Industry'];
@@ -6588,6 +6610,7 @@ const MANUAL_REASONS = {
   'reactivation': { group: 'Reactivate, then wait' },
   'not-updated': { group: 'MySource not updated yet' },
   'no-email': { group: 'Profile not matched', detail: 'No email on the ticket' },
+  'email-differs': { group: 'Profile not matched', detail: 'Email column and Description differ' },
   'duplicate-ticket': { group: 'Profile not matched', detail: 'More than one ticket' },
   'no-profile': { group: 'Profile not matched', detail: 'No profile found' },
   'replaced-by-newer': { group: 'Replaced by a newer ticket' },
@@ -9972,7 +9995,7 @@ const __transfersScreens = [["header",{"class":"tool-head"},[["button",{"class":
 const __transfersStyles = [":root {\n  color-scheme: dark;\n  --bg: #151515;\n  --surface: #1c1c1c;\n  --surface-2: #1e1e1e;\n  --surface-3: #242424;\n  --border: #3a3a3a;\n  --border-strong: #4b4b4b;\n  --text: #eeeeee;\n  --muted: #a8a8a8;\n  --faint: #969696;\n  --sage: #a9c77d;\n  --sage-ink: #151515;\n  --blue: #86b8c8;\n  --amber: #c9aa68;\n  --coral: #c97972;\n  --shadow: 0 12px 36px rgba(0, 0, 0, .5);\n  --radius: 10px;\n  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;\n}\n* { box-sizing: border-box; }\n[hidden] { display: none !important; }\nbody { margin: 0; min-width: 300px; background: var(--bg); color: var(--text); }\nbutton, input { font: inherit; }\nbutton { color: inherit; }\n",":root {\n  --border: #303030;\n  --border-strong: #3a3a3a;\n  --selected-text: #c6d9a8;\n  font-size: 13px;\n  line-height: 1.5;\n}\nbody {\n  min-width: 280px;\n}\nbutton,\ninput,\ntextarea,\nselect {\n  font: inherit;\n}\nbutton,\nsummary {\n  cursor: pointer;\n}\nbutton:focus-visible,\nsummary:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\na:focus-visible,\n.summary-card:focus-within,\n.queue-row:focus-within {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 3px;\n}\nbutton:disabled {\n  opacity: 0.5;\n  cursor: not-allowed;\n}\n.button {\n  border: 0;\n  border-radius: 8px;\n  padding: 8px 10px;\n  background: var(--border-strong);\n  color: var(--text);\n  font-size: 13px;\n  font-weight: 700;\n  line-height: 1.4;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 7px;\n  min-height: 36px;\n  transition:\n    transform 120ms,\n    filter 120ms,\n    box-shadow 120ms;\n}\n.button:hover:not(:disabled),\n.drop-card:hover:not(:disabled) {\n  filter: brightness(1.1);\n  transform: translateY(-1px);\n  box-shadow: 0 3px 8px rgb(0 0 0 / 0.2);\n}\n.button:active:not(:disabled),\n.drop-card:active:not(:disabled) {\n  transform: scale(0.985);\n  filter: brightness(0.95);\n}\n.button.primary {\n  background: var(--sage);\n  color: var(--bg);\n}\n.button.secondary {\n  background: var(--blue);\n  color: var(--bg);\n}\n.button.warn {\n  background: var(--amber);\n  color: var(--bg);\n}\n.button.danger {\n  background: var(--coral);\n  color: var(--bg);\n  width: 100%;\n}\n.button-row,\n.actions {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 8px;\n  align-items: center;\n}\n.button-row > .button,\n.actions > .button {\n  flex: 1 1 calc(50% - 4px);\n  min-width: 0;\n  padding: 8px 6px;\n}\n.actions > .primary {\n  flex-basis: 100%;\n  order: -1;\n}\n.actions > .danger {\n  flex-basis: 100%;\n  order: 2;\n}\n.tool-head {\n  display: flex;\n  align-items: center;\n  gap: 12px;\n  min-height: 48px;\n  padding: 8px 14px;\n  background: var(--surface);\n  border-bottom: 1px solid var(--border);\n}\n.tool-head strong {\n  font-size: 14px;\n  font-weight: 700;\n}\n.tool-head > span {\n  margin-left: auto;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  color: var(--muted);\n  font-size: 12px;\n}\n.tool-menu {\n  margin-left: auto;\n  position: relative;\n  flex-shrink: 0;\n}\n.tool-head > span + .tool-menu {\n  margin-left: 0;\n}\n.tool-menu > summary {\n  list-style: none;\n  padding: 7px 10px;\n  border-radius: 8px;\n  background: var(--border-strong);\n  color: var(--text);\n  font-size: 12px;\n  font-weight: 700;\n}\n.tool-menu > summary::-webkit-details-marker {\n  display: none;\n}\n.menu-body {\n  position: absolute;\n  top: calc(100% + 8px);\n  right: 0;\n  z-index: 20;\n  width: min(310px, calc(100vw - 28px));\n  max-height: calc(100vh - 80px);\n  overflow-y: auto;\n  padding: 12px;\n  border: 1px solid var(--border-strong);\n  border-radius: 10px;\n  background: var(--surface);\n  box-shadow: var(--shadow);\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.menu-body hr {\n  width: 100%;\n  border: 0;\n  border-top: 1px solid var(--border);\n  margin: 0;\n}\n.menu-body details[open] {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\nh1,\nh2,\nh3,\nh4,\np {\n  margin: 0;\n}\nh2 {\n  font-size: 18px;\n  line-height: 1.3;\n  font-weight: 600;\n}\nh3 {\n  font-size: 20px;\n  font-weight: 600;\n}\nh4 {\n  font-size: 13px;\n  font-weight: 600;\n}\np {\n  color: var(--muted);\n}\nsmall,\n.notice,\n.session-warning {\n  color: var(--muted);\n  font-size: 12px;\n  line-height: 1.5;\n}\ndetails > summary {\n  font-size: 12px;\n  color: var(--muted);\n  padding: 5px 0;\n}\n.session-warning {\n  padding: 12px 0;\n  border-top: 1px solid var(--border);\n}\n.error,\n.error-panel {\n  color: var(--coral);\n  border-left: 2px solid var(--coral);\n  padding: 8px 10px;\n  overflow-wrap: anywhere;\n}\n.error-panel ul {\n  margin: 4px 0 0;\n  padding-left: 18px;\n}\n#diagnostic-log {\n  max-height: 190px;\n  overflow: auto;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  font:\n    11px/1.5 ui-monospace,\n    Consolas,\n    monospace;\n  color: var(--muted);\n}\ntextarea {\n  width: 100%;\n  min-height: 70px;\n  resize: vertical;\n  background: var(--surface);\n  border: 1px solid var(--border-strong);\n  border-radius: 8px;\n  color: var(--text);\n  padding: 8px 10px;\n}\n.session-note {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.discard-dialog {\n  max-width: min(390px, calc(100vw - 24px));\n  margin: auto;\n  border: 1px solid var(--border-strong);\n  border-radius: 12px;\n  padding: 20px;\n  background: var(--bg);\n  color: var(--text);\n}\n.discard-dialog[open] {\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n}\n.discard-dialog::backdrop {\n  background: rgb(0 0 0 / 0.6);\n}\n.sr-only {\n  position: absolute;\n  width: 1px;\n  height: 1px;\n  overflow: hidden;\n  clip-path: inset(50%);\n  white-space: nowrap;\n}\n.selection-input {\n  position: absolute;\n  width: 1px;\n  height: 1px;\n  opacity: 0;\n}\n@media (pointer: coarse) {\n  button,\n  summary,\n  .summary-card,\n  .queue-row {\n    min-height: 44px;\n  }\n  input,\n  textarea,\n  select {\n    font-size: 16px;\n  }\n}\n@media (prefers-reduced-motion: reduce) {\n  *,\n  *::before,\n  *::after {\n    scroll-behavior: auto !important;\n    transition: none !important;\n    transform: none !important;\n  }\n}\n",":root {\n  --head: #1b1b1b;\n  --border-soft: #242424;\n  --lavender: #a58ecc;\n}\nhtml {\n  scrollbar-width: none;\n}\nhtml::-webkit-scrollbar {\n  display: none;\n}\nbutton:focus-visible,\nsummary:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\na:focus-visible {\n  outline-offset: 2px;\n}\nmain {\n  max-width: 1120px;\n  margin: auto;\n  padding: 12px;\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.tool-head {\n  position: sticky;\n  top: 0;\n  z-index: 10;\n  min-height: 36px;\n  gap: 8px;\n  padding: 3px 6px 3px 12px;\n  background: var(--head);\n  border-bottom-color: var(--border-soft);\n}\n.tool-head > .close-transfers,\n.tool-head > .header-back {\n  min-height: 0;\n  padding: 3px 10px;\n  font-size: 13px;\n  line-height: 1.25;\n}\n.case-steps {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.case-steps[hidden] {\n  display: none;\n}\n.tool-head .header-step {\n  min-height: 0;\n  padding: 3px 8px;\n  font-size: 13px;\n  line-height: 1.25;\n}\n.queue-row .row-number {\n  color: var(--muted);\n  font-variant-numeric: tabular-nums;\n  margin-right: 6px;\n}\n.tool-head:has(> .header-back:not([hidden])) > strong {\n  display: none;\n}\n.header-space { flex: 1; }\n.tool-head > .header-action { width: auto; min-height: 0; padding: 3px 10px; font-size: 13px; line-height: 1.25; }\n.mail-signoff { display: flex; flex-direction: column; gap: 7px; margin-top: 20px; color: var(--muted); font-size: 12px; }\n.mail-signoff input { width: 100%; padding: 9px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); color: var(--text); box-sizing: border-box; }\n.loading-help { display: flex; align-items: center; gap: 12px; margin-top: 36px; color: var(--muted); font-size: 10px; }\n.loading-help .button { width: auto; min-height: 0; padding: 3px 0; font-size: 11px; background: transparent; color: var(--muted); }\n.optional {\n  font-weight: 400;\n  opacity: 0.8;\n}\n#file-check {\n  align-self: flex-start;\n}\n.field-names {\n  max-height: 180px;\n  overflow: auto;\n  margin: 0;\n  padding: 8px;\n  border: 1px solid var(--border);\n  border-radius: 6px;\n  background: var(--bg);\n  white-space: pre-wrap;\n  font: 11px/1.5 ui-monospace, Consolas, monospace;\n}\n.intake {\n  width: 100%;\n  max-width: 600px;\n  margin: auto;\n  display: flex;\n  flex-direction: column;\n  gap: 18px;\n  scroll-margin-top: 64px;\n}\n.drop-grid {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.drop-card {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 14px;\n  width: 100%;\n  padding: 8px 10px;\n  background: var(--surface);\n  color: var(--muted);\n  border: 1px solid var(--border);\n  border-radius: 8px;\n  text-align: left;\n  cursor: pointer;\n  transition:\n    transform 120ms,\n    filter 120ms;\n}\n.drop-card.loaded {\n  color: var(--text);\n}\n.file-copy {\n  display: flex;\n  align-items: baseline;\n  gap: 8px;\n  flex: 1;\n  min-width: 0;\n}\n.file-sign {\n  flex-shrink: 0;\n}\n.loaded .file-sign {\n  color: var(--sage);\n}\n.file-name {\n  min-width: 0;\n  overflow-wrap: anywhere;\n}\n.file-separator {\n  display: none;\n}\n.loaded .file-separator {\n  display: inline;\n}\n.drop-card .file-state {\n  font-size: inherit;\n  max-width: none;\n  overflow: visible;\n  white-space: normal;\n}\n.file-control {\n  flex-shrink: 0;\n  padding: 3px 8px;\n  border: 1px solid var(--blue);\n  border-radius: 6px;\n  color: var(--blue);\n  font-size: 12px;\n}\n.drop-card.dragging {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 3px;\n}\n.file-state {\n  font-size: 12px;\n  max-width: 44%;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n.run-row {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.run-row .primary {\n  width: 100%;\n}\n#results {\n  display: flex;\n  flex-direction: column;\n  gap: 18px;\n  scroll-margin-top: 64px;\n}\n.queue {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n.summary-grid {\n  display: flex;\n  gap: 2px;\n  flex-wrap: wrap;\n}\n.summary-card {\n  position: relative;\n  border: 0;\n  border-radius: 6px;\n  color: var(--muted);\n  padding: 6px 5px;\n  cursor: pointer;\n  font-size: 12px;\n  display: flex;\n  align-items: center;\n  gap: 5px;\n}\n.summary-card strong {\n  font-weight: 600;\n}\n.summary-card.active {\n  color: var(--selected-text);\n}\n.summary-card:hover {\n  background: var(--surface-3);\n}\n.summary-card:focus-within,\n.queue-row:focus-within {\n  outline: none;\n}\n.summary-card:has(:focus-visible),\n.queue-row:has(:focus-visible) {\n  outline: 2px solid var(--selected-text);\n  outline-offset: -2px;\n}\n.batch-warning {\n  margin: 4px 0 0;\n  font-size: 12px;\n  color: var(--amber);\n}\n.search-box input {\n  width: 100%;\n  border: 1px solid var(--border-strong);\n  background: var(--surface);\n  color: var(--text);\n  border-radius: 8px;\n  padding: 9px 10px;\n}\n.filter-row {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.queue-row {\n  position: relative;\n  display: flex;\n  align-items: baseline;\n  gap: 10px;\n  width: 100%;\n  padding: 8px 10px;\n  border-bottom: 1px solid var(--border-soft);\n  background: transparent;\n  color: var(--text);\n  cursor: pointer;\n  border-radius: 6px;\n}\n.queue-row:hover {\n  background: var(--surface-3);\n}\n.row-top {\n  display: flex;\n  flex: none;\n  justify-content: space-between;\n  gap: 8px;\n}\n.row-top > div {\n  text-align: right;\n}\n.queue-row .person {\n  display: block;\n  font-size: 13px;\n}\n.status-note {\n  display: block;\n  font-size: 11px;\n  color: var(--muted);\n  line-height: 1.4;\n}\n.list-heading {\n  margin: 8px 0 0;\n  font-size: 11px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  color: var(--blue);\n}\n.case-pane {\n  min-width: 0;\n}\n.case-card {\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.case-head {\n  display: flex;\n  justify-content: space-between;\n  align-items: baseline;\n  gap: 12px;\n}\n.case-tag .note-flag {\n  margin: 0 6px 0 0;\n}\n.ticket-number {\n  font-size: 12px;\n  color: var(--muted);\n}\n.badge {\n  font-size: 11px;\n  color: var(--muted);\n}\n.badge.ready,\n.badge.deactivation {\n  color: var(--sage);\n}\n.badge.done {\n  color: var(--lavender);\n}\n.badge.manual {\n  color: var(--amber);\n}\n.badge.no-change,\n.badge.later {\n  color: var(--blue);\n}\n.case-identity {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n.case-name {\n  margin: 0;\n  font-size: 20px;\n  font-weight: 600;\n}\n.case-meta {\n  margin: 0;\n  font-size: 12px;\n  color: var(--muted);\n  overflow-wrap: anywhere;\n}\n.case-section {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n}\n.case-label {\n  display: block;\n  margin: 0 0 2px;\n  font-size: 12px;\n  font-weight: 600;\n  color: var(--text);\n}\n.manual-section > .case-label {\n  color: var(--amber);\n}\n.case-lines {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n}\n.case-line {\n  margin: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  overflow-wrap: anywhere;\n}\n.case-line strong {\n  font-weight: 600;\n}\n.case-line.attention {\n  color: var(--amber);\n}\n.case-line.sign-problem {\n  color: var(--coral);\n}\n.case-line.sign-fine {\n  color: var(--sage);\n}\n.case-line.sign-info {\n  color: var(--blue);\n}\n.case-line.good {\n  color: var(--sage);\n}\n.case-line.noticed,\n.case-line.noticed strong,\n.case-line.noticed .sub-line {\n  color: var(--sage);\n}\n.schedule-step {\n  padding-left: 20px;\n}\n.schedule-step label {\n  cursor: pointer;\n}\n.information-list .case-line {\n  color: var(--muted);\n}\n.date-sensitive > strong {\n  color: var(--muted);\n}\n.date-sensitive .sub-line {\n  margin: 0;\n  padding-left: 12px;\n}\n.date-sensitive .sub-line.attention {\n  color: var(--amber);\n}\n.copy-text {\n  padding: 0;\n  border: 0;\n  background: none;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  cursor: copy;\n  text-decoration: underline dotted var(--faint);\n  text-underline-offset: 3px;\n}\n.copy-text:hover {\n  color: var(--text);\n  text-decoration-color: var(--text);\n}\n.copy-note {\n  margin-left: 6px;\n  font-size: 11px;\n  color: var(--sage);\n}\n.comment-block {\n  display: flex;\n  flex-direction: column;\n  align-items: flex-start;\n  gap: 4px;\n}\n.comment-block > .copy-text {\n  padding-left: 12px;\n  border-left: 2px solid var(--border-strong);\n  font-size: 13px;\n  line-height: 1.5;\n  color: var(--muted);\n  text-decoration: none;\n}\n.comment-block > .copy-text:hover {\n  border-left-color: var(--text);\n}\n.comment-block > .copy-note {\n  margin-left: 14px;\n}\n.comment-waiting,\n.comment-waiting .case-label {\n  color: var(--muted);\n}\n.comment-to-add:not(.comment-waiting),\n.comment-to-add:not(.comment-waiting) .case-label,\n.comment-to-add:not(.comment-waiting) .copy-text {\n  color: var(--sage);\n}\n.case-section + .comment-to-add {\n  margin-top: -8px;\n}\n.discard-dialog [autofocus]:focus {\n  outline: 2px solid var(--selected-text);\n  outline-offset: 2px;\n}\n.dialog-choices {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n}\n.dialog-choices > .button {\n  width: 100%;\n}\n.case-box {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n.case-box > .status-line:first-child {\n  font-weight: 600;\n}\n.case-box > .button {\n  width: 100%;\n}\n.done-row {\n  display: flex;\n  gap: 8px;\n}\n.done-row > .button {\n  min-width: 0;\n  padding: 8px 6px;\n}\n.done-row > .button.primary {\n  flex: 2;\n}\n.done-row > .button.quiet {\n  flex: 1;\n}\n.status-line {\n  margin: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  overflow-wrap: anywhere;\n}\n.status-line.good {\n  color: var(--sage);\n}\n.status-line.warn {\n  color: var(--amber);\n}\n.status-line.bad {\n  color: var(--coral);\n}\n.status-line.neutral {\n  color: var(--muted);\n}\n.note-fold {\n  border-top: 1px solid var(--border-soft);\n  padding-top: 10px;\n  font-size: 12px;\n}\n.note-fold > summary {\n  width: max-content;\n  list-style: none;\n  color: var(--muted);\n  cursor: pointer;\n}\n.note-fold > summary::-webkit-details-marker {\n  display: none;\n}\n.note-fold[open] > summary {\n  margin-bottom: 8px;\n}\n.note-fold textarea {\n  width: 100%;\n}\n.date-warning > summary {\n  color: var(--amber);\n  cursor: pointer;\n}\n.decided {\n  font-size: 12px;\n  color: var(--muted);\n}\n.decided summary {\n  cursor: pointer;\n}\n.decided h5 {\n  margin: 8px 0 2px;\n  font-size: 11px;\n  font-weight: 600;\n  color: var(--text);\n}\n.decided ul {\n  margin: 0;\n  padding-left: 18px;\n}\n.decided .values-heading { margin: 8px 0 2px; font-size: 11px; font-weight: 600; }\n.decided .hint, .comment-to-add .hint { font-size: 11px; font-weight: 400; color: var(--muted); }\n.decided li.sign-problem { color: var(--coral); }\n.decided li.sign-fine { color: var(--sage); }\n.decided li.sign-info { color: var(--blue); }\n.decided li.attention { color: var(--amber); }\n.note-flag {\n  margin-left: 6px;\n  padding: 0 2px;\n  border: 0;\n  background: none;\n  color: var(--amber);\n  font: inherit;\n  cursor: pointer;\n}\ndialog.small-window {\n  position: fixed;\n  inset: auto;\n  z-index: 30;\n  width: 230px;\n  max-width: calc(100vw - 16px);\n  max-height: 60vh;\n  margin: 0;\n  padding: 10px;\n  overflow: hidden auto;\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  background: var(--bg);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 12px;\n  box-shadow: var(--shadow);\n  outline: none;\n  font-size: 12px;\n}\n.small-window h2 {\n  margin: 0;\n  font-size: 14px;\n}\n.small-window p {\n  margin: 0;\n  line-height: 1.4;\n}\n.small-window p.notice {\n  color: var(--muted);\n  font-size: 11px;\n}\n.small-window .actions {\n  gap: 6px;\n}\n.small-window .button {\n  min-width: 0;\n  min-height: 0;\n  margin: 0;\n  padding: 6px 8px;\n  font-size: 12px;\n  border-radius: 8px;\n}\n.small-window .actions > .button {\n  flex: 1 1 calc(50% - 3px);\n}\n.small-window .actions > .danger {\n  flex-basis: 100%;\n}\n.wrong-mark {\n  margin-top: 10px;\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n.wrong-mark select {\n  background: var(--surface);\n  color: var(--text);\n  border: 1px solid var(--border-strong);\n  border-radius: 6px;\n  padding: 4px 6px;\n  font-size: 12px;\n}\n.wrong-mark.marked,\n.wrong-mark.marked select {\n  color: var(--amber);\n}\n.health-line {\n  margin: 0;\n  font-size: 12px;\n  color: var(--amber);\n}\n",".auto-page { width: 100%; box-sizing: border-box; max-width: 680px; margin: 0 auto; padding-bottom: 24px; }\n.auto-actions { display: flex; gap: 8px; margin-bottom: 16px; }\n.auto-actions > .button { width: auto; flex: 0 0 auto; }\n.auto-actions > .primary { flex: 1; }\n.auto-page > .case-section, .auto-results { margin-top: 24px; }\n.auto-page progress { width: 100%; height: 8px; accent-color: var(--lavender); border: 0; border-radius: 8px; overflow: hidden; }\n.auto-page progress::-webkit-progress-bar { background: var(--border); }\n.auto-page progress::-webkit-progress-value { background: var(--lavender); }\n.auto-person { font-weight: 600; margin: 8px 0; }\n.auto-before { margin: 12px 0; }\n.auto-done { color: var(--lavender); }\n.auto-page .case-line { overflow-wrap: anywhere; }\n"];
 const __transfersEmailHelpers = __transfersCreateModuleSystem({ document, window })('rules/prepare.js');
 __transfersCreateModuleSystem({ document, window })('run/start.js').start({
-  version: "0.7.0-console.86",
+  version: "0.7.0-console.89",
   styles: __transfersStyles,
   screens: __transfersScreens,
   pageReaders: __transfersPageReaders,
