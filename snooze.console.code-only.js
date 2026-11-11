@@ -1,4 +1,4 @@
-// v0.13.6
+// v0.13.7
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -3669,7 +3669,7 @@ async function restoreWeeklyWindow(backup, options = {}) {
   for (const old of plan.steps.add) await attempt(old.day, async () => {
     const run = weeklyPutBack(old);
     await addAssignment({ client: old.client, wbs: old.wbs, jobCode: old.jobCode, assignCode: old.assignCode, assignCode2: old.assignCode2, billable: old.billable,
-      utilization: old.utilization, pricingId: old.pricingId, start: run.start, end: run.end, hoursPerDay: run.hoursPerDay, notes: '' }, 'Normal', { onWrite: writeFor(run.start) });
+      utilization: old.utilization, pricingId: old.pricingId, start: run.start, end: run.end, hoursPerDay: run.hoursPerDay, notes: '' }, 'Normal', { onWrite: writeFor(run.start), weekly: true });
     await prove([...current.days, { ...old, id: '', notes: 0 }]); added++;
   });
   const after = await read();
@@ -5089,7 +5089,7 @@ __exports.safePageInfo = safePageInfo;
 },
 "mysource/dates-box.js": function (__require, __exports, document, window) {
 'use strict';
-const { compareDays, sameDay, readIsoDay, dayFromParts, usDate, workingDays, workdayCount } = __require("../rules/dates.js");
+const { compareDays, sameDay, readIsoDay, dayFromParts, usDate, workingDays, workdayCount, mondayOf } = __require("../rules/dates.js");
 const { PageError, WAIT, waitFor, stopFlagged, text, typeInto } = __require("./dom.js");
 const US = /(\d{1,2})\/(\d{1,2})\/(\d{4})/g;
 const readUsText = value => [...String(value || '').matchAll(US)].map(m => dayFromParts(m[3], m[1], m[2]));
@@ -5280,6 +5280,7 @@ function readDates(form, hoursPerDay = null) {
   const rowText = text(row);
   const days = (rowText.match(/Days\s*:?\s*(\d+)/i) || [])[1];
   const total = (rowText.match(/Total\s*Hours\s*:?\s*([\d.]+)/i) || [])[1];
+  const weeks = (rowText.match(/Weeks\s*:?\s*(\d+)/i) || [])[1];
   return {
     picker: found?.kind === 'bootstrap' ? multidateDays !== null
       ? { start: held[0] || null, end: held[held.length - 1] || null }
@@ -5293,6 +5294,7 @@ function readDates(form, hoursPerDay = null) {
         : shown.length > 2 ? { start: null, end: null } : null,
     boxes: { start: readAnyDay(startBox?.value), end: readAnyDay(endBox?.value) },
     days: days === undefined ? null : Number(days),
+    weeks: weeks === undefined ? null : Number(weeks),
     totalHours: total === undefined ? null : Number(total),
     hoursPerDay,
   };
@@ -5333,7 +5335,8 @@ function proveDates(form, start, end, hoursPerDay = null, pending = false) {
   if (d.totalHours !== null && hoursPerDay !== null && Math.abs(d.totalHours - days * hoursPerDay) > 0.001) problems.push(`Total Hours (${d.totalHours}, not ${days * hoursPerDay})`);
   const matchingRange = pair => pair && sameDay(pair.start, start) && sameDay(pair.end, end);
   if (![d.picker, d.shown].some(matchingRange)) problems.push('no readable start and end in the picker or shown dates box confirm them');
-  const confirmedByPage = matchingRange(d.picker) || d.days !== null && d.days === days;
+  const confirmedByPage = matchingRange(d.picker) || d.days !== null && d.days === days
+    || d.days === null && d.weeks !== null && d.weeks === new Set(expected.map(day => usDate(mondayOf(day)))).size;
   if (!confirmedByPage) problems.push('neither the page\u2019s picker nor its Days count confirms the dates');
   if (problems.length) {
     if (pending) return null;
@@ -5366,11 +5369,11 @@ __exports.proveDates = proveDates;
 const { stageNotes, stageTaxHours, stageRemoval, sameAssignmentRows } = __require("./note-stage.js");
 const { isTaxPage } = __require("./site.js");
 const { timedRun, recordRun } = __require("../core/run-records.js");
-const { addDays, compareDays, sameDay, mondayOf, todayOf, readIsoDay, usDate } = __require("../rules/dates.js");
+const { addDays, compareDays, sameDay, mondayOf, todayOf, readIsoDay, usDate, workingDays } = __require("../rules/dates.js");
 const { valueKey } = __require("../rules/prepare.js");
 const { entryKind } = __require("../rules/entries.js");
 const { compareCopies, copyWindow, coverAssignmentRange, retainAssignmentEvidence, dayOf, ENTRY_FIELDS, scheduleWriteAttempt, knownAssignmentRows } = __require("./copy.js");
-const { PageError, WAIT, guardReady, chooseInSelect2, click, closeWindow, fieldByLabel, keepFlags, cleanupAfter, modalTransitioning, settled, shown, stopFlagged, text, typeInto, waitFor } = __require("./dom.js");
+const { PageError, WAIT, guardReady, chooseInSelect2, click, closeWindow, fieldByLabel, keepFlags, cleanupAfter, modalTransitioning, sameText, settled, shown, stopFlagged, text, typeInto, waitFor } = __require("./dom.js");
 const { proveDates, setDates, proveAllowedDates, proveDateSet, setDateSet } = __require("./dates-box.js");
 const { waitForDates, waitForDateSet, readDates } = __require("./dates-box.js");
 const { buttonIn, emptySpots, menuItem, findAssignments, findAssignmentsRange, readEditTable, closeEdit, personIdentity, waitForPersonIdentity } = __require("./schedule.js");
@@ -5475,7 +5478,7 @@ async function deleteAllObserved(edit, { onWrite = () => {} }, opening) {
     throw error;
   } finally { view.removeEventListener('error', observeError); }
 }
-async function addAssignmentRecorded(entry, mode, { onWrite = () => {}, move = showDate, onProgress = () => {}, formModal = null, preflightForm = null } = {}) {
+async function addAssignmentRecorded(entry, mode, { onWrite = () => {}, move = showDate, onProgress = () => {}, formModal = null, preflightForm = null, weekly = false } = {}) {
   if (isTaxPage() && compareDays(entry.start, todayOf()) < 0) throw new PageError('Tax Add/Replace cannot start before today.');
   let retained = null;
   if (preflightForm) {
@@ -5491,10 +5494,12 @@ async function addAssignmentRecorded(entry, mode, { onWrite = () => {}, move = s
     }
   }
   const modal = formModal || await openAddForm(entry.start, move, onProgress);
+  let runs = null;
   if (!modal.isConnected || !shown(modal)) throw new PageError('The preflight Add Assignment window closed before the change. Nothing was changed.');
   try {
     if (retained?.required) proveAllowedDates(modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal, retained.required);
-    await fillAndAdd(modal, entry, mode, onWrite, onProgress);
+    runs = weekFormRuns(modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal, entry, weekly);
+    await fillAndAdd(modal, runs ? { ...entry, ...runs[0] } : entry, mode, onWrite, onProgress);
   } catch (error) {
     if (modal.isConnected && shown(modal) && !error.addPressed) {
       const how = await cleanupAfter(error, () => closeWindow(modal, 'Add Assignment'));
@@ -5502,17 +5507,62 @@ async function addAssignmentRecorded(entry, mode, { onWrite = () => {}, move = s
     }
     throw error;
   }
+  for (const run of runs?.slice(1) || []) await addAssignmentRecorded({ ...entry, ...run }, mode, { onWrite, move, onProgress, weekly });
+}
+const hasLabel = (form, label) => [...form.querySelectorAll('label')].some(node => sameText(text(node).replace(/[*?]/g, ''), label));
+const isWeekForm = form => !isTaxPage() && hasLabel(form, 'Hours Per Week');
+function weekRuns(start, end) {
+  const runs = [];
+  for (const day of workingDays(start, end)) {
+    const last = runs.at(-1);
+    if (last && sameDay(mondayOf(last.start), mondayOf(day))) last.end = day;
+    else runs.push({ start: day, end: day });
+  }
+  return runs;
+}
+function weekFormRuns(form, entry, weekly) {
+  if (!isWeekForm(form)) return null;
+  if (!weekly || entry.dates || entry.hoursPerWeek !== undefined || !Number.isFinite(Number(entry.hoursPerDay))) {
+    throw new PageError('This person’s Add Assignment works in weeks (Hours Per Week); Snooze adds there only for a Weekly A&A Exit. Nothing was added.');
+  }
+  const runs = weekRuns(entry.start, entry.end);
+  if (!runs.length) throw new PageError('The Weekly run has no working day. Nothing was added.');
+  return runs;
+}
+const weekHours = entry => Number(entry.hoursPerDay) * workingDays(entry.start, entry.end).length;
+async function proveWeek(form, start, end, hours) {
+  await waitForDates(form, start, end, null);
+  const box = fieldByLabel(form, 'Hours Per Week');
+  const check = () => {
+    const d = readDates(form);
+    return d.weeks === 1 && Math.abs(Number(box.value) - hours) < 0.001 && (d.totalHours === null || Math.abs(d.totalHours - hours) < 0.001);
+  };
+  try { await waitFor(check, 'the Weekly Add Assignment to show one week', WAIT.proof); }
+  catch (error) {
+    if (stopFlagged(error)) throw error;
+    const d = readDates(form);
+    throw Object.assign(new PageError(`Add Assignment does not show one week of ${hours} h for ${usDate(start)} – ${usDate(end)} (Weeks ${d.weeks ?? 'not shown'}, Hours Per Week ${box.value || 'blank'}, Total Hours ${d.totalHours ?? 'not shown'}). Nothing was added.`), { weekShown: true });
+  }
 }
 async function tryRun(form, { start, end, hoursPerDay, label }) {
   try {
-    await setDates(form, start, end);
-    await typeInto(fieldByLabel(form, 'Hours Per Day'), hoursPerDay);
-    await waitForDates(form, start, end, Number(hoursPerDay));
+    if (isWeekForm(form)) for (const run of weekRuns(start, end)) {
+      const hours = weekHours({ ...run, hoursPerDay });
+      await setDates(form, run.start, run.end);
+      await typeInto(fieldByLabel(form, 'Hours Per Week'), hours);
+      await proveWeek(form, run.start, run.end, hours);
+    } else {
+      await setDates(form, start, end);
+      await typeInto(fieldByLabel(form, 'Hours Per Day'), hoursPerDay);
+      await waitForDates(form, start, end, Number(hoursPerDay));
+    }
   } catch (error) {
-    if (stopFlagged(error)) throw error;
+    if (stopFlagged(error) || !(error instanceof PageError)) throw error;
+    if (error.weekShown) throw Object.assign(new PageError(error.message.replace('Nothing was added.', 'Nothing was changed; By hand.')), { trialDates: true });
     const held = readDates(form, Number(hoursPerDay));
+    const pair = held.picker?.start ? held.picker : held.shown?.start ? held.shown : null;
     const days = held.multidateDays?.length ? held.multidateDays.map(usDate).join(', ')
-      : held.shown?.start ? `${usDate(held.shown.start)} to ${held.shown.end ? usDate(held.shown.end) : 'no end'}` : 'no readable days';
+      : pair ? `${usDate(pair.start)} to ${pair.end ? usDate(pair.end) : 'no end'}` : 'no readable days';
     throw Object.assign(new PageError(`Add Assignment did not hold the ${label} days ${usDate(start)} – ${usDate(end)} (it held ${days}). Nothing was changed; By hand.`), { trialDates: true });
   }
 }
@@ -5576,17 +5626,20 @@ async function fillAndAdd(modal, entry, mode, onWrite, onProgress) {
     if (value) await chooseInSelect2(fieldByLabel(form, label), value, label);
   }
   onProgress('dates');
+  const week = !tax && isWeekForm(form);
+  if (week && (entry.dates || !sameDay(mondayOf(entry.start), mondayOf(entry.end)))) throw new PageError('A Weekly Add Assignment takes one week at a time. Nothing was added.');
   if (entry.dates) await setDateSet(form, entry.dates);
   else await setDates(form, entry.start, entry.end);
-  const hoursLabel = tax ? 'Hours Per Week' : 'Hours Per Day';
+  const hoursLabel = tax || week ? 'Hours Per Week' : 'Hours Per Day';
   onProgress(hoursLabel);
-  await typeInto(fieldByLabel(form, hoursLabel), tax ? entry.hoursPerWeek : entry.hoursPerDay);
+  await typeInto(fieldByLabel(form, hoursLabel), tax ? entry.hoursPerWeek : week ? weekHours(entry) : entry.hoursPerDay);
   onProgress('Notes');
   await typeInto(fieldByLabel(form, 'Notes'), entry.notes || '');
   onProgress('Mode');
   await chooseInSelect2(fieldByLabel(form, 'Mode'), mode, 'Mode');
   onProgress('prove');
   if (entry.dates) await waitForDateSet(form, entry.dates, Number(entry.hoursPerDay));
+  else if (week) await proveWeek(form, entry.start, entry.end, weekHours(entry));
   else await waitForDates(form, entry.start, entry.end, tax ? null : Number(entry.hoursPerDay));
   if (tax) {
     const wanted = [['Client', entry.client], ['Mode', mode], ['Hours Per Week', String(entry.hoursPerWeek)]];
@@ -5735,6 +5788,8 @@ async function saveStagedNotes(prepared, onWrite = () => {}) {
     throw error;
   }
 }
+__exports.isWeekForm = isWeekForm;
+__exports.weekRuns = weekRuns;
 __exports.preflightDates = preflightDates;
 __exports.deleteAll = deleteAll;
 __exports.splitDeleteWeeks = splitDeleteWeeks;
@@ -10129,7 +10184,7 @@ async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () 
   }
   if (weekly.addDns) await step(async () => {
     await addAssignment({ client: DNS_CLIENT, start: weekly.addDns.start, end: weekly.addDns.end, hoursPerDay: 8,
-      billable: 'Non-Billable', utilization: 'No', notes: '' }, 'Normal', { onWrite: written });
+      billable: 'Non-Billable', utilization: 'No', notes: '' }, 'Normal', { onWrite: written, weekly: true });
     const expected = weekly.expected.map(row => row.id ? current.days.find(live => live.id === row.id) || row : { jobCode: '', assignCode: '', assignCode2: '', wbs: '', pricingId: '', notes: 0, ...row });
     await prove(expected);
   });
@@ -15149,5 +15204,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.13.6");
+__snoozeLoad("screen/panel.js").start("0.13.7");
 })();
