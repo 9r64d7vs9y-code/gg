@@ -1,4 +1,4 @@
-// v0.13.5
+// v0.13.6
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -3633,7 +3633,8 @@ async function restoreWeeklyWindow(backup, options = {}) {
   if (previewBefore && !compareCopies(previewBefore, plan.before).same) throw new PageError('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
   if (previewDays && plan.changedDays.some(day => !previewDays.some(old => compareDays(old, day) === 0))) throw new PageError('The restore dates changed since the preview. Nothing was changed; preview again.');
   const addDates = plan.steps.add.flatMap(old => { const run = weeklyPutBack(old); return workingDays(run.start, run.end); });
-  if (addDates.length) await preflightDates(addDates, { anchor: addDates[0] });
+  const trial = plan.steps.add.map(old => ({ ...weeklyPutBack(old), label: old.client }));
+  if (addDates.length) await preflightDates(addDates, { anchor: addDates[0], trial });
   let current = plan.before, added = 0, runs = 0;
   const failures = [];
   const read = () => copyWindow(plan.window, { future: true });
@@ -5371,7 +5372,7 @@ const { entryKind } = __require("../rules/entries.js");
 const { compareCopies, copyWindow, coverAssignmentRange, retainAssignmentEvidence, dayOf, ENTRY_FIELDS, scheduleWriteAttempt, knownAssignmentRows } = __require("./copy.js");
 const { PageError, WAIT, guardReady, chooseInSelect2, click, closeWindow, fieldByLabel, keepFlags, cleanupAfter, modalTransitioning, settled, shown, stopFlagged, text, typeInto, waitFor } = __require("./dom.js");
 const { proveDates, setDates, proveAllowedDates, proveDateSet, setDateSet } = __require("./dates-box.js");
-const { waitForDates, waitForDateSet } = __require("./dates-box.js");
+const { waitForDates, waitForDateSet, readDates } = __require("./dates-box.js");
 const { buttonIn, emptySpots, menuItem, findAssignments, findAssignmentsRange, readEditTable, closeEdit, personIdentity, waitForPersonIdentity } = __require("./schedule.js");
 const { calendarHolds, showDate } = __require("./calendar.js");
 const { rememberPreflightForm, takePreflightForm, preflightFormIdentity } = __require("./preflight-form.js");
@@ -5502,7 +5503,20 @@ async function addAssignmentRecorded(entry, mode, { onWrite = () => {}, move = s
     throw error;
   }
 }
-async function preflightDates(required, { move = showDate, entries = [], keepOpen = false, anchor = required[0], onBounds = () => {} } = {}) {
+async function tryRun(form, { start, end, hoursPerDay, label }) {
+  try {
+    await setDates(form, start, end);
+    await typeInto(fieldByLabel(form, 'Hours Per Day'), hoursPerDay);
+    await waitForDates(form, start, end, Number(hoursPerDay));
+  } catch (error) {
+    if (stopFlagged(error)) throw error;
+    const held = readDates(form, Number(hoursPerDay));
+    const days = held.multidateDays?.length ? held.multidateDays.map(usDate).join(', ')
+      : held.shown?.start ? `${usDate(held.shown.start)} to ${held.shown.end ? usDate(held.shown.end) : 'no end'}` : 'no readable days';
+    throw Object.assign(new PageError(`Add Assignment did not hold the ${label} days ${usDate(start)} – ${usDate(end)} (it held ${days}). Nothing was changed; By hand.`), { trialDates: true });
+  }
+}
+async function preflightDates(required, { move = showDate, entries = [], keepOpen = false, anchor = required[0], onBounds = () => {}, trial = null } = {}) {
   if (!required.length) return { exact: false };
   const modal = await openAddForm(anchor, move);
   let proved = false;
@@ -5510,6 +5524,7 @@ async function preflightDates(required, { move = showDate, entries = [], keepOpe
     const form = modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal;
     const capability = proveAllowedDates(form, required, onBounds);
     let exact = capability.exact;
+    for (const run of [].concat(trial || [])) await tryRun(form, run);
     for (const entry of entries.filter(entry => entry.dates)) {
       if (!exact) break;
       await typeInto(fieldByLabel(form, 'Hours Per Day'), entry.hoursPerDay);
@@ -10054,8 +10069,10 @@ async function prepareWeeklyExit(ctx) {
   if (!greyedExit) {
     const dates = [...(weekly.addDns ? workingDays(weekly.addDns.start, weekly.addDns.end) : []), ...weekly.remove.filter(inReport).map(row => row.day)];
     if (dates.length) {
-      try { await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => preflightDates(dates, { anchor: dates.reduce((a, b) => compareDays(a, b) <= 0 ? a : b) }))); }
+      try { await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => preflightDates(dates, { anchor: dates.reduce((a, b) => compareDays(a, b) <= 0 ? a : b),
+        ...(weekly.addDns ? { trial: { start: weekly.addDns.start, end: weekly.addDns.end, hoursPerDay: 8, label: 'DNS' } } : {}) }))); }
       catch (error) {
+        if (error.trialDates) return { stop: error.message, reasonCode: 'addFormDates' };
         if (!/website.*allowed|Required dates/.test(error.message)) throw error;
         return { stop: error.message, reasonCode: 'allowedDatesUnreadableOrOutside' };
       }
@@ -12955,7 +12972,7 @@ function timedRun(stage, fn) {
   } catch (error) { return failed(error); }
 }
 const RULE_CODES = new Set('add shorten dns notLeave exit mixedNotification noDates noStart noEnd endBeforeStart leaveOver notesTooLong noEmail twoEmails twoEmailsInReportCell twoTickets noBusiness notConsulting cmat termDateUnreadable termBeforeLwd termBeforeEnd exitNoLwdUs exitNoLwdRegion exitUsiLwd futureScheduleGreyed exitNoLwd unknownLine twoWayDate twoDates unreadableDate reportPersonDisagrees exportPersonDisagrees datesOnOneLine auditLoa auditExit auditUsiLwd auditMissingDp bothReports cannotRestore taxPastEnd taxPartialLoa taxLevelGroup taxPartnerMd taxTalentGroup subcategoryMismatch notLeaveOrExitCase wrongSite taxWeeks'.split(' '));
-const REASON_CODES = new Set('allowedDatesUnreadableOrOutside loaSeparateBlocks notOnReport reportNotReady reportUnreadable reportStale personNotFound pageReportMismatch pastReportClients backupUnrestorable backupUnavailable backupReadFailed greyedNoBackup pageUnreadable pageTimeout identityChanged writeRefused changeUnproved restoreUnproved undoUnproved screenshotUnreadable sessionExpired unknownFailure'.split(' '));
+const REASON_CODES = new Set('allowedDatesUnreadableOrOutside addFormDates loaSeparateBlocks notOnReport reportNotReady reportUnreadable reportStale personNotFound pageReportMismatch pastReportClients backupUnrestorable backupUnavailable backupReadFailed greyedNoBackup pageUnreadable pageTimeout identityChanged writeRefused changeUnproved restoreUnproved undoUnproved screenshotUnreadable sessionExpired unknownFailure'.split(' '));
 const STAGES = new Set(['open person', 'close person', 'load person', 'read', 'compare', 'delete', 'check', 'add', 'save notes', 'screenshot', 'restore', 'undo', 'undo preview', 'prepare', 'report', 'resume']);
 const WINDOWS = new Set(['Schedule page', 'Find Assignments', 'Edit Assignment', 'Bulk Edit Assignments', 'Add Assignment', 'confirmation window', 'No. of Periods', 'go-to-date', 'right-click menu', 'View Notes', 'Schedule window', 'window search boxes', 'professional search', 'calendar dates', 'page loading']);
 const STRUCTURES = new Set(['select[id^="ScheduleAddForm_Staff_Form_field_"]', '.calendar-name', '.fc-view', 'table#editGrid', 'td.column-start', 'td.column-hours', 'td.column-jobcode', 'td.column-assigncodename', 'td.column-assigncodename2', 'td.column-clientname', 'td.column-engagement_name', 'td.column-assignment_type_name', 'td.column-utilization_name', 'td.column-cp#pricingid', 'td.column-resourcename', 'td.column-notesnumber']);
@@ -15132,5 +15149,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.13.5");
+__snoozeLoad("screen/panel.js").start("0.13.6");
 })();
