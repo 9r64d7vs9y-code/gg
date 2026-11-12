@@ -1,4 +1,4 @@
-// v0.14.7
+// v0.14.8
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -5365,11 +5365,12 @@ function proveDates(form, start, end, hoursPerDay = null, pending = false) {
   if (!singleBlankEnd && (d.boxes.start || d.boxes.end || sameDay(start, end) && endBox && d.multidateDays !== null)) check('the start/end boxes', d.boxes);
   const expected = workingDays(start, end);
   const days = expected.length;
+  const weeksConfirm = d.days === null && d.weeks !== null && d.weeks === new Set(expected.map(day => usDate(mondayOf(day)))).size;
   if (d.multidateDays !== null) {
     const keys = d.multidateDays.map(usDate);
     const held = new Set(keys);
     if (keys.length !== days || held.size !== days || !expected.every(day => held.has(usDate(day)))) problems.push('the picker does not hold exactly the working days');
-    if (d.days === null) problems.push('no Days shown to confirm the working days');
+    if (d.days === null && !weeksConfirm) problems.push('no Days or Weeks shown to confirm the working days');
   }
   if (d.days !== null && d.days !== days) problems.push(`Days (${d.days}, not ${days})`);
   if (d.totalHours !== null && hoursPerDay !== null && Math.abs(d.totalHours - days * hoursPerDay) > 0.001) problems.push(`Total Hours (${d.totalHours}, not ${days * hoursPerDay})`);
@@ -5629,7 +5630,8 @@ async function tryRun(form, { start, end, hoursPerDay, label }) {
     const pair = held.picker?.start ? held.picker : held.shown?.start ? held.shown : null;
     const days = held.multidateDays?.length ? held.multidateDays.map(usDate).join(', ')
       : pair ? `${usDate(pair.start)} to ${pair.end ? usDate(pair.end) : 'no end'}` : 'no readable days';
-    throw Object.assign(new PageError(`Add Assignment did not hold the ${label} days ${usDate(start)} – ${usDate(end)} (it held ${days}). Nothing was changed; By hand.`), { trialDates: true });
+    throw Object.assign(new PageError(`Add Assignment did not hold the ${label} days ${usDate(start)} – ${usDate(end)} (it held ${days}). Nothing was changed; By hand.`), { trialDates: true,
+      dateDiagnostics: { expected: { start, end }, picker: held.picker, shown: held.shown, boxes: held.boxes, days: held.days, weeks: held.weeks } });
   }
 }
 async function preflightDates(required, { move = showDate, entries = [], keepOpen = false, anchor = required[0], onBounds = () => {}, trial = null } = {}) {
@@ -13853,6 +13855,10 @@ __exports.diagnosticWaitName = diagnosticWaitName;
 "core/reason-names.js": function (__require, __exports, document, window) {
 'use strict';
 const reasons = [
+  ['allowedDatesUnreadable', /allowed dates could not be read/],
+  ['datesOutsideAllowed', /outside the website.s allowed range/],
+  ['datesDisabled', /disabled by the website/],
+  ['addDatesNotHeld', /did not hold the .* days|The Dates in Add Assignment are not|picker does not prove exactly/],
   ['weekNotCovered', /whole week is not covered|week delete scope/],
   ['keptRowInRange', /kept row is inside|A kept DNS and another entry share a day/],
   ['ownedDeleteTableChanged', /owned .*delete rows changed/],
@@ -15736,5 +15742,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.14.7");
+__snoozeLoad("screen/panel.js").start("0.14.8");
 })();
