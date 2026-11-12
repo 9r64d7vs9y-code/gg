@@ -1,4 +1,4 @@
-// v0.14.1
+// v0.14.2
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -5124,7 +5124,8 @@ __exports.safePageInfo = safePageInfo;
 "mysource/dates-box.js": function (__require, __exports, document, window) {
 'use strict';
 const { compareDays, sameDay, readIsoDay, dayFromParts, usDate, workingDays, workdayCount, mondayOf } = __require("../rules/dates.js");
-const { PageError, WAIT, waitFor, stopFlagged, text, typeInto } = __require("./dom.js");
+const { PageError, WAIT, waitFor, shown, stopFlagged, text, typeInto } = __require("./dom.js");
+const { isTaxPage } = __require("./site.js");
 const US = /(\d{1,2})\/(\d{1,2})\/(\d{4})/g;
 const readUsText = value => [...String(value || '').matchAll(US)].map(m => dayFromParts(m[3], m[1], m[2]));
 const readAnyDay = value => {
@@ -5256,7 +5257,8 @@ async function setDates(form, start, end) {
   let pickerEvidence = null;
   const { endBox, shownBox } = parts(form);
   const found = pickerOf(shownBox);
-  const hoursBox = form.querySelector('.js-daily-override');
+  const daily = form.querySelector('.js-daily-override');
+  const hoursBox = daily && (shown(daily) || isTaxPage(form.ownerDocument)) ? daily : null;
   const hours = hoursBox?.value.trim() && Number.isFinite(Number(hoursBox.value)) ? Number(hoursBox.value) : null;
   if (found) {
     try {
@@ -5541,7 +5543,7 @@ async function addAssignmentRecorded(entry, mode, { onWrite = () => {}, move = s
     throw error;
   }
 }
-const hasLabel = (form, label) => [...form.querySelectorAll('label')].some(node => sameText(text(node).replace(/[*?]/g, ''), label));
+const hasLabel = (form, label) => [...form.querySelectorAll('label')].some(node => shown(node) && sameText(text(node).replace(/[*?]/g, ''), label));
 const isWeekForm = form => !isTaxPage() && hasLabel(form, 'Hours Per Week');
 const wholeWeek = run => sameDay(run.start, mondayOf(run.start)) && sameDay(run.end, addDays(mondayOf(run.end), 4));
 function weekRuns(start, end, grouped = false) {
@@ -15469,5 +15471,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.14.1");
+__snoozeLoad("screen/panel.js").start("0.14.2");
 })();
