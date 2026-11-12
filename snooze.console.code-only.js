@@ -1,4 +1,4 @@
-// v0.14.6
+// v0.14.7
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -3885,9 +3885,12 @@ async function pageReady(what, timeout = WAIT.person, { reuseQuiet = false } = {
   quietProof = null;
   const started = Date.now();
   let clearSince = null;
+  let back = 0, latest = 0;
   await waitFor(() => {
-    if (busyCovers().length) clearSince = null;
-    else clearSince ??= Date.now();
+    if (busyCovers().length) {
+      if (clearSince !== null) { back++; latest = Math.max(latest, Date.now() - clearSince); }
+      clearSince = null;
+    } else clearSince ??= Date.now();
     return clearSince !== null && Date.now() - clearSince >= WAIT.quiet;
   }, `the page to finish loading (${what})`, timeout).catch(error => {
     if (error.identityChanged) throw error;
@@ -3897,6 +3900,7 @@ async function pageReady(what, timeout = WAIT.person, { reuseQuiet = false } = {
     throw keepFlags(error, new PageError(`${error.message} The loading cover ${describe(cover)} is still there${box ? ` (${Math.round(box.width)}×${Math.round(box.height)} px, opacity ${style.opacity}, z-index ${style.zIndex}, position ${style.position})` : ''}.`));
   });
   pageReady.waited = Date.now() - started - WAIT.quiet;
+  recordRun({ type: 'calmWait', back, latest });
   const proof = { touched: false, document };
   proof.watch = new document.defaultView.MutationObserver(records => { if (records.some(record => !ownChange(record))) proof.touched = true; });
   proof.watch.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
@@ -5823,11 +5827,12 @@ async function deleteRange(query, before, { edit = null, read, onWrite = () => {
   return current;
 }
 function addAssignment(...args) { return timedRun("add", () => addAssignmentRecorded(...args)); }
-async function setAssignmentHours(query, expected, target, hours, { onWrite = () => {}, restoring = false, weekly = false } = {}) {
-  const allowed = () => (weekly ? !isTaxPage() : isTaxPage()) && compareDays(target.day, mondayOf(todayOf())) >= 0 && (restoring || hours <= target.hours)
+async function setAssignmentHours(query, expected, target, hours, { onWrite = () => {}, restoring = false, weekly = false, remove = [] } = {}) {
+  const removable = !remove.length || weekly && remove.every(row => row.id && row.id !== target.id && compareDays(row.day, mondayOf(todayOf())) >= 0);
+  const allowed = () => removable && (weekly ? !isTaxPage() : isTaxPage()) && compareDays(target.day, mondayOf(todayOf())) >= 0 && (restoring || hours <= target.hours)
     && (weekly || compareDays(target.day, todayOf()) >= 0 || !['loa', 'holiday', 'dns'].includes(entryKind(target)) && valueKey(target.client) !== 'loa');
   if (!allowed()) throw new PageError('Tax hours edit is outside the allowed change.');
-  const staged = await stageTaxHours(query, expected, target, hours);
+  const staged = await stageTaxHours(query, expected, target, hours, { remove });
   return saveStagedNotes(staged, async () => { await onWrite(); if (!allowed()) throw new PageError('Tax hours edit moved outside the allowed dates.'); });
 }
 async function refreshNotes(query, expected, notes, { onWrite = () => {}, remove = [], onStage = () => {} } = {}) {
@@ -5991,7 +5996,7 @@ function noteRowsEligible(rows) {
     return (first || blankNoteField(field)) && rows.every(row => valueKey(row[field]) === first);
   });
 }
-async function stageTaxHours(query, expected, target, hours) {
+async function stageTaxHours(query, expected, target, hours, { remove = [] } = {}) {
   const edit = await findAssignments(query);
   let staged = false;
   try {
@@ -6018,6 +6023,7 @@ async function stageTaxHours(query, expected, target, hours) {
     const submits = [...edit.querySelectorAll('button')].filter(node => shown(node) && text(node) === 'Submit' && !node.disabled);
     if (submits.length !== 1) throw new PageError('Tax Edit Assignment has no unique enabled Submit. Nothing was saved.');
     staged = true;
+    if (remove.length) return await stageRemoval(edit, after, remove);
     return { edit, saveSubmit: submits[0] };
   } finally { if (!staged) await closeEdit(edit); }
 }
@@ -8168,7 +8174,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
   };
   const batch = { state: 'idle', message: '', rows: cases.map(one => ({ one, state: 'pending' })), phase: 'check', index: 0,
     confirmed: false, active: false, pauseRequested: false, stopRequested: false, pendingRestore: null };
-  batch.diagnostic = { today, misses: [], slow: [], dialogs: [], unread: [], resumed: 0, noAction, waits: [], visibility: [], schedulePage: [], identity: [], findSteps: [], stalls: [] };
+  batch.diagnostic = { today, misses: [], slow: [], dialogs: [], unread: [], resumed: 0, noAction, waits: [], visibility: [], schedulePage: [], identity: [], findSteps: [], stalls: [], calm: { waits: 0, back: [] } };
   for (const row of batch.rows) row.diagnostic = { steps: [], paint: [] };
   let observedRow = null;
   let retrying = false;
@@ -8291,6 +8297,10 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       run.findSteps.push({ name: event.name, seconds: event.seconds, person: row ? batch.rows.indexOf(row) + 1 : null, stage: data?.currentStage });
     }
     if (event.type === 'wait') run.waits.push({ ...event, person: row ? batch.rows.indexOf(row) + 1 : null });
+    if (event.type === 'calmWait' && run.calm) {
+      run.calm.waits++;
+      if (event.back > 0) run.calm.back.push({ person: row ? batch.rows.indexOf(row) + 1 : null, times: event.back, latest: event.latest, stage: data?.currentStage });
+    }
     if (event.type === 'schedulePage' || event.type === 'identity') {
       const items = event.type === 'identity' ? run.identity : run.schedulePage;
       items.push({ ...event.facts, seconds: event.seconds, person: event.person ?? (row ? batch.rows.indexOf(row) + 1 : null),
@@ -11261,11 +11271,11 @@ async function runSmallConsultingRecorded({ email, version, today = todayOf(), o
     async () => { result.pictures.push(...await page.smallPicture()); },
     () => page.smallUndo(write), () => page.smallExit(write), () => page.auditClear(write)];
   const toWeekly = () => {
-    result.design = 'weekly5'; result.expectedSteps = 5;
+    result.design = 'weekly6'; result.expectedSteps = 6;
     result.steps = [result.steps[0], ...Object.keys(WEEKLY_LIVE_STEPS).slice(1).map(id => ({ id, state: 'notExercised' }))];
-    actions = [actions[0], () => page.weeklySetup(write), () => page.weeklyExit(write), () => page.weeklyUndo(write), () => page.weeklyClear(write)];
+    actions = [actions[0], () => page.weeklySetup(write), () => page.weeklyTable(write), () => page.weeklyExit(write), () => page.weeklyUndo(write), () => page.weeklyClear(write)];
   };
-  const titles = () => result.design === 'weekly5' ? WEEKLY_LIVE_STEPS : SMALL_LIVE_STEPS;
+  const titles = () => result.design === 'weekly6' ? WEEKLY_LIVE_STEPS : SMALL_LIVE_STEPS;
   let release;
   try {
     release = await page.begin(result.events);
@@ -11284,7 +11294,7 @@ async function runSmallConsultingRecorded({ email, version, today = todayOf(), o
     if (error.connectionLost) throw error;
     if (!result.diagnostic.stop) diagnostic.fail(error, result.steps.find(s => s.state === 'running')?.id || 'smallOpen');
     result.state = 'failed'; diagnostic.cleanup();
-    try { result.cleanup = await (result.design === 'weekly5' ? page.weeklyCleanup(write, error) : page.auditCleanup(write, error)); }
+    try { result.cleanup = await (result.design === 'weekly6' ? page.weeklyCleanup(write, error) : page.auditCleanup(write, error)); }
     catch (cleanupError) { if (cleanupError.connectionLost) { result.connectionReturnState = 'failed'; result.state = 'paused'; throw cleanupError; } diagnostic.fail(cleanupError, 'recovery'); result.cleanup = 'unconfirmed'; }
   } finally {
     result.outstanding = page.auditOutstanding(result.cleanup); release?.(); diagnostic.finish(); onUpdate(result);
@@ -11630,6 +11640,7 @@ const SMALL_LIVE_STEPS = {
 };
 const WEEKLY_LIVE_STEPS = {
   smallOpen: 'Open and read', weeklySetup: 'Weekly setup: DNS 4 h a day, three weeks',
+  weeklyTable: 'Weekly table: lower one week, remove two rows one by one, one Submit; put back',
   weeklyExit: 'Weekly A&A Exit: DNS in whole weeks, each Add checked', weeklyUndo: 'Undo from the backup',
   cleanup: 'Clear and check empty',
 };
@@ -12387,7 +12398,7 @@ function auditLivePage(today, small = false) {
       await deleteAll(edit, { onWrite: notice });
     }, write);
   };
-  let weeklyCheckpoint = null;
+  let weeklyCheckpoint = null, weeklyGrouped = false;
   const weeklyRead = () => withWeeklyRows(() => read());
   const weeklyAdd = async (entry, write) => { bounded(entry); await addAssignment(entry, 'Normal', { onWrite: write, weekly: true }); };
   const weeklyExpect = (copy, rows, message) => {
@@ -12472,11 +12483,30 @@ function auditLivePage(today, small = false) {
       const setup = { start: addDays(scope.start, 14), end: addDays(scope.start, 32) };
       const held = await preflightDates(workingDays(setup.start, setup.end), { anchor: setup.start,
         trial: { ...setup, hoursPerDay: 4, label: 'DNS' } });
-      for (const run of weekRuns(setup.start, setup.end, !!held?.grouped))
+      weeklyGrouped = !!held?.grouped;
+      for (const run of weekRuns(setup.start, setup.end, weeklyGrouped))
         await weeklyAdd({ ...run, client: DNS, hoursPerDay: 4, billable: 'Non-Billable', utilization: 'No', notes: '' }, write);
       weeklyCheckpoint = await weeklyRead();
       weeklyExpect(weeklyCheckpoint, [[14, DNS, 20], [21, DNS, 20], [28, DNS, 20]], 'The Weekly setup was not saved as three weeks of 20 h.');
       return { weeks: 3 };
+    },
+    async weeklyTable(write) {
+      const before = await weeklyRead();
+      if (!matches(weeklyCheckpoint, before)) throw new PageError('The Weekly setup changed before the table edit.');
+      const span = { start: addDays(scope.start, 14), end: addDays(scope.start, 32), weekEndFriday: true };
+      const inWeek = offset => row => sameDay(mondayOf(row.day), addDays(scope.start, offset));
+      const target = before.days.find(inWeek(14));
+      const remove = before.days.filter(row => inWeek(21)(row) || inWeek(28)(row));
+      if (!target || remove.length !== 2) throw new PageError('The Weekly table rows are unreadable.');
+      await withWeeklyRows(() => setAssignmentHours(span, before, target, 12, { onWrite: write, weekly: true, remove }));
+      const after = await weeklyRead();
+      weeklyExpect(after, [[14, DNS, 12]], 'The Weekly table edit was not saved as one 12 h week.');
+      await withWeeklyRows(() => setAssignmentHours(span, after, after.days[0], 20, { onWrite: write, weekly: true, restoring: true }));
+      for (const run of weekRuns(addDays(scope.start, 21), addDays(scope.start, 32), weeklyGrouped))
+        await weeklyAdd({ ...run, client: DNS, hoursPerDay: 4, billable: 'Non-Billable', utilization: 'No', notes: '' }, write);
+      weeklyCheckpoint = await weeklyRead();
+      weeklyExpect(weeklyCheckpoint, [[14, DNS, 20], [21, DNS, 20], [28, DNS, 20]], 'The Weekly table edit was not put back.');
+      return { rowsRemoved: 2, hoursLowered: true, putBack: true };
     },
     async weeklyExit(write) {
       known = weeklyCheckpoint;
@@ -13371,7 +13401,7 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     box.replaceChildren(); email.disabled = active || !!result;
     back.disabled = active; go.disabled = active || !!result; downloadButton.disabled = active; logButton.disabled = active;
     if (photo && result && !active) {
-      const small = ['small8','weekly5','tax5'].includes(result.design) || !Array.isArray(result.events);
+      const small = ['small8','weekly6','tax5'].includes(result.design) || !Array.isArray(result.events);
       const report = small ? el('div', { role: 'region', 'aria-label': 'Photo report' },
         el('pre', { style: 'font:13px/1.35 Consolas,monospace;white-space:pre;margin:0' }, shortLiveReport(result))) : renderPhotoReport(result);
       box.append(report);
@@ -13889,11 +13919,11 @@ const { SMALL_LIVE_STEPS, SMALL_TAX_STEPS, WEEKLY_LIVE_STEPS } = __require("./li
 const { observeRun, recordRun, STAGES, WINDOWS, FIELDS, WAIT_NAMES, REASON_CODES, reasonCode } = __require("../core/run-records.js");
 const { REASON_NAMES, errorReason } = __require("../core/reason-names.js");
 const { dayFromParts, mondayOf, weekday, usDate } = __require("../rules/dates.js");
-const steps = new Set('smallExit weeklySetup weeklyExit weeklyUndo smallOpen smallAdd smallChange smallDelete smallPicture smallUndo aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
+const steps = new Set('smallExit weeklySetup weeklyTable weeklyExit weeklyUndo smallOpen smallAdd smallChange smallDelete smallPicture smallUndo aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
 const word = (value, allowed, fallback = 'unknown') => allowed.has(value) ? value : fallback;
 const count = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
 const stages = new Set([...STAGES, 'move calendar']);
-const types = new Set('begin step error miss window field loading waiting slow wait waitBegin delay restoreRead restoreComparison diagnosticRead findStep findBoxes writeAttempt writeProof assignPeriod crossCheck stop cleanup finish periods identity schedulePage visibility dialog personLoaded searchStart'.split(' '));
+const types = new Set('calmWait begin step error miss window field loading waiting slow wait waitBegin delay restoreRead restoreComparison diagnosticRead findStep findBoxes writeAttempt writeProof assignPeriod crossCheck stop cleanup finish periods identity schedulePage visibility dialog personLoaded searchStart'.split(' '));
 const results = new Set(['passed','failed','refused','late','unconfirmed','running']);
 const actions = new Set(['delete','add','submit']);
 const waitNames = new Set([...WAIT_NAMES,...FIELDS,'open','filters','settle','submit','table']);
@@ -13948,7 +13978,7 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
       code: word(event.code, REASON_CODES, 'none'), reasonName: word(event.reasonName, REASON_NAMES, 'none'), boxType,
       assignPeriod: data.assignPeriod };
     if (event.type === 'error') { safe.page = snapshot(); safe.lastAction = lastAction; event.liveStop = {step:safe.step,stage,lastAction,page:safe.page}; }
-    for (const key of ['rows','selected','count']) if (Number.isSafeInteger(event[key]) && event[key] >= 0) safe[key] = event[key];
+    for (const key of ['rows','selected','count','back','latest']) if (Number.isSafeInteger(event[key]) && event[key] >= 0) safe[key] = event[key];
     if (event.type === 'writeAttempt') {
       lastAction = word(event.action, actions); safe.action = lastAction; safe.write = ++writes;
       safe.proof = 'unconfirmed'; pending.push(safe);
@@ -14000,7 +14030,7 @@ function cleanEvent(event) {
   if (event.page) safe.page=cleanPage(event.page);
   if (actions.has(event.action)) safe.action=event.action;
   if (actions.has(event.lastAction) || stages.has(event.lastAction)) safe.lastAction=event.lastAction;
-  for (const key of ['rows','selected','count','write']) if (Number.isSafeInteger(event[key]) && event[key]>=0) safe[key]=event[key];
+  for (const key of ['rows','selected','count','write','back','latest']) if (Number.isSafeInteger(event[key]) && event[key]>=0) safe[key]=event[key];
   if (Array.isArray(event.writes)) safe.writes=event.writes.filter(n=>Number.isSafeInteger(n) && n>0);
   if (['passed','failed','unconfirmed'].includes(event.proof)) safe.proof=event.proof;
   return safe;
@@ -14092,7 +14122,7 @@ function shortLiveReport(result) {
     return parts.join(' · ');
   };
   line('Verdict', `${report.verdict}; version ${report.version}`);
-  const smallSteps = result.design === 'small8' ? SMALL_LIVE_STEPS : result.design === 'weekly5' ? WEEKLY_LIVE_STEPS : result.design === 'tax5' ? SMALL_TAX_STEPS : null;
+  const smallSteps = result.design === 'small8' ? SMALL_LIVE_STEPS : result.design === 'weekly6' ? WEEKLY_LIVE_STEPS : result.design === 'tax5' ? SMALL_TAX_STEPS : null;
   if (smallSteps) {
     const states = Object.entries(smallSteps).map(([id, title]) => {
       const step = result.steps?.find(step => step.id === id);
@@ -14358,6 +14388,12 @@ function runReportText(batch, version, now = Date.now()) {
   if (records.stalls?.length) for (const item of records.stalls) {
     const time = number(item.time);
     lines.push(`Stall: ${time === null ? 'not recorded' : new Date(time).toISOString()}; #${amount(item.person)}; step ${stage(item.stage)}; last wait ${WINDOWS.has(item.wait) ? windowWords(item.wait) : 'not recorded'}; stuck ${amount(item.seconds)} s`);
+  }
+  const calm = records.calm;
+  if (calm) {
+    const back = (calm.back || []).filter(item => number(item.latest) !== null);
+    lines.push(`Calm waits: ${amount(calm.waits)}; a cover came back in ${back.length}${back.length ? `, latest after ${Math.max(...back.map(item => number(item.latest)))} ms of calm` : ''}`);
+    for (const item of back.slice(0, 40)) lines.push(`#${amount(item.person)} ${stage(item.stage)}: back ${amount(item.times)} time(s), after ${amount(item.latest)} ms`);
   }
   lines.push('Waits:');
   for (const item of records.waits || []) lines.push(`#${amount(item.person)} ${WINDOWS.has(item.name) ? windowWords(item.name) : 'unrecognized window'}: ${amount(item.seconds)} s / ${amount(item.ceiling)} s limit; ${['passed', 'failed', 'late', 'refused', 'unconfirmed'].includes(item.result) ? item.result : 'unconfirmed'}`);
@@ -15700,5 +15736,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.14.6");
+__snoozeLoad("screen/panel.js").start("0.14.7");
 })();
