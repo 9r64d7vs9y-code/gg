@@ -1,4 +1,4 @@
-// v0.14.3
+// v0.14.6
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -5384,7 +5384,7 @@ function proveDates(form, start, end, hoursPerDay = null, pending = false) {
       selected: selected ? { count: selected.length, unique: new Set(selected).size,
         missing: expected.filter(day => !selected.includes(usDate(day))).length,
         extra: selected.filter(day => !expected.some(wanted => usDate(wanted) === day)).length } : null,
-      days: d.days, totalHours: d.totalHours,
+      days: d.days, weeks: d.weeks ?? null, totalHours: d.totalHours,
     };
     throw error;
   }
@@ -5591,7 +5591,8 @@ async function proveWeek(form, start, end, hours) {
   catch (error) {
     if (stopFlagged(error)) throw error;
     const d = readDates(form);
-    throw Object.assign(new PageError(`Add Assignment does not show ${said} of ${hours} h for ${usDate(start)} – ${usDate(end)} (Weeks ${d.weeks ?? 'not shown'}, Hours Per Week ${box.value || 'blank'}, Total Hours ${d.totalHours ?? 'not shown'}). Nothing was added.`), { weekShown: true });
+    throw Object.assign(new PageError(`Add Assignment does not show ${said} of ${hours} h for ${usDate(start)} – ${usDate(end)} (Weeks ${d.weeks ?? 'not shown'}, Hours Per Week ${box.value || 'blank'}, Total Hours ${d.totalHours ?? 'not shown'}). Nothing was added.`), { weekShown: true,
+      dateDiagnostics: { expected: { start, end }, picker: d.picker, shown: d.shown, boxes: d.boxes, days: d.days, weeks: d.weeks } });
   }
 }
 async function tryRun(form, { start, end, hoursPerDay, label }) {
@@ -5619,7 +5620,7 @@ async function tryRun(form, { start, end, hoursPerDay, label }) {
     }
   } catch (error) {
     if (stopFlagged(error) || !(error instanceof PageError)) throw error;
-    if (error.weekShown) throw Object.assign(new PageError(error.message.replace('Nothing was added.', 'Nothing was changed; By hand.')), { trialDates: true });
+    if (error.weekShown) throw Object.assign(new PageError(error.message.replace('Nothing was added.', 'Nothing was changed; By hand.')), { trialDates: true, dateDiagnostics: error.dateDiagnostics });
     const held = readDates(form, Number(hoursPerDay));
     const pair = held.picker?.start ? held.picker : held.shown?.start ? held.shown : null;
     const days = held.multidateDays?.length ? held.multidateDays.map(usDate).join(', ')
@@ -6183,6 +6184,17 @@ const addReads = new WeakMap();
 const findCopies = new WeakMap();
 const knownAssignmentRows = copy => findCopies.get(copy) || { rows: copy.days, range: copy.window };
 function retainAssignmentEvidence(copy, checked) { findCopies.set(copy, knownAssignmentRows(checked)); }
+function futureCopyFrom(copy, window) {
+  const known = copy && findCopies.get(copy);
+  if (!known?.range?.start || compareDays(known.range.start, window.start) > 0 || compareDays(window.start, copy.window.start) > 0) return null;
+  if (compareDays(copy.window.end, window.end) < 0) return null;
+  if (known.rows.some(row => !row.day)) return null;
+  const days = known.rows.filter(row => compareDays(row.day, window.start) >= 0);
+  const end = days.reduce((last, row) => compareDays(row.day, last) > 0 ? row.day : last, window.end);
+  const narrowed = { window: { ...window, end }, taken: copy.taken, days };
+  findCopies.set(narrowed, { rows: known.rows, range: known.range, canRefreshNotes: known.canRefreshNotes });
+  return narrowed;
+}
 async function coverAssignmentRange(copy, range) {
   const known = knownAssignmentRows(copy);
   if (!known.range || !range?.end || !known.range.end
@@ -6349,6 +6361,7 @@ function copyWindow(...args) { return timedRun("read", () => copyWindowRecorded(
 function compareCopies(...args) { return timedRun("check", () => compareCopiesRecorded(...args)); }
 __exports.knownAssignmentRows = knownAssignmentRows;
 __exports.retainAssignmentEvidence = retainAssignmentEvidence;
+__exports.futureCopyFrom = futureCopyFrom;
 __exports.coverAssignmentRange = coverAssignmentRange;
 __exports.retireAddRead = retireAddRead;
 __exports.scheduleWriteAttempt = scheduleWriteAttempt;
@@ -6550,13 +6563,15 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
   const startedOn = todayOf();
   const currentDay = () => { const day = todayOf(); return compareDays(day, startedOn) === 0 ? today : day; };
   const notPast = span => { if (compareDays(span.start, currentDay()) < 0) throw new PageError(`${usDate(span.start)} became a past date during the restore; it was not changed.`); };
-  const writeFor = span => async () => { notPast(span); await onWrite(); notPast(span); };
+  let wrote = false;
+  const writeFor = span => async () => { notPast(span); await onWrite(); wrote = true; notPast(span); };
   const { window, scoped, before, skippedPast, skippedLater, skippedLocked = [], changedDays, protectedDays } = plan;
   if (previewDays && changedDays.some(day => !previewDays.some(allowed => compareDays(day, allowed) === 0))) throw new PageError('The restore dates changed since the preview. Nothing was changed; preview again.');
   if (previewBefore && before && !sameLive(previewBefore, before)) throw new PageError('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
   if (plan.nothing) return { same: !automaticRecovery || !skippedLocked.length, unrestoredDates: skippedLocked.map(usDate), differences: automaticRecovery ? skippedLocked.map(day => ({ date: usDate(day), field: 'restore unconfirmed', message: `${usDate(day)}: restore unconfirmed; the day is locked.` })) : [], missing: [], extra: [], added: 0, runs: 0, skippedPast, skippedLater, skippedLocked, after: before || null,
     nothing: !provedAfter && !previewBefore && before ? 'Nothing to put back.' : plan.nothing };
-  const restoreRuns = automaticRecovery ? changedDays.map(day => ({ start: day, end: day })) : changedRuns(plan.differences, protectedDays);
+  const noBridge = automaticRecovery ? new Set([...protectedDays, ...before.days.filter(row => weekend(row.day)).map(row => usDate(row.day))]) : protectedDays;
+  const restoreRuns = changedRuns(plan.differences, noBridge);
   const planned = restoreRuns.map(window => {
     const wanted = scoped.days.filter(row => within(row.day, window));
     const present = before.days.filter(row => within(row.day, window));
@@ -6583,8 +6598,19 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
   let added = 0;
   let runs = 0;
   let weekBefore = before;
+  const wholeNoteRows = [...before.days, ...planned.flatMap(run => run.preserved)].filter(row => typeof row.noteText === 'string');
+  let wholeRead = null, checking = false;
+  const readWhole = async () => {
+    if (!checking) { checking = true; onStep({ step: 'checking' }); }
+    const copy = await copyWindow(window, { noteRows: wholeNoteRows });
+    proofIds.set(copy, ++proofSequence);
+    wholeRead = copy;
+    return copy;
+  };
+  const part = (copy, span) => ({ window: span, days: copy.days.filter(row => within(row.day, span)) });
   for (const run of planned) {
     let entry = null;
+    const lastRun = run === planned[planned.length - 1];
     try {
       onStep({ step: 'clearing', runs, ofRuns: planned.length });
       let edit = await findAssignments(run.window);
@@ -6618,7 +6644,8 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
         await verifyBefore?.({ ...actual, window: run.window });
         for (const row of actual.days) {
           if (expected.days.some(old => usDate(old.day) === usDate(row.day) && valueKey(old.client) === valueKey(row.client) && typeof old.noteText === 'string')) {
-            row.noteText = row.notes > 0 ? await readRowNote(edit, row.id) : '';
+            const read = !wrote && row.id && before.days.find(old => old.id === row.id && old.notes === row.notes && typeof old.noteText === 'string');
+            row.noteText = read ? read.noteText : row.notes > 0 ? await readRowNote(edit, row.id) : '';
           }
         }
         if (!(run.additionOnly ? sameRetained(expected, actual) : sameLive(expected, actual))) throw new PageError('The schedule changed before Undo could clear these days. Nothing was deleted.');
@@ -6649,9 +6676,17 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
           return days;
         })();
         for (const day of dates) restoredDays.push({ ...entry, day, hours: entry.hoursPerDay });
-        const afterEntry = await copyWindow({ start: entry.start, end: entry.end }, { noteRows: run.preserved.filter(row => typeof row.noteText === 'string'), reuseAfterAdd: true });
-        proofIds.set(afterEntry, ++proofSequence);
-        recordRun({ type: 'restoreRead', purpose: 'afterAdd', rows: afterEntry.days.length, selected: dates.length, proof: proofIds.get(afterEntry), result: 'passed', scope: { start: usDate(afterEntry.window.start), end: usDate(afterEntry.window.end) }, reused: false });
+        const span = { start: entry.start, end: entry.end };
+        const lastWrite = lastRun && entry === run.entries[run.entries.length - 1];
+        let afterEntry;
+        if (lastWrite) {
+          afterEntry = part(await readWhole(), span);
+          proofIds.set(afterEntry, proofIds.get(wholeRead));
+        } else {
+          afterEntry = await copyWindow(span, { noteRows: run.preserved.filter(row => typeof row.noteText === 'string'), reuseAfterAdd: true });
+          proofIds.set(afterEntry, ++proofSequence);
+        }
+        recordRun({ type: 'restoreRead', purpose: 'afterAdd', rows: afterEntry.days.length, selected: dates.length, proof: proofIds.get(afterEntry), result: 'passed', scope: { start: usDate(afterEntry.window.start), end: usDate(afterEntry.window.end) }, reused: false, ...(lastWrite ? { wholeWindow: true } : {}) });
         const expected = { days: restoredDays.filter(row => within(row.day, afterEntry.window)) };
         if (!compare(expected, afterEntry).same) throw new PageError('The page did not show the entry as backed up.');
         const preserved = { days: run.preserved.filter(row => within(row.day, afterEntry.window)) };
@@ -6661,17 +6696,27 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
         lastAddCopy = afterEntry;
         added += 1;
       }
-      const freshRun = reuseVerifiedAddRead(lastAddCopy, run.window, { noteRows: run.preserved.filter(row => typeof row.noteText === 'string') });
-      const completedRun = freshRun || await copyWindow(run.window);
-      if (!freshRun) proofIds.set(completedRun, ++proofSequence);
-      recordRun({ type: 'restoreRead', purpose: 'completedRun', rows: completedRun.days.length, proof: proofIds.get(completedRun), result: 'passed', scope: { start: usDate(run.window.start), end: usDate(run.window.end) }, reused: !!freshRun });
+      let completedRun, reusedRun;
+      if (lastRun) {
+        const whole = wholeRead || await readWhole();
+        reusedRun = !!lastAddCopy && compareDays(lastAddCopy.window.start, run.window.start) <= 0 && compareDays(lastAddCopy.window.end, run.window.end) >= 0;
+        completedRun = part(whole, run.window);
+        proofIds.set(completedRun, proofIds.get(whole));
+      } else {
+        const freshRun = reuseVerifiedAddRead(lastAddCopy, run.window, { noteRows: run.preserved.filter(row => typeof row.noteText === 'string') });
+        completedRun = freshRun || await copyWindow(run.window);
+        if (!freshRun) proofIds.set(completedRun, ++proofSequence);
+        reusedRun = !!freshRun;
+      }
+      recordRun({ type: 'restoreRead', purpose: 'completedRun', rows: completedRun.days.length, proof: proofIds.get(completedRun), result: 'passed', scope: { start: usDate(run.window.start), end: usDate(run.window.end) }, reused: reusedRun, ...(lastRun ? { wholeWindow: true } : {}) });
       if (!compare({ days: scoped.days.filter(row => within(row.day, run.window)) }, completedRun).same) {
         throw new PageError('The page did not show the run as backed up.');
       }
       recordRun({ type: 'restoreComparison', purpose: 'completedRun', proof: proofIds.get(completedRun), ok: true });
-      weekBefore = weekBoxes ? await copyWindow(window) : null;
+      weekBefore = weekBoxes && !lastRun ? await copyWindow(window) : null;
       runs += 1;
     } catch (error) {
+      wholeRead = null;
       const where = entry ? `${usDate(entry.start)} to ${usDate(entry.end)}, ${entry.client}`
         : `${usDate(run.window.start)} to ${usDate(run.window.end)}`;
       const stopped = new PageError(`${added} of ${total} entries were put back and checked. Restore stopped at ${where}: ${error.message} ${runs} of ${planned.length} runs were put back and checked.`);
@@ -6688,18 +6733,18 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
       if (!preflightDone) await preflight(false);
     }
   }
-  onStep({ step: 'checking' });
-  let after;
-  try {
+  if (!checking) onStep({ step: 'checking' });
+  let after = wholeRead;
+  if (!after) try {
     after = await copyWindow(window, { noteRows: before.days.filter(row => typeof row.noteText === 'string') });
+    proofIds.set(after, ++proofSequence);
   } catch (error) {
     const stopped = new PageError(`${added} of ${total} entries were put back and checked. ${runs} of ${planned.length} runs were put back and checked. The final copy could not be read: ${error.message}`);
     stopped.restoreProgress = { added, total, runs, totalRuns: planned.length, affectedDays: changedDays, failedWindow: window };
     keepFlags(error, stopped);
     throw stopped;
   }
-  proofIds.set(after, ++proofSequence);
-  recordRun({ type: 'restoreRead', purpose: 'wholeRestore', rows: after.days.length, proof: proofIds.get(after), result: 'passed', scope: { start: usDate(window.start), end: usDate(window.end) }, reused: false });
+  recordRun({ type: 'restoreRead', purpose: 'wholeRestore', rows: after.days.length, proof: proofIds.get(after), result: 'passed', scope: { start: usDate(window.start), end: usDate(window.end) }, reused: after === wholeRead });
   const touched = new Set(changedDays.map(usDate));
   const onlyTouched = copy => ({ days: copy.days.filter(row => touched.has(usDate(row.day))) });
   const untouched = copy => ({ days: copy.days.filter(row => !touched.has(usDate(row.day))) });
@@ -9959,7 +10004,7 @@ async function prepareExit(one, version, today, { step }) {
     if (initialEdit?.isConnected) await step(() => closeEdit(initialEdit));
     const resourceManager = facts.resourceManager || slice.resourceManager || record.person.resourceManager || '';
     return prepareWeeklyExit({ one, version, today, step, identity, plan, termText, greyedExit, greyed, dnsEnd: startGreyed ? null : editableDnsEnd,
-      undoBlocked: TERM_DATE_UNDO,
+      undoBlocked: TERM_DATE_UNDO, pageRead: copy,
       exitPeople: { dpName: resourceManager, dpEmail: facts.resourceManagerEmail || slice.resourceManagerEmail || '', dpNotFound: valueKey(resourceManager) === 'not applicable' } });
   }
   if (withoutNotes) allowWeeklyRows(false);
@@ -10401,7 +10446,7 @@ const { planWeeklyExit } = __require("../rules/weekly-exit.js");
 const { exitMailChoice } = __require("../rules/exit.js");
 const { PageError, withPersonGuard } = __require("../mysource/dom.js");
 const { checkPersonIdentity, waitForPersonIdentity } = __require("../mysource/schedule.js");
-const { copyWindow, compareCopies } = __require("../mysource/copy.js");
+const { copyWindow, compareCopies, futureCopyFrom } = __require("../mysource/copy.js");
 const { deleteRange, addAssignment, preflightDates, setAssignmentHours, weekRuns } = __require("../mysource/write.js");
 const { DNS_CLIENT } = __require("../mysource/checks.js");
 const { backupRecord, compareByDay, reportDays, withPagePricing, validatePageDays, pageRowsAfter, pageBackupRow, recordLaterChange } = __require("./backup.js");
@@ -10419,8 +10464,11 @@ async function prepareWeeklyExit(ctx) {
   const weekStart = greyedExit && compareDays(mondayOf(boundary), mondayOf(today)) < 0 ? mondayOf(today) : mondayOf(boundary);
   const readStart = compareDays(mondayOf(today), weekStart) < 0 ? mondayOf(today) : weekStart;
   const dns = !greyedExit && dnsEnd && workingDays(addDays(boundary, 1), dnsEnd).length ? { start: addDays(boundary, 1), end: dnsEnd } : null;
-  const copy = await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe),
-    () => copyWindow({ start: readStart, end: addDays(plan.dnsEnd, 56) }, { future: true })));
+  const readWindow = { start: readStart, end: addDays(plan.dnsEnd, 56) };
+  const reused = futureCopyFrom(ctx.pageRead, readWindow);
+  if (reused) await step(() => waitForPersonIdentity(identity));
+  const copy = reused || await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe),
+    () => copyWindow(readWindow, { future: true })));
   const reportEnd = slice.reportEnd;
   const inReport = row => compareDays(row.day, reportEnd) <= 0;
   const backupEnd = compareDays(copy.window.end, reportEnd) < 0 ? copy.window.end : reportEnd;
@@ -10491,15 +10539,17 @@ async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () 
   const { weekly, identity, window } = prepared;
   const stopWords = prepared.greyedExit ? `${PROVE} By hand.` : `${PROVE} Restore this person before continuing.`;
   const written = async () => {
+    readAfterWrite = null;
     await waitForPersonIdentity(identity); await onWrite();
     if (prepared.greyedExit) prepared.deletedDays = prepared.deletedDays || [];
   };
   let current = prepared.copy;
+  let readAfterWrite = null;
   const read = () => copyWindow(window, { future: true });
-  const prove = async expected => {
-    const after = await read();
+  const prove = async (expected, fresh = null) => {
+    const after = fresh || await read();
     if (!compareCopies({ days: expected }, after).same) throw new PageError(stopWords);
-    current = after;
+    current = after; readAfterWrite = after;
     return after;
   };
   const week = monday => ({ start: monday, end: addDays(monday, 4), weekEndFriday: true });
@@ -10518,10 +10568,12 @@ async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () 
       await written();
       if (prepared.greyedExit) prepared.deletedDays = [...new Set([...prepared.deletedDays, ...rows.map(row => usDate(row.day))])];
     };
-    await step(() => deleteRange(query, current, { onWrite: deleteNotice, protectedRows: current.days.filter(row => !rows.some(old => old.id === row.id)),
+    let deleteRead = null;
+    const readOnce = async () => (deleteRead = await read());
+    const afterDelete = await step(() => deleteRange(query, current, { onWrite: deleteNotice, protectedRows: current.days.filter(row => !rows.some(old => old.id === row.id)),
       validate: async actual => { if (actual.days.some(row => !gone.has(row.id))) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.'); },
-      read }));
-    await prove(current.days.filter(row => !rows.some(old => old.id === row.id)));
+      read: readOnce }));
+    await prove(current.days.filter(row => !rows.some(old => old.id === row.id)), deleteRead && afterDelete === deleteRead ? deleteRead : null);
   };
   for (const rows of sameDayClient(weekly.remove.filter(inWeek(weekly.weekStart)))) {
     await removeIn({ start: rows[0].day, end: rows[0].day, weekEndFriday: true, clients: [rows[0].client] }, rows);
@@ -10540,7 +10592,7 @@ async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () 
       .map(row => row.id ? current.days.find(live => live.id === row.id) || row : { jobCode: '', assignCode: '', assignCode2: '', wbs: '', pricingId: '', notes: 0, ...row });
     await prove(expected);
   });
-  const after = await read();
+  const after = readAfterWrite || await read();
   const same = compareCopies({ days: weekly.expected.map(row => ({ jobCode: '', assignCode: '', assignCode2: '', wbs: '', pricingId: '', ...row })) }, after).same;
   if (!same) throw new PageError(stopWords);
   recordLaterChange(prepared, after);
@@ -11198,8 +11250,8 @@ const runSmallConsultingTest = (options, page) => withLiveConnection(options, pa
 async function runSmallConsultingRecorded({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
   const window = smallTestPeriod(today);
   if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
-  const result = { kind: 'Snooze live test 1', mode: 'consulting', version, design: 'small7', length: 'twelveWeeks',
-    expectedSteps: 7, week: { start: usDate(window.start), end: usDate(window.end) },
+  const result = { kind: 'Snooze live test 1', mode: 'consulting', version, design: 'small8', length: 'twelveWeeks',
+    expectedSteps: 8, week: { start: usDate(window.start), end: usDate(window.end) },
     state: 'running', cleanup: 'notNeeded', writes: 0, steps: Object.keys(SMALL_LIVE_STEPS).map(id => ({ id, state: 'notExercised' })),
     events: [], pictures: [], outstanding: [] };
   const diagnostic = beginLiveDiagnostics(result, page, assignPeriod, today);
@@ -11207,7 +11259,7 @@ async function runSmallConsultingRecorded({ email, version, today = todayOf(), o
   let actions = [() => page.smallStart(String(email).trim(), window), () => page.smallAdd(write),
     () => page.smallChange(write), () => page.smallDelete(write),
     async () => { result.pictures.push(...await page.smallPicture()); },
-    () => page.smallUndo(write), () => page.auditClear(write)];
+    () => page.smallUndo(write), () => page.smallExit(write), () => page.auditClear(write)];
   const toWeekly = () => {
     result.design = 'weekly5'; result.expectedSteps = 5;
     result.steps = [result.steps[0], ...Object.keys(WEEKLY_LIVE_STEPS).slice(1).map(id => ({ id, state: 'notExercised' }))];
@@ -11573,7 +11625,8 @@ async function testPart(part, action) {
 const SMALL_LIVE_STEPS = {
   smallOpen: 'Open and read', smallAdd: 'Add LOA, DNS and blank-note A&A DNS',
   smallChange: 'Replace, combined Edit Submit and Cancel', smallDelete: 'Delete around a kept DNS day',
-  smallPicture: 'Hover picture and plain A&A picture', smallUndo: 'Undo from the backup', cleanup: 'Clear and check empty',
+  smallPicture: 'Hover picture and plain A&A picture', smallUndo: 'Undo from the backup file',
+  smallExit: 'Consulting Exit, then automatic put-back', cleanup: 'Clear and check empty',
 };
 const WEEKLY_LIVE_STEPS = {
   smallOpen: 'Open and read', weeklySetup: 'Weekly setup: DNS 4 h a day, three weeks',
@@ -11652,7 +11705,7 @@ const { sessionExpired, cancelBatchWindows } = __require("./batch.js");
 const { copyWindow, compareCopies, dayOf, entriesToAdd, knownAssignmentRows } = __require("./copy.js");
 const { isEditableDay } = __require("./editability.js");
 const { calendarDates, showDate } = __require("./calendar.js");
-const { addAssignment, deleteAll, deleteRange, refreshNotes, preflightDates, setAssignmentHours, splitDeleteWeeks, saveStagedNotes } = __require("./write.js");
+const { addAssignment, deleteAll, deleteRange, refreshNotes, preflightDates, setAssignmentHours, splitDeleteWeeks, saveStagedNotes, weekRuns } = __require("./write.js");
 const { restoreWindow } = __require("./restore.js");
 const { addDays, compareDays, mondayOf, todayOf, usDate, workingDays } = __require("../rules/dates.js");
 const { inside } = __require("../rules/leaves.js");
@@ -11660,7 +11713,9 @@ const { readSite, isTaxPage } = __require("./site.js");
 const { valueKey, addressCount } = __require("../rules/prepare.js");
 const { entryKind } = __require("../rules/entries.js");
 const { planTaxWeeks } = __require("../rules/tax-weeks.js");
-const { apply, prepare, restore, BACKUP_KIND } = __require("../run/work.js");
+const { apply, prepare, restore, recover, BACKUP_KIND } = __require("../run/work.js");
+const { backupFileSheets, readBackupFile } = __require("../files/backup-file.js");
+const { xlsxBytes } = __require("../files/xlsx-writer.js");
 const { taxRestorePlan } = __require("./tax-restore.js");
 const { taxTestPeriod, smallTestPeriod } = __require("../run/live-proof.js");
 const { termDayOf } = __require("../rules/shared.js");
@@ -12234,8 +12289,11 @@ function auditLivePage(today, small = false) {
     check();
     if (!scope || !inside(range.start, scope) || !inside(range.end, scope) || compareDays(range.start, range.end) > 0) throw new PageError('Outside the approved A&A period.');
   };
+  let writeSeq = 0, deleteProof = null;
   const read = async () => { bounded(scope); const copy = await copyWindow(scope); check(); return copy; };
-  const assertKnown = async () => { const actual = await read(); if (!matches(known, actual)) throw new PageError('The owned A&A test rows changed.'); return actual; };
+  const deleteRead = async () => { const copy = await read(); deleteProof = { copy, at: writeSeq }; return copy; };
+  let fresh = false;
+  const assertKnown = async () => { if (fresh && !pending) { check(); return known; } const actual = await read(); if (!matches(known, actual)) throw new PageError('The owned A&A test rows changed.'); fresh = true; return actual; };
   const resolveRead = (actual, mustBeAfter = false) => {
     if (!pending ? !matches(known, actual) : !matches(pending.after, actual) && (mustBeAfter || !matches(pending.before, actual))) throw new PageError('A&A save ownership is unconfirmed.');
     if (pending && matches(pending.after, actual)) {
@@ -12246,11 +12304,15 @@ function auditLivePage(today, small = false) {
       }
       recordRun({type:'writeProof',ok:true,whole:true});
     }
-    known = actual; pending = null; return actual;
+    known = actual; pending = null; fresh = true; return actual;
   };
-  const resolve = async (mustBeAfter = false) => resolveRead(await read(), mustBeAfter);
+  const resolve = async (mustBeAfter = false) => {
+    const proof = deleteProof; deleteProof = null;
+    if (pending && proof && proof.at === writeSeq) { check(); return resolveRead(proof.copy, mustBeAfter); }
+    return resolveRead(await read(), mustBeAfter);
+  };
   const withReopen = async action => {
-    check(); release?.(); release = null;
+    fresh = false; check(); release?.(); release = null;
     try { return await action(); }
     finally { release = setBatchGuard(check); check(); }
   };
@@ -12261,6 +12323,7 @@ function auditLivePage(today, small = false) {
     await assertKnown(); let index = 0;
     const notice = async () => {
       const operation = operations[index];
+      fresh = false; writeSeq++; deleteProof = null;
       if (!operation) throw new PageError('Unplanned A&A test write.');
       bounded(operation.range);
       if (pending) { known = pending.after; pending = null; }
@@ -12313,7 +12376,7 @@ function auditLivePage(today, small = false) {
     await sequence([addOp(entry)], notice => addAssignment(entry, 'Normal', { onWrite: notice }), write);
   };
   const clear = async write => {
-    await assertKnown();
+    fresh = false; await assertKnown();
     if (!known.days.length) return;
     await sequence([deleteOp(scope)], async notice => {
       const edit = await findAssignments(scope);
@@ -12346,6 +12409,14 @@ function auditLivePage(today, small = false) {
     known = await weeklyRead();
     if (known.days.length) throw new PageError('Weekly span is not empty.');
   };
+  const throughBackupFile = async record => {
+    const rows = [{ state: 'done', diagnostic: { changeAttempted: true }, prepared: { backup: record },
+      one: { record: { number: 'diagnostic', email, notification: { kind: 'loa' }, person: { professional: record.professional } } } }];
+    const bytes = xlsxBytes(backupFileSheets(rows, 'live test'));
+    const read = await readBackupFile({ name: 'Snooze backup live test.xlsx', arrayBuffer: async () => new Blob([bytes]).arrayBuffer() });
+    if (read.length !== 1 || emailKey(read[0].email) !== emailKey(email) || read[0].backup.days.length !== record.days.length) throw new PageError('The backup file did not read back.');
+    return { ...read[0].backup, diagnostic: true };
+  };
   const smallNote = 'Snooze small live test';
   let smallCheckpoint = null, smallKept = null, smallKeptOriginalId = null;
   const smallKeep = () => {
@@ -12368,39 +12439,65 @@ function auditLivePage(today, small = false) {
       return () => { stop(); release?.(); release = null; };
     },
     setStep(id) { step = id; },
+    async smallExit(write) {
+      await clear(write);
+      await add(LOA, { start: scope.start, end: addDays(scope.start, 1) }, 8, '', write);
+      const before = await assertKnown();
+      const person = { professional: identity.name.split('(')[0].trim(), business: 'Consulting Services', region: 'US - US', resourceManager: 'Planner, Invented', termDate: scheduleFacts().termDate || '12/31/9999' };
+      const lwd = addDays(scope.start, -3);
+      const record = { number: 'diagnostic', email, person, subcategory: { business: 'consulting', kind: 'exit' },
+        notification: readNotification(`Date of resignation: ${usDate(addDays(lwd, -7))}\nPlanned last working day: ${usDate(lwd)}`) };
+      const entries = before.days.map(row => ({ ...row, email: emailKey(email), days: [{ day: row.day, hours: row.hours }], fields: {} }));
+      const slice = { status: 'ready', mode: 'day', entries, backupEntries: entries, person, resourceManager: person.resourceManager, reportEnd: scope.end, liveScope: true };
+      const exit = { record, slice, decision: decideExit(record, scope.start, slice) };
+      if (!exit.decision.plan || exit.decision.byHand) throw new PageError('The production Consulting decision was not proved.');
+      exit.decision.plan.dnsEnd = addDays(scope.start, 1);
+      const ready = await withReopen(() => prepare(exit, 'diagnostic', scope.start));
+      if (ready.stop || !ready.backup) throw new PageError('The production Consulting Exit was not prepared.');
+      const done = await withReopen(() => apply(exit, ready, { onWrite: write, step: fn => fn() }));
+      if (!done.ok) throw new PageError('The production Consulting Exit result was not proved.');
+      known = await read(); fresh = true;
+      const dns = workingDays(scope.start, addDays(scope.start, 1));
+      if (known.days.length !== dns.length || known.days.some(row => row.client !== DNS || row.hours !== 8)) throw new PageError('The Consulting Exit did not leave DNS on the two days.');
+      const back = await withReopen(() => recover(ready.backup, { today: scope.start, identity, after: done.after, onWrite: write }));
+      known = await read(); fresh = true;
+      if (!back.same || !matches({ days: before.days.map(row => ({ ...row, id: '', notes: 0 })) }, known)) throw new PageError('The automatic put-back did not bring the LOA back.');
+      return { productionExit: true, putBack: true };
+    },
     async smallStart(typedEmail, window) {
       const found = await this.auditStart(typedEmail, window);
       return found?.week ? { weekly: true } : {};
     },
     async weeklySetup(write) {
-      const setup = { start: scope.start, end: addDays(scope.start, 18) };
-      await weeklyAdd({ ...setup, client: DNS, hoursPerDay: 4, billable: 'Non-Billable', utilization: 'No', notes: '' }, write);
+      const setup = { start: addDays(scope.start, 14), end: addDays(scope.start, 32) };
+      const held = await preflightDates(workingDays(setup.start, setup.end), { anchor: setup.start,
+        trial: { ...setup, hoursPerDay: 4, label: 'DNS' } });
+      for (const run of weekRuns(setup.start, setup.end, !!held?.grouped))
+        await weeklyAdd({ ...run, client: DNS, hoursPerDay: 4, billable: 'Non-Billable', utilization: 'No', notes: '' }, write);
       weeklyCheckpoint = await weeklyRead();
-      weeklyExpect(weeklyCheckpoint, [[0, DNS, 20], [7, DNS, 20], [14, DNS, 20]], 'The Weekly setup was not saved as three weeks of 20 h.');
+      weeklyExpect(weeklyCheckpoint, [[14, DNS, 20], [21, DNS, 20], [28, DNS, 20]], 'The Weekly setup was not saved as three weeks of 20 h.');
       return { weeks: 3 };
     },
     async weeklyExit(write) {
-      known = await weeklyRead();
-      if (!matches(weeklyCheckpoint, known)) throw new PageError('The Weekly test rows changed.');
+      known = weeklyCheckpoint;
       const person = { professional: identity.name.split('(')[0].trim(), business: 'Audit & Assurance', region: 'US - US', resourceManager: 'Planner, Invented', termDate: scheduleFacts().termDate || '12/31/9999' };
-      const lwd = addDays(scope.start, -3);
+      const lwd = addDays(scope.start, 16);
       const record = { number: 'diagnostic', email, person, subcategory: { business: 'audit', kind: 'exit' },
-        notification: readNotification(`Date of resignation: ${usDate(addDays(lwd, -7))}\nPlanned last working day: ${usDate(lwd)}`) };
+        notification: readNotification(`Date of resignation: ${usDate(addDays(lwd, -4))}\nPlanned last working day: ${usDate(lwd)}`) };
       const entries = known.days.map(row => ({ ...row, email: emailKey(email), days: [{ day: row.day, hours: row.hours }], fields: { 'Assign Period': 'Weekly' } }));
       const slice = { status: 'ready', mode: 'day', entries, backupEntries: entries, person, resourceManager: person.resourceManager, reportEnd: scope.end, liveScope: true };
       one = { record, slice, decision: decideExit(record, scope.start, slice) };
       if (!record.notification.dates.lastWorkingDay || !one.decision.plan?.withoutNotes) throw new PageError('The production A&A decision was not proved.');
-      one.decision.plan.dnsEnd = addDays(scope.start, 16);
+      one.decision.plan.dnsEnd = addDays(scope.start, 30);
       prepared = await withReopen(() => prepare(one, 'diagnostic', scope.start));
       if (prepared.stop || !prepared.weekly || !prepared.backup) throw new PageError('The production Weekly Exit was not prepared.');
       applied = await withReopen(() => apply(one, prepared, { onWrite: write, step: fn => fn() }));
       if (!applied.ok) throw new PageError('The production Weekly Exit result was not proved.');
       known = await weeklyRead();
-      weeklyExpect(known, [[0, DNS, 40], [7, DNS, 40], [14, DNS, 24]], 'The Weekly Exit did not leave DNS 8 h a day to the third Wednesday.');
+      if (!known.days.length || known.days.some(row => row.client !== DNS || compareDays(row.day, addDays(scope.start, 32)) > 0)) throw new PageError('The Weekly Exit left more than DNS to the fifth week.');
       return { productionPrepare: true, productionApply: true };
     },
     async weeklyUndo(write) {
-      known = await weeklyRead();
       const restored = await withReopen(() => restore(prepared.backup, { today: scope.start, after: applied.after, identity, onWrite: write }));
       known = await weeklyRead();
       if (!restored.same || !matches({ days: weeklyCheckpoint.days.map(row => ({ ...row, id: '', notes: 0 })) }, known)) throw new PageError('Weekly Undo was not proved.');
@@ -12446,12 +12543,12 @@ function auditLivePage(today, small = false) {
       if (!staged) throw new PageError('The Cancel stage could not be proved.');
       const cancels = [...staged.edit.querySelectorAll('button')].filter(node => shown(node) && text(node) === 'Cancel' && !node.disabled);
       if (cancels.length !== 1) throw new PageError('The staged Cancel button is unclear.');
-      await click(cancels[0]);
+      fresh = false; await click(cancels[0]);
       await waitFor(() => !staged.edit.isConnected || !shown(staged.edit), 'the staged Cancel to close', WAIT.window);
       await assertKnown(); smallKeep(); return { combinedReduction: true, cancelUnchanged: true };
     },
     async smallDelete(write) {
-      await assertKnown(); smallKeep();
+      fresh = false; await assertKnown(); smallKeep();
       const ranges = [{ start: scope.start, end: addDays(smallKept.day, -1) }, { start: addDays(smallKept.day, 1), end: scope.end }];
       let weekBoxes = false;
       for (const range of ranges) {
@@ -12467,7 +12564,7 @@ function auditLivePage(today, small = false) {
                 await closeEdit(edit); throw new PageError('The small delete exceeds its owned days.');
               }
               await saveStagedNotes(await stageRemoval(edit, expected, targets), notice);
-            } else await deleteRange(part, known, { edit, read, protectedRows: [smallKept],
+            } else await deleteRange(part, known, { edit, read: deleteRead, protectedRows: [smallKept],
               validate: async () => { check(); }, onWrite: notice });
           }, write);
         }
@@ -12501,8 +12598,9 @@ function auditLivePage(today, small = false) {
       const exactEntries = ranges.flatMap(range => entriesToAdd({ days: missing.filter(row => inside(row.day, range)) }, { exact: true }).entries);
       const capability = await preflightDates(missing.map(row => row.day), { anchor: scope.start, entries: exactEntries });
       const operations = ranges.flatMap(range => entriesToAdd({ days: missing.filter(row => inside(row.day, range)) }, { exact: capability.exact }).entries.map(addOp));
-      const backup = { kind: BACKUP_KIND, diagnostic: true, email, professional: identity.name.split('(')[0].trim(),
+      const record = { kind: BACKUP_KIND, email, professional: identity.name.split('(')[0].trim(),
         window: scope, days: smallCheckpoint.days, plan: { action: 'add' } };
+      const backup = await throughBackupFile(record);
       const after = known;
       const restored = await sequence(operations, notice => restoreWindow(backup, { today, identity, after,
         verifyBefore: async actual => {
@@ -12511,7 +12609,7 @@ function auditLivePage(today, small = false) {
         }, onWrite: notice }), write);
       const expected = { days: smallCheckpoint.days.map(row => row.id === smallKeptOriginalId ? smallKept : { ...row, id: '', notes: 0 }) };
       if (!restored.same || restored.skippedLater?.length || !matches(expected, known)) throw new PageError('The small backup was not restored.');
-      smallKeep(); return { backupRestored: true };
+      smallKeep(); return { backupRestored: true, fromBackupFile: true };
     },
     async auditStart(typedEmail, window) {
       if (scope || !String(typedEmail || '').trim() || addressCount(typedEmail) > 1) throw new PageError('Enter one test professional.');
@@ -12582,7 +12680,7 @@ function auditLivePage(today, small = false) {
       } finally { if (one.outputs) one.outputs.screenshots = []; }
     },
     async auditUndo(write) {
-      await assertKnown();
+      fresh = false; await assertKnown();
       const operations = [];
       for (const range of [first, { start: second.start, end: scope.end }]) {
         operations.push(deleteOp(range));
@@ -12600,6 +12698,7 @@ function auditLivePage(today, small = false) {
     },
     async auditClear(write) { await clear(write); if ((await read()).days.length) throw new PageError('A&A span is not empty.'); },
     async auditCleanup(write, error) {
+      fresh = false;
       if (!started) return 'notNeeded';
       if (error?.identityChanged || error?.session || error?.pageBlocked) return 'unconfirmed';
       await cancelLiveWindows(); check(); await resolve();
@@ -13272,7 +13371,7 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     box.replaceChildren(); email.disabled = active || !!result;
     back.disabled = active; go.disabled = active || !!result; downloadButton.disabled = active; logButton.disabled = active;
     if (photo && result && !active) {
-      const small = ['small7','weekly5','tax5'].includes(result.design) || !Array.isArray(result.events);
+      const small = ['small8','weekly5','tax5'].includes(result.design) || !Array.isArray(result.events);
       const report = small ? el('div', { role: 'region', 'aria-label': 'Photo report' },
         el('pre', { style: 'font:13px/1.35 Consolas,monospace;white-space:pre;margin:0' }, shortLiveReport(result))) : renderPhotoReport(result);
       box.append(report);
@@ -13790,7 +13889,7 @@ const { SMALL_LIVE_STEPS, SMALL_TAX_STEPS, WEEKLY_LIVE_STEPS } = __require("./li
 const { observeRun, recordRun, STAGES, WINDOWS, FIELDS, WAIT_NAMES, REASON_CODES, reasonCode } = __require("../core/run-records.js");
 const { REASON_NAMES, errorReason } = __require("../core/reason-names.js");
 const { dayFromParts, mondayOf, weekday, usDate } = __require("../rules/dates.js");
-const steps = new Set('weeklySetup weeklyExit weeklyUndo smallOpen smallAdd smallChange smallDelete smallPicture smallUndo aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
+const steps = new Set('smallExit weeklySetup weeklyExit weeklyUndo smallOpen smallAdd smallChange smallDelete smallPicture smallUndo aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
 const word = (value, allowed, fallback = 'unknown') => allowed.has(value) ? value : fallback;
 const count = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
 const stages = new Set([...STAGES, 'move calendar']);
@@ -13876,7 +13975,7 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
       pending.length = 0;
       const failure = { step: stepName(step), code: error?.identityChanged ? 'identityChanged' : error?.session ? 'sessionExpired' : word(error?.reasonCode, REASON_CODES, reasonCode(error?.message)), reasonName:errorReason(error) };
       const source = error?.liveStop || data.events.findLast(e => e.type === 'error' && e.reasonName === failure.reasonName && e.step === failure.step);
-      const stopped = { ...failure, time: elapsed(), lastAction:source?.lastAction || lastAction, stage: source?.stage || word(error?.stage, stages, stage), page: source?.page || snapshot() };
+      const stopped = { ...failure, time: elapsed(), lastAction:source?.lastAction || lastAction, stage: source?.stage || word(error?.stage, stages, stage), page: source?.page || snapshot(), held: heldDates(error?.dateDiagnostics || error?.pickerDateDiagnostics) };
       data.stop ||= stopped;
       Object.assign(result.steps.find(s => s.id === step) || {}, { code:failure.code, reasonName:failure.reasonName });
       recordRun({ type:'stop', ...failure, result:'failed' });
@@ -13909,7 +14008,7 @@ function cleanEvent(event) {
 function liveReportSummary(result, includeMonday = true) {
   const data = result.diagnostic || {}, raw = data.stop;
   const stop = raw ? {step:stepName(raw.step),code:word(raw.code,REASON_CODES,'unknownFailure'),reasonName:word(raw.reasonName,REASON_NAMES,'unknownFailure'),
-    lastAction:word(raw.lastAction,new Set([...stages,...actions])),stage:word(raw.stage,stages),time:Number.isFinite(raw.time) && raw.time>=0 ? raw.time : null,page:cleanPage(raw.page)} : null;
+    lastAction:word(raw.lastAction,new Set([...stages,...actions])),stage:word(raw.stage,stages),time:Number.isFinite(raw.time) && raw.time>=0 ? raw.time : null,page:cleanPage(raw.page),held:typeof raw.held === 'string' && /^[\w\/ ·,-]{1,100}$/.test(raw.held) ? raw.held : null} : null;
   const taxMonday = includeMonday && result.mode === 'tax' && result.steps?.some(s=>s.id==='taxPast' && s.state==='failed')
     && data.events?.some(e=>e.type==='writeAttempt' && e.step==='taxPast') ? mondayDate(data.taxMonday) : null;
   const outstanding = result.cleanup === 'unconfirmed' ? [...new Set([...(result.ledger?.outstanding || []).map(r=>r.date), ...(result.outstanding || []).map(r=>r.date), ...(taxMonday ? [taxMonday] : [])])].filter(d=>date(d,result.week) || taxMonday && d===taxMonday) : [];
@@ -13933,6 +14032,15 @@ function dateRanges(dates) {
 }
 function dateNumber(value) {
   const [m,d,y] = value.split('/').map(Number); return Date.UTC(y,m-1,d);
+}
+function heldDates(d) {
+  if (!d) return null;
+  const day = value => value && Number.isSafeInteger(value.y) ? date(usDate(value)) : null;
+  const pair = (name, p) => p && (day(p.start) || day(p.end)) ? `${name} ${day(p.start) || 'none'}-${day(p.end) || 'none'}` : null;
+  const parts = [pair('picker', d.picker), pair('shown', d.shown), pair('boxes', d.boxes),
+    Number.isSafeInteger(d.days) ? `Days ${d.days}` : null, Number.isSafeInteger(d.weeks) ? `Weeks ${d.weeks}` : null].filter(Boolean);
+  const want = d.expected && day(d.expected.start) ? `wanted ${day(d.expected.start)}-${day(d.expected.end) || 'none'}` : null;
+  return [want, ...parts].filter(Boolean).join(' · ') || 'nothing readable';
 }
 function findSummary(events) {
   const finds = events.filter(e=>e.type==='findBoxes').map(cleanEvent), counts = {};
@@ -13972,32 +14080,64 @@ function shortLiveReport(result) {
     }
     lines.push(current);
   };
-  const kinds = page => Object.keys(page?.windowKinds || {}).length ? Object.entries(page.windowKinds).map(([kind,n])=>`${kind} ${n}`) : ['none'];
-  const visible = page => page?.visibleWindows?.length ? page.visibleWindows : ['none'];
-  const state = page => !page || page.unavailable ? 'unavailable' : `${page.view}; periods ${page.periods ?? 'unknown'}; open ${page.windows.open}; hidden ${page.windows.hidden}; covers ${page.covers}`;
+  const kindList = page => Object.entries(page?.windowKinds || {}).map(([kind,n])=>`${kind} ${n}`);
+  const known = value => value != null && value !== 'unknown' && value !== 'none';
+  const pageLine = page => {
+    if (!page || page.unavailable) return 'unavailable';
+    const parts = [];
+    if (known(page.view)) parts.push(page.view);
+    if (page.periods != null) parts.push(`${page.periods} periods`);
+    parts.push(`windows open ${page.windows?.open ?? 'unknown'}, hidden ${page.windows?.hidden ?? 'unknown'}`);
+    parts.push(`covers ${page.covers ?? 'unknown'}`);
+    return parts.join(' · ');
+  };
   line('Verdict', `${report.verdict}; version ${report.version}`);
-  const smallSteps = result.design === 'small7' ? SMALL_LIVE_STEPS : result.design === 'weekly5' ? WEEKLY_LIVE_STEPS : result.design === 'tax5' ? SMALL_TAX_STEPS : null;
-  if (smallSteps) for (const [index, [id, title]] of Object.entries(smallSteps).entries()) {
-    const step = result.steps?.find(step => step.id === id);
-    line(`Step ${index + 1}`, `${title}: ${step?.state === 'passed' ? 'PASS' : step?.state === 'failed' ? 'FAIL' : 'not exercised'}`);
+  const smallSteps = result.design === 'small8' ? SMALL_LIVE_STEPS : result.design === 'weekly5' ? WEEKLY_LIVE_STEPS : result.design === 'tax5' ? SMALL_TAX_STEPS : null;
+  if (smallSteps) {
+    const states = Object.entries(smallSteps).map(([id, title]) => {
+      const step = result.steps?.find(step => step.id === id);
+      return { title, state: step?.state === 'passed' ? 'PASS' : step?.state === 'failed' ? 'FAIL' : 'not run' };
+    });
+    if (states.every(step => step.state === 'PASS')) line('Steps', `all ${states.length} PASS`);
+    else {
+      const groups = [];
+      states.forEach((step, index) => {
+        const last = groups.at(-1);
+        if (last && last.state === step.state && step.state !== 'FAIL') last.end = index + 1;
+        else groups.push({ state: step.state, start: index + 1, end: index + 1, title: step.title });
+      });
+      line('Steps', groups.map(group => `${group.start === group.end ? group.start : `${group.start}-${group.end}`} ${group.state}${group.state === 'FAIL' ? ` ${group.title.split(':')[0]}` : ''}`).join(' · '));
+    }
   }
-  line('Failed step',stop ? `${stop.step}${stop.time==null?'':` at ${stop.time} s`}` : 'none'); line('Code',stop?.code || 'none'); line('Reason',stop?.reasonName || 'none');
-  line('Last action',stop?.lastAction || 'none'); line('Stage',stop?.stage || 'none');
-  line('Assign Period',report.assignPeriod);
-  line('Finds',Object.entries(report.finds.counts).map(([kind,n])=>`${kind} ${n}`).join(', ') || 'none');
-  line('Find steps',`${report.finds.first} - ${report.finds.last}`);
-  line('View',noStop ? 'none' : page?.view); line('Periods',noStop ? 'none' : page?.periods);
-  line('Windows',noStop ? 'none' : page ? `open ${page.windows?.open ?? 'unknown'}, hidden ${page.windows?.hidden ?? 'unknown'}` : 'unavailable');
-  line('Window kinds',kinds(page)); line('Visible',visible(page)); line('Covers',noStop ? 'none' : page?.covers);
-  for (const [index,edit] of (page?.edits || []).entries()) line(`Edit ${index+1}`,`open ${edit.open}, shown ${edit.shown}, display ${edit.display}, rows ${edit.rows}, owned ${edit.owned}`);
-  line('Writes',`${report.writes.attempted} attempted / ${report.writes.proved} proved`);
-  line('Cleanup',smallSteps && report.cleanup === 'unconfirmed' ? 'UNCONFIRMED' : report.cleanup);
+  if (stop) {
+    const where = [stop.stage, stop.lastAction].find(known);
+    line('Failed step', `${stop.step}${stop.time==null?'':` at ${stop.time} s`}${where ? ` · in ${where}` : ''}`);
+    line('Reason', `${stop.reasonName}${known(stop.code) ? ` (${stop.code})` : ''}`);
+    if (stop.held) line('Held', stop.held);
+  } else if (report.verdict === 'FAIL') line('Failed step', 'unknown');
+  if (known(report.assignPeriod)) line('Assign Period', report.assignPeriod);
+  const finds = Object.entries(report.finds.counts).map(([kind,n])=>`${kind} ${n}`).join(', ');
+  if (finds) line('Finds', finds);
+  if (!noStop) {
+    line('Page', pageLine(page));
+    if (page?.visibleWindows?.length) line('Visible', page.visibleWindows);
+    if (kindList(page).length) line('Window kinds', kindList(page));
+    for (const [index,edit] of (page?.edits || []).entries()) if (edit.open !== 'no' || edit.rows > 0) line(`Edit ${index+1}`,`open ${edit.open}, shown ${edit.shown}, display ${edit.display}, rows ${edit.rows}, owned ${edit.owned}`);
+  }
+  const cleanupWords = { empty: 'span left empty', notNeeded: 'nothing to clear', unconfirmed: 'CLEANUP UNCONFIRMED' }[report.cleanup] || report.cleanup;
+  line('Writes',`${report.writes.attempted} attempted / ${report.writes.proved} proved · ${cleanupWords}`);
   let rangeStart=lines.length;
-  line('Unconfirmed',report.unconfirmed.length ? report.unconfirmed : report.unconfirmedSpan ? `${report.unconfirmedSpan.start}-${report.unconfirmedSpan.end}` : 'none');
+  if (report.unconfirmed.length || report.unconfirmedSpan) line('Unconfirmed',report.unconfirmed.length ? report.unconfirmed : `${report.unconfirmedSpan.start}-${report.unconfirmedSpan.end}`);
   const rangeEnd=lines.length;
   line('Span',`${report.span.start}-${report.span.end}`);
-  line('Finish',`at ${report.seconds==null?'unknown':report.seconds} s; ${state(finish)}`); line('Finish visible',visible(finish)); line('Finish kinds',kinds(finish));
-  if (lines.length>30 && report.unconfirmed.length) {
+  const end = [`at ${report.seconds==null?'unknown':report.seconds} s`];
+  if (finish && !finish.unavailable) {
+    end.push(`open ${finish.windows?.open ?? 'unknown'}, hidden ${finish.windows?.hidden ?? 'unknown'}`, `covers ${finish.covers ?? 'unknown'}`);
+    if (finish.visibleWindows?.length) end.push(`visible ${finish.visibleWindows.join(', ')}`);
+  } else if (!noStop) end.push('page unavailable');
+  line('Finish', end.join('; '));
+  if (!noStop && kindList(finish).join() !== kindList(page).join() && kindList(finish).length) line('Finish kinds', kindList(finish));
+  if (report.unconfirmed.length && (lines.length>30 || rangeEnd-rangeStart>1)) {
     const tail=lines.slice(rangeEnd), groups={};
     for (const range of report.unconfirmed) {
       const year=range.slice(6,10);
@@ -15262,7 +15402,7 @@ button{font:bold 13px system-ui,sans-serif;border:0;border-radius:8px;padding:8p
 .body,.batch{gap:12px}button{font-weight:700;transition:filter .15s ease,transform .15s ease,box-shadow .15s ease}button:hover:not(:disabled){box-shadow:0 4px 12px rgba(0,0,0,.4)}button:active:not(:disabled){transform:scale(.985)}
 .red{background:${COLOURS.red};color:${COLOURS.page}}.stack{display:grid;gap:8px}.stack>button{width:100%}
 .status{font-weight:600;font-size:12px;line-height:1.35;overflow-wrap:anywhere;white-space:normal}
-.counts{font-size:12px;font-weight:500}.counts.finished,.counts.finished>span{color:${COLOURS.greenText}}.c-todo{color:var(--family-lavender)}.c-no-action{color:var(--family-muted)}.c-done{color:${COLOURS.greenText}}.c-hand{color:${COLOURS.amber}}.c-fail{color:${COLOURS.redText}}.c-sep{color:${COLOURS.grey};margin:0 5px}
+.counts{font-size:12px;font-weight:500}.counts.finished .c-finished{color:${COLOURS.greenText}}.c-todo{color:var(--family-lavender)}.c-no-action{color:var(--family-muted)}.c-done{color:${COLOURS.greenText}}.c-hand{color:${COLOURS.amber}}.c-fail{color:${COLOURS.redText}}.c-sep{color:${COLOURS.grey};margin:0 5px}
 .run-line{display:flex;align-items:baseline;gap:8px}.run-line>.counts{flex:1;min-width:0}.run-of{font-size:11px;white-space:nowrap;color:${COLOURS.muted};font-variant-numeric:tabular-nums}
 .run-now{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:${COLOURS.muted};overflow-wrap:anywhere;white-space:normal}
 .progress{height:8px;margin-top:6px;background:${COLOURS.surface};border-radius:8px}.progress>div{background:${COLOURS.green};border-radius:8px;transition:width .2s linear}
@@ -15560,5 +15700,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.14.3");
+__snoozeLoad("screen/panel.js").start("0.14.6");
 })();
