@@ -1,56 +1,139 @@
 (async () => {
-  const wait = ms => new Promise(done => setTimeout(done, ms));
-  const pad = n => String(n).padStart(2, '0');
-  const now = new Date();
-  const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - ((now.getDay() + 6) % 7));
-  const date = `${monday.getFullYear()}-${pad(monday.getMonth() + 1)}-${pad(monday.getDate())}`;
-  const seen = e => e.getClientRects().length > 0;
-  const name = e => e ? e.tagName.toLowerCase() + [...e.classList].slice(0, 3).map(c => '.' + c).join('') : 'nothing';
-  const cells = [...document.querySelectorAll(`td.fc-day[data-date="${date}"]`)].filter(seen).filter(c => !c.closest('[id^="controlCalendar_"]'));
-  const lines = [`week ${date}; cells ${cells.length}`];
-  const cell = cells[0];
-  if (cell) {
-    const shown = node => {
-      for (let at = node; at && at.nodeType === 1; at = at.parentElement) {
-        const style = getComputedStyle(at);
-        if (at.hidden || (at !== node && at.getAttribute('aria-hidden') === 'true') || style.display === 'none' || style.visibility === 'hidden') return false;
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const shown = node => { if (!node) return false; const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
+  const words = node => (node?.textContent || '').replace(/\s+/g, ' ').trim();
+  const lines = [], report = { probe: 'add-dates 1' };
+  const finish = () => {
+    const text = lines.join('\n');
+    console.log(JSON.stringify(report, null, 1));
+    console.log(text);
+    document.querySelector('[data-snooze-dates-probe]')?.remove();
+    const panel = document.createElement('pre');
+    panel.setAttribute('data-snooze-dates-probe', '');
+    panel.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:900px;white-space:pre-wrap;background:#111;color:#eee;font:12px/1.4 monospace;padding:10px;border:2px solid #6cf;margin:0';
+    panel.textContent = text;
+    document.body.append(panel);
+    try { copy(JSON.stringify(report)); } catch { /* copy() exists only in the DevTools console */ }
+  };
+  const modal = [...document.querySelectorAll('#addShiftEventModal')].find(shown);
+  if (!modal) { lines.push('Dates probe 1: no open Add Assignment window. Open one with New Assignment first.'); finish(); return; }
+  const form = modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal.querySelector('form') || modal;
+  const labelShown = text => [...form.querySelectorAll('label')].some(node => shown(node) && words(node).replace(/[*?]/g, '').trim() === text);
+  const kind = labelShown('Hours Per Week') ? 'Weekly (Hours Per Week)' : labelShown('Hours Per Day') ? 'Daily (Hours Per Day)' : 'unknown';
+  const range = form.querySelector('.shift-date-picker');
+  const jq = window.jQuery;
+  report.window = kind;
+  lines.push(`Dates probe 1 · ${kind} window`);
+  if (!range) { lines.push('No Dates box (.shift-date-picker) in the window.'); finish(); return; }
+
+  const role = input => /-start$/.test(input.id) ? 'start' : /-end$/.test(input.id) ? 'end' : input.classList.contains('shift-date-picker-dates') ? 'dates' : 'other';
+  const dataOf = input => { try { return typeof jq === 'function' ? jq(input).data() || {} : {}; } catch { return {}; } };
+  const eventsOf = input => { try { const e = jq?._data?.(input, 'events') || {}; return Object.fromEntries(Object.entries(e).map(([name, list]) => [name, list.length])); } catch { return {}; } };
+  const inputs = [...range.querySelectorAll('input')];
+  report.boxes = inputs.map(input => ({ role: role(input), type: input.type, shown: shown(input), readOnly: input.readOnly, disabled: input.disabled,
+    classes: [...input.classList].join(' '), data: Object.keys(dataOf(input)), events: eventsOf(input) }));
+  lines.push('Boxes: ' + report.boxes.map(b => `${b.role} ${b.shown ? 'shown' : 'hidden'}${b.readOnly ? ' read-only' : ''}${b.data.length ? ' [' + b.data.join(',') + ']' : ''}`).join(' · '));
+  const shownBox = range.querySelector('input.shift-date-picker-dates') || inputs.find(input => role(input) === 'other');
+  const startBox = inputs.find(input => role(input) === 'start'), endBox = inputs.find(input => role(input) === 'end');
+  const pickerBox = [shownBox, startBox, endBox].find(input => input && (dataOf(input).datepicker || dataOf(input).daterangepicker));
+  const picker = pickerBox && (dataOf(pickerBox).datepicker || dataOf(pickerBox).daterangepicker);
+  const pickerKind = !picker ? 'none' : dataOf(pickerBox).datepicker ? 'bootstrap' : 'daterangepicker';
+  const methods = picker ? ['setDates', 'getDates', 'setDate', 'clearDates', 'update', 'show', 'hide', 'setStartDate', 'setEndDate'].filter(name => typeof picker[name] === 'function') : [];
+  const o = picker?.o || {};
+  const limit = value => value === Infinity || value === -Infinity ? String(value) : value instanceof Date ? 'a date' : value == null ? 'none' : typeof value;
+  report.picker = { on: pickerBox ? role(pickerBox) : 'none', kind: pickerKind, multidate: o.multidate ?? null, inputs: picker?.inputs?.length ?? 0, subPickers: picker?.pickers?.length ?? 0,
+    methods, startLimit: limit(o.startDate ?? picker?.minDate), endLimit: limit(o.endDate ?? picker?.maxDate), disabledWeekdays: (o.daysOfWeekDisabled || []).length,
+    disabledDates: (o.datesDisabled || []).length, beforeShowDay: typeof o.beforeShowDay, calendarWeeks: !!o.calendarWeeks, weekStart: o.weekStart ?? null,
+    shownBoxEvents: shownBox ? eventsOf(shownBox) : {}, startEvents: startBox ? eventsOf(startBox) : {} };
+  lines.push(`Picker: ${pickerKind} on the ${report.picker.on} box · multidate ${report.picker.multidate} · inputs ${report.picker.inputs} · sub-pickers ${report.picker.subPickers} · ${methods.join(',') || 'no methods'}`);
+  lines.push(`Limits: start ${report.picker.startLimit} · end ${report.picker.endLimit} · disabled weekdays ${report.picker.disabledWeekdays} · disabled dates ${report.picker.disabledDates} · beforeShowDay ${report.picker.beforeShowDay}`);
+  const ev = obj => Object.entries(obj).map(([k, v]) => `${k} ${v}`).join(', ') || 'none';
+  lines.push(`Handlers: dates box ${ev(report.picker.shownBoxEvents)} · start box ${ev(report.picker.startEvents)}`);
+
+  const us = d => `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}/${d.getFullYear()}`;
+  const heldDays = () => {
+    try {
+      if (pickerKind === 'bootstrap' && picker.pickers?.length === 2 && !(o.multidate >= 2 || o.multidate === true)) return picker.pickers.map(p => p.getDates?.()[0]).filter(Boolean).map(us);
+      if (pickerKind === 'bootstrap') return (picker.getDates?.() || []).map(us);
+      if (pickerKind === 'daterangepicker') return [picker.startDate?.format?.('MM/DD/YYYY'), picker.endDate?.format?.('MM/DD/YYYY')].filter(Boolean);
+    } catch (error) { return ['unreadable: ' + String(error?.message || error).slice(0, 80)]; }
+    return [];
+  };
+  const summary = () => { const text = words(range.closest('.dynamic-form-row, .form-group, .row') || range.parentElement) + ' ' + words(form);
+    const pick = name => (text.match(new RegExp(name + ':\\s*([\\d.]+)')) || [])[1] || '-';
+    return { weeks: pick('Weeks'), days: pick('Days'), total: pick('Total Hours') }; };
+  const state = () => { const held = heldDays(), s = summary();
+    return { start: startBox?.value || '', end: endBox?.value || '', datesBox: shownBox ? shownBox.value.slice(0, 60) : '', picker: held.length ? `${held.length} day(s) ${held[0]}${held.length > 1 ? ' to ' + held.at(-1) : ''}` : 'nothing', ...s }; };
+  const say = st => `boxes ${st.start || 'blank'} to ${st.end || 'blank'} · picker ${st.picker} · Weeks ${st.weeks} · Days ${st.days} · Total ${st.total}`;
+  report.opened = state();
+  lines.push('Opened with: ' + say(report.opened));
+
+  const parsed = (startBox?.value || '').match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!parsed) { lines.push('Start box is not MM/DD/YYYY: no tries made. Press Cancel.'); finish(); return; }
+  const base = new Date(+parsed[3], +parsed[1] - 1, +parsed[2]);
+  const monday = new Date(base); monday.setDate(base.getDate() - ((base.getDay() + 6) % 7) + 7);
+  const weekFrom = offset => [0, 1, 2, 3, 4].map(n => { const d = new Date(monday); d.setDate(monday.getDate() + offset + n); return d; });
+  const days = weekFrom(0), days2 = weekFrom(7);
+  const wanted = `${us(days[0])} to ${us(days[4])}`, wanted2 = `${us(days2[0])} to ${us(days2[4])}`;
+  const matches = (st, list = days) => st.start === us(list[0]) && st.end === us(list[4]);
+  report.wanted = [wanted, wanted2];
+
+  try {
+    if (pickerKind === 'bootstrap' && (o.multidate === true || o.multidate >= 2)) { picker.clearDates?.(); jq(pickerBox).datepicker('setDates', days); }
+    else if (pickerKind === 'bootstrap' && picker.pickers?.length === 2) { (picker.inputs || []).forEach((input, i) => jq(input).datepicker('setDate', i ? days[4] : days[0])); }
+    else if (pickerKind === 'bootstrap') jq(pickerBox).datepicker('setDate', days[0]);
+    else if (pickerKind === 'daterangepicker') { picker.setStartDate(us(days[0])); picker.setEndDate(us(days[4])); jq(pickerBox).trigger('apply.daterangepicker', [picker]); }
+    await sleep(1500);
+    report.try1 = { ...state(), error: '' };
+  } catch (error) { report.try1 = { ...state(), error: String(error?.message || error).slice(0, 120) }; }
+  try { if (pickerKind === 'bootstrap') jq(pickerBox).datepicker('hide'); } catch { /* closing only */ }
+  lines.push(`Try 1 (Snooze's way), wanted ${wanted}: ${matches(report.try1) ? 'HELD' : 'NOT held'} · ${say(report.try1)}${report.try1.error ? ' · error ' + report.try1.error : ''}`);
+
+  const press = node => { for (const type of ['mousedown', 'mouseup', 'click']) node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })); };
+  const inDropdown = node => !!node?.closest('.datepicker, .daterangepicker') && !modal.querySelector('.modal-footer')?.contains(node);
+  const openPicker = async () => {
+    const box = shown(shownBox) ? shownBox : shown(startBox) ? startBox : null;
+    if (!box) return null;
+    box.focus(); press(box); await sleep(500);
+    return [...document.querySelectorAll('.datepicker-dropdown, .datepicker.dropdown-menu, .daterangepicker')].find(shown) || null;
+  };
+  const steps = [];
+  try {
+    let drop = await openPicker();
+    steps.push(drop ? 'picker opened' : 'picker did not open');
+    if (drop) {
+      const clear = [...drop.querySelectorAll('.clear, th.clear, button.cancelBtn')].find(shown);
+      if (clear && inDropdown(clear)) { press(clear); steps.push('Clear pressed'); await sleep(500); } else steps.push('no Clear');
+      drop = [...document.querySelectorAll('.datepicker-dropdown, .datepicker.dropdown-menu, .daterangepicker')].find(shown) || await openPicker();
+      const pickDay = async (day, name) => {
+        const view = () => { drop = [...document.querySelectorAll('.datepicker-dropdown, .datepicker.dropdown-menu, .daterangepicker')].find(shown) || drop;
+          return [...(drop?.querySelectorAll('.datepicker-days') || [])].find(shown) || drop; };
+        const target = `${['January','February','March','April','May','June','July','August','September','October','November','December'][day.getMonth()]} ${day.getFullYear()}`;
+        for (let i = 0; i < 36 && drop; i++) {
+          const title = words(view().querySelector('.datepicker-switch, .month'));
+          if (title === target) break;
+          const [m, y] = [title.split(' ')[0], +title.split(' ')[1]];
+          const at = y * 12 + ['January','February','March','April','May','June','July','August','September','October','November','December'].indexOf(m);
+          const arrow = view().querySelector(at < day.getFullYear() * 12 + day.getMonth() ? '.next' : '.prev');
+          if (!arrow || !inDropdown(arrow)) break;
+          press(arrow); await sleep(250);
+        }
+        const cells = [...view().querySelectorAll('td.day, td.available')].filter(cell => shown(cell) && !cell.matches('.old, .new, .off') && words(cell).replace(/\D.*$/, '') === String(day.getDate()));
+        if (cells.length !== 1 || !inDropdown(cells[0])) { steps.push(`${name} day not found (${cells.length})`); return false; }
+        press(cells[0]); steps.push(`${name} clicked`); await sleep(500);
+        return true;
+      };
+      if (drop && await pickDay(days2[0], 'start')) {
+        drop = [...document.querySelectorAll('.datepicker-dropdown, .datepicker.dropdown-menu, .daterangepicker')].find(shown) || await openPicker();
+        if (!drop) steps.push('picker closed after start');
+        else await pickDay(days2[4], 'end');
       }
-      return node.isConnected;
-    };
-    const menu = () => [...document.querySelectorAll('ul.context-menu-list.context-menu-root')].find(shown);
-    const items = () => {
-      const open = menu();
-      return open ? [...open.querySelectorAll(':scope > li.context-menu-item')].filter(shown).map(li => li.textContent.trim() + (li.classList.contains('context-menu-disabled') ? ' (off)' : '')).join(', ') || 'no items' : 'no menu';
-    };
-    const close = async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true }));
-      for (const layer of document.querySelectorAll('#context-menu-layer')) {
-        layer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true }));
-        layer.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, button: 0 }));
-      }
-      await wait(500);
-    };
-    cell.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    await close();
-    const box = cell.getBoundingClientRect();
-    const spots = { 'Snooze bottom': box.bottom - 4, 'quarter up': box.bottom - box.height / 4, middle: box.top + box.height / 2 };
-    lines.push(`cell height ${Math.round(box.height)}; window height ${innerHeight}`);
-    for (const [spot, y] of Object.entries(spots)) {
-      const x = Math.round(box.left + box.width / 2), top = Math.round(y);
-      const on = document.elementFromPoint(x, top);
-      const target = on || cell;
-      const common = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: top, screenX: x, screenY: top };
-      target.dispatchEvent(new PointerEvent('pointerdown', { ...common, button: 2, buttons: 2, pointerType: 'mouse' }));
-      target.dispatchEvent(new MouseEvent('mousedown', { ...common, button: 2, buttons: 2 }));
-      target.dispatchEvent(new PointerEvent('pointerup', { ...common, button: 2, buttons: 0, pointerType: 'mouse' }));
-      target.dispatchEvent(new MouseEvent('mouseup', { ...common, button: 2, buttons: 0 }));
-      target.dispatchEvent(new MouseEvent('contextmenu', { ...common, button: 2, buttons: 0 }));
-      const first = items();
-      await wait(1000);
-      lines.push(`${spot}: on ${on === cell ? 'the cell' : name(on)}; at once: ${first}; after 1 s: ${items()}`);
-      await close();
     }
-    lines.push(`menu closed: ${!menu()}`);
-  }
-  console.log(lines.join('\n'));
+    await sleep(1500);
+    report.try2 = { ...state(), steps, error: '' };
+  } catch (error) { report.try2 = { ...state(), steps, error: String(error?.message || error).slice(0, 120) }; }
+  try { if (pickerKind === 'bootstrap') jq(pickerBox).datepicker('hide'); } catch { /* closing only */ }
+  lines.push(`Try 2 (click way), wanted ${wanted2}: ${steps.join(', ')} · ${matches(report.try2, days2) ? 'HELD' : 'NOT held'} · ${say(report.try2)}${report.try2.error ? ' · error ' + report.try2.error : ''}`);
+  lines.push('Done. Nothing was saved. Press Cancel on the Add Assignment window, then take a photo of this box.');
+  finish();
 })();
