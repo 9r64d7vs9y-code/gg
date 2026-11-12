@@ -1,4 +1,4 @@
-// v0.14.2
+// v0.14.3
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -5645,7 +5645,7 @@ async function preflightDates(required, { move = showDate, entries = [], keepOpe
     }
     proved = true;
     if (keepOpen) rememberPreflightForm(modal, personIdentity(), required);
-    return { exact, ...(grouped !== undefined ? { grouped } : {}), ...(keepOpen ? { modal } : {}) };
+    return { exact, ...(isWeekForm(form) ? { week: true } : {}), ...(grouped !== undefined ? { grouped } : {}), ...(keepOpen ? { modal } : {}) };
   } catch (error) {
     await cleanupAfter(error, () => closeWindow(modal, 'Add Assignment'));
     throw error;
@@ -9101,6 +9101,10 @@ const { valueKey } = __require("../rules/prepare.js");
 const { PageError } = __require("../mysource/dom.js");
 const { compareCopies } = __require("../mysource/copy.js");
 const BACKUP_KIND = 'Snooze backup 1';
+function backupRecord({ site, version, taken, ticket, email, professional, plan, fileName }, fields) {
+  return { kind: BACKUP_KIND, ...(site ? { site } : {}), snooze: version, taken, ticket, email, professional,
+    plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')), report: fileName || 'the Staff Schedule Hours Report by Day', ...fields };
+}
 const RESTORE_FIELDS = {
   billable: 'Billable', utilization: 'Utilization Generating', jobCode: 'Job Code',
   assignCode: 'Assign Code 1', assignCode2: 'Assign Code 2',
@@ -9256,6 +9260,7 @@ function recordLaterChange(prepared, after, notesChanged = false) {
 const pastReportWarning = backup => backup?.unbackedAfter && !backup.laterBacked
   ? `Days after ${usDate(backup.unbackedAfter)} are not backed up; Undo does not put them back.` : '';
 __exports.BACKUP_KIND = BACKUP_KIND;
+__exports.backupRecord = backupRecord;
 __exports.RESTORE_FIELDS = RESTORE_FIELDS;
 __exports.withPagePricing = withPagePricing;
 __exports.validatePageDays = validatePageDays;
@@ -9511,7 +9516,7 @@ const { deleteAll, deleteRange, splitDeleteWeeks, addAssignment, preflightDates,
 const { compareCopies, copyWindow, entriesToAdd, dayOf, knownAssignmentRows } = __require("../mysource/copy.js");
 const { restoreWindow, restorePlan } = __require("../mysource/restore.js");
 const { LOA_CLIENT, DNS_CLIENT, checkDnsAdded, checkLoaAdded } = __require("../mysource/checks.js");
-const { BACKUP_KIND, recordLaterChange, compareByDay, reportDays, withPagePricing, validatePageDays, withLaterDays, laterDays } = __require("./backup.js");
+const { BACKUP_KIND, backupRecord, recordLaterChange, compareByDay, reportDays, withPagePricing, validatePageDays, withLaterDays, laterDays } = __require("./backup.js");
 const { requireDayReport, reportAssignPeriod } = __require("../files/report.js");
 const { auditLoaExact } = __require("./audit-loa.js");
 const { checkPerson, termDayOf } = __require("../rules/shared.js");
@@ -9654,13 +9659,12 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
     if (valueKey(row.billable) === 'billable') item.clientHours += row.hours;
     removing.set(row.client, item);
   }
-  const backup = {
-    kind: BACKUP_KIND, snooze: version, taken: copy.taken, ticket: record.number, email: record.email,
-    professional: record.person.professional, plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')), window: { ...watchedWindow, end: compareDays(watchedWindow.end, reportEnd) < 0 ? watchedWindow.end : reportEnd }, days, reportEnd, termDate: termText,
-    report: slice.fileName || 'the Staff Schedule Hours Report by Day',
+  const backup = backupRecord({ version, taken: copy.taken, ticket: record.number, email: record.email,
+    professional: record.person.professional, plan, fileName: slice.fileName }, {
+    window: { ...watchedWindow, end: compareDays(watchedWindow.end, reportEnd) < 0 ? watchedWindow.end : reportEnd }, days, reportEnd, termDate: termText,
     noteChangedDays: copy.days.filter(row => valueKey(row.client) === valueKey(LOA_CLIENT)
       && inRange(row.day, plan.loaStart, plan.loaEnd)).map(row => row.day),
-  };
+  });
   if (!slice.liveScope) withLaterDays(backup, copy, entriesToAdd);
   return { window, watchedWindow, copy, watched: copy, backup, removing: [...removing.values()], daysCompared, checks, reportEnd, identity, replacedOldNote, runs, kept, canRefreshNotes, dateForm: dateCheck.modal };
 }
@@ -9955,7 +9959,7 @@ async function prepareExit(one, version, today, { step }) {
     if (initialEdit?.isConnected) await step(() => closeEdit(initialEdit));
     const resourceManager = facts.resourceManager || slice.resourceManager || record.person.resourceManager || '';
     return prepareWeeklyExit({ one, version, today, step, identity, plan, termText, greyedExit, greyed, dnsEnd: startGreyed ? null : editableDnsEnd,
-      backupKind: BACKUP_KIND, undoBlocked: TERM_DATE_UNDO,
+      undoBlocked: TERM_DATE_UNDO,
       exitPeople: { dpName: resourceManager, dpEmail: facts.resourceManagerEmail || slice.resourceManagerEmail || '', dpNotFound: valueKey(resourceManager) === 'not applicable' } });
   }
   if (withoutNotes) allowWeeklyRows(false);
@@ -10039,12 +10043,12 @@ async function prepareExit(one, version, today, { step }) {
     const reachesLater = !slice.liveScope && (copy.days.some(row => !inReport(row) && inChange(row)) || addDns && compareDays(editableDnsEnd, reportEnd) > 0);
     const { problems } = greyedExit ? { problems: [] } : entriesToAdd({ window: watchedWindow, days: [...days, ...(reachesLater ? laterDays(reportEnd, copy) : [])] });
     if (problems.length) return { stop: `Snooze could not put these days back if needed: ${problems.join('; ')}.` };
-    const backup = { kind: BACKUP_KIND, snooze: version, taken: copy.taken, ticket: record.number, email: record.email,
-      professional: professionalName(record), plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')), window: { ...watchedWindow, end: compareDays(watchedWindow.end, reportEnd) < 0 ? watchedWindow.end : reportEnd }, days, reportEnd, termDate: termText,
+    const backup = backupRecord({ version, taken: copy.taken, ticket: record.number, email: record.email,
+      professional: professionalName(record), plan, fileName: slice.fileName }, {
+      window: { ...watchedWindow, end: compareDays(watchedWindow.end, reportEnd) < 0 ? watchedWindow.end : reportEnd }, days, reportEnd, termDate: termText,
       ...((addDns || repairDays.length) && !withoutNotes ? { noteChangedDays: copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT)
         && (addDns && inRange(row.day, plan.dnsStart, editableDnsEnd) || repairDays.some(day => compareDays(day, row.day) === 0))).map(row => row.day) } : {}),
-      report: slice.fileName || 'the Staff Schedule Hours Report by Day',
-      ...(greyedExit ? { greyedExit: true, undoBlocked: TERM_DATE_UNDO } : {}) };
+      ...(greyedExit ? { greyedExit: true, undoBlocked: TERM_DATE_UNDO } : {}) });
     if (!slice.liveScope) withLaterDays(backup, copy, entriesToAdd);
     const later = copy.days.filter(row => compareDays(row.day, plan.dnsStart) >= 0);
     const clearLater = later.length > 0 && later.every(inChange);
@@ -10304,7 +10308,7 @@ const { openPerson, personIdentity, checkPersonIdentity, canAddAssignment } = __
 const { showDate, calendarHolds } = __require("../mysource/calendar.js");
 const { copyWindow, compareCopies } = __require("../mysource/copy.js");
 const { preflightDates } = __require("../mysource/write.js");
-const { BACKUP_KIND, reportDays, compareByDay } = __require("./backup.js");
+const { backupRecord, reportDays, compareByDay } = __require("./backup.js");
 const { recordRun } = __require("../core/run-records.js");
 const { reportDifferenceSummary } = __require("../files/report-diagnostic.js");
 const within = (day, start, end) => compareDays(day, start) >= 0 && compareDays(day, end) <= 0;
@@ -10362,9 +10366,8 @@ async function prepareTax(one, version, today, { step = fn => fn() } = {}) {
   }
   const backupEnd = compareDays(copy.window.end, reportEnd) < 0 ? copy.window.end : reportEnd;
   const window = copy.window;
-  const backup = { kind: BACKUP_KIND, site: 'tax', snooze: version, email: one.record.email, professional: one.record.person.professional, ticket: one.record.number,
-    taken: copy.taken, window: { start, end: backupEnd }, watchedWindow: window, today, reportEnd, days: report.filter(row => compareDays(row.day, backupEnd) <= 0),
-    plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')), report: one.slice.fileName || 'the Staff Schedule Hours Report by Day' };
+  const backup = backupRecord({ site: 'tax', version, email: one.record.email, professional: one.record.person.professional, ticket: one.record.number,
+    taken: copy.taken, plan, fileName: one.slice.fileName }, { window: { start, end: backupEnd }, watchedWindow: window, today, reportEnd, days: report.filter(row => compareDays(row.day, backupEnd) <= 0) });
   const pairedIds = new Set();
   backup.days = backup.days.map(old => {
     const row = copy.days.find(row => !pairedIds.has(row.id) && copy.days.filter(other => other.id === row.id).length === 1
@@ -10401,14 +10404,14 @@ const { checkPersonIdentity, waitForPersonIdentity } = __require("../mysource/sc
 const { copyWindow, compareCopies } = __require("../mysource/copy.js");
 const { deleteRange, addAssignment, preflightDates, setAssignmentHours, weekRuns } = __require("../mysource/write.js");
 const { DNS_CLIENT } = __require("../mysource/checks.js");
-const { compareByDay, reportDays, withPagePricing, validatePageDays, pageRowsAfter, pageBackupRow, recordLaterChange } = __require("./backup.js");
+const { backupRecord, compareByDay, reportDays, withPagePricing, validatePageDays, pageRowsAfter, pageBackupRow, recordLaterChange } = __require("./backup.js");
 const { recordRun } = __require("../core/run-records.js");
 const { sameDayClient } = __require("../mysource/weekly-restore.js");
 const { reportDifferenceSummary } = __require("../files/report-diagnostic.js");
 const sameWeek = (a, b) => compareDays(mondayOf(a), mondayOf(b)) === 0;
 const PROVE = 'The Weekly schedule step could not be proved.';
 async function prepareWeeklyExit(ctx) {
-  const { one, version, today, step, identity, plan, termText, greyedExit, greyed, dnsEnd, exitPeople, backupKind, undoBlocked } = ctx;
+  const { one, version, today, step, identity, plan, termText, greyedExit, greyed, dnsEnd, exitPeople, undoBlocked } = ctx;
   const { record, slice } = one;
   const yesterday = addDays(today, -1);
   const lastDay = record.notification.dates.lastWorkingDay;
@@ -10459,12 +10462,11 @@ async function prepareWeeklyExit(ctx) {
     paired.add(row.id);
     return { ...old, id: row.id, pricingId: row.pricingId };
   });
-  const backup = { kind: backupKind, site: 'weekly', snooze: version, taken: copy.taken, ticket: record.number, email: record.email,
-    professional: professionalName(record), plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')),
+  const backup = backupRecord({ site: 'weekly', version, taken: copy.taken, ticket: record.number, email: record.email,
+    professional: professionalName(record), plan, fileName: slice.fileName }, {
     window: { start: readStart, end: laterBacked ? copy.window.end : backupEnd }, watchedWindow: copy.window, today, reportEnd,
     days: laterBacked ? [...days, ...later.map(row => ({ ...pageBackupRow(row), id: row.id }))] : days, termDate: termText, ...(laterBacked ? { laterBacked: true } : {}),
-    report: slice.fileName || 'the Staff Schedule Hours Report by Day',
-    ...(greyedExit ? { greyedExit: true, undoBlocked } : {}) };
+    ...(greyedExit ? { greyedExit: true, undoBlocked } : {}) });
   let dnsRuns = [];
   if (!greyedExit) {
     const dates = [...(weekly.addDns ? workingDays(weekly.addDns.start, weekly.addDns.end) : []), ...weekly.remove.filter(row => inReport(row) || laterBacked).map(row => row.day)];
@@ -10659,6 +10661,7 @@ function restoreReportButton(work, body, onBack) {
   return el('div', { class: 'restore-entry' }, button, recoveryGuide(), input, message);
 }
 const RESTORE_TITLE = 'Restore from a backup or report';
+const PLAIN_REPORT_LINE = 'A plain report only if the batch stopped before Save files: no Pricing ID or later days.';
 const RESULT_LABELS = { restored: 'Restored', partial: 'Partly restored', byHand: 'By hand', notRun: 'Not run', paused: 'Paused' };
 const notBackedUp = backup => backup?.unbackedAfter && !backup.laterBacked ? ` · days after ${usDate(backup.unbackedAfter)} were not backed up and are not put back` : '';
 const resultLabel = row => (RESULT_LABELS[row.state] || 'Not run') + (['restored', 'partial'].includes(row.state) ? notBackedUp(row.person.backup) : '');
@@ -10754,6 +10757,7 @@ function mountRestorePanel(people, work, body, onBack, { fromBackup = false } = 
     const text = results ? `${results.rows.filter(row => row.state === 'restored').length} restored · ${results.rows.filter(row => row.state === 'partial').length} partial · ${results.rows.filter(row => row.state === 'byHand').length} by hand${pending ? ` · ${pending} not run` : ''}`
       : checked ? `${selected.size} selected · ${countDays()} days to restore` : `${selected.size} of ${people.length} selected`;
     footer.append(el('div', { class: 'restore-count', role: 'status' }, active ? restoring ? 'Restoring the selected schedules…' : 'Reading the selected schedules…' : text));
+    if (!results && !fromBackup) footer.append(el('div', { class: 'restore-notice' }, PLAIN_REPORT_LINE));
     if (!results) footer.append(el('div', { class: 'restore-notice' }, fromBackup ? 'Original notes cannot be restored.' : 'Original notes and Pricing ID cannot be restored.'));
     if (message) footer.append(el('div', { class: 'warn', role: 'status' }, message));
     const action = results
@@ -10773,6 +10777,7 @@ function mountRestorePanel(people, work, body, onBack, { fromBackup = false } = 
 }
 __exports.restoreReportButton = restoreReportButton;
 __exports.RESTORE_TITLE = RESTORE_TITLE;
+__exports.PLAIN_REPORT_LINE = PLAIN_REPORT_LINE;
 __exports.resultLabel = resultLabel;
 __exports.mountRestorePanel = mountRestorePanel;
 },
@@ -10872,7 +10877,7 @@ __exports.withLiveConnection = withLiveConnection;
 'use strict';
 const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { NOTE_STAGE_EXITS, isNoteStageRefusal } = __require("../mysource/note-stage.js");
-const { LIVE_TEST_PARTS, testPart, TAX_LIVE_STEPS, SMALL_LIVE_STEPS, taxLiveReport } = __require("./live-proof.js");
+const { LIVE_TEST_PARTS, testPart, TAX_LIVE_STEPS, SMALL_LIVE_STEPS, WEEKLY_LIVE_STEPS, taxLiveReport } = __require("./live-proof.js");
 const { runTaxLiveTest } = __require("./tax-live-test.js");
 const { withLiveConnection } = __require("./live-connection.js");
 const { runAuditLiveTest, runSmallConsultingTest, AUDIT_LIVE_STEPS, auditLiveReport } = __require("./audit-live-test.js");
@@ -10906,6 +10911,7 @@ const LIVE_TEST_STEPS = {
   ...GROUP_TITLES,
   ...EXTENSION_STEPS,
   ...SMALL_LIVE_STEPS,
+  ...WEEKLY_LIVE_STEPS,
   open: 'Open professional', empty: 'Check empty period', editable: 'Check editable dates',
   loaAdd: 'Add LOA', loaReplace: 'Replace LOA, hover and screenshot',
   loaDelete: 'Delete LOA', loaAlter: 'Change test entries before Restore', loaRestore: 'Restore LOA',
@@ -11186,7 +11192,7 @@ __exports.runTaxLiveTest = runTaxLiveTest;
 const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { addressCount } = __require("../rules/prepare.js");
 const { compareDays, todayOf, usDate } = __require("../rules/dates.js");
-const { SMALL_LIVE_STEPS, smallTestPeriod } = __require("./live-proof.js");
+const { SMALL_LIVE_STEPS, WEEKLY_LIVE_STEPS, smallTestPeriod } = __require("./live-proof.js");
 const { withLiveConnection } = __require("./live-connection.js");
 const runSmallConsultingTest = (options, page) => withLiveConnection(options, page, runSmallConsultingRecorded);
 async function runSmallConsultingRecorded({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
@@ -11198,17 +11204,27 @@ async function runSmallConsultingRecorded({ email, version, today = todayOf(), o
     events: [], pictures: [], outstanding: [] };
   const diagnostic = beginLiveDiagnostics(result, page, assignPeriod, today);
   const write = () => { result.writes++; };
-  const actions = [() => page.smallStart(String(email).trim(), window), () => page.smallAdd(write),
+  let actions = [() => page.smallStart(String(email).trim(), window), () => page.smallAdd(write),
     () => page.smallChange(write), () => page.smallDelete(write),
     async () => { result.pictures.push(...await page.smallPicture()); },
     () => page.smallUndo(write), () => page.auditClear(write)];
+  const toWeekly = () => {
+    result.design = 'weekly5'; result.expectedSteps = 5;
+    result.steps = [result.steps[0], ...Object.keys(WEEKLY_LIVE_STEPS).slice(1).map(id => ({ id, state: 'notExercised' }))];
+    actions = [actions[0], () => page.weeklySetup(write), () => page.weeklyExit(write), () => page.weeklyUndo(write), () => page.weeklyClear(write)];
+  };
+  const titles = () => result.design === 'weekly5' ? WEEKLY_LIVE_STEPS : SMALL_LIVE_STEPS;
   let release;
   try {
     release = await page.begin(result.events);
     for (let index = 0; index < actions.length; index++) {
       const step = result.steps[index]; step.state = 'running'; page.setStep?.(step.id); onUpdate(result);
-      try { Object.assign(step, await actions[index]()); step.state = 'passed'; }
-      catch (error) { if (error.connectionLost) { result.state = 'paused'; throw error; } step.state = 'failed'; step.part = SMALL_LIVE_STEPS[step.id]; diagnostic.fail(error, step.id); throw error; }
+      try {
+        const { weekly, ...found } = await actions[index]() || {};
+        Object.assign(step, found); step.state = 'passed';
+        if (index === 0 && weekly) toWeekly();
+      }
+      catch (error) { if (error.connectionLost) { result.state = 'paused'; throw error; } step.state = 'failed'; step.part = titles()[step.id]; diagnostic.fail(error, step.id); throw error; }
       finally { page.finishStep?.(); onUpdate(result); }
     }
     result.state = 'complete'; result.cleanup = 'empty';
@@ -11216,7 +11232,7 @@ async function runSmallConsultingRecorded({ email, version, today = todayOf(), o
     if (error.connectionLost) throw error;
     if (!result.diagnostic.stop) diagnostic.fail(error, result.steps.find(s => s.state === 'running')?.id || 'smallOpen');
     result.state = 'failed'; diagnostic.cleanup();
-    try { result.cleanup = await page.auditCleanup(write, error); }
+    try { result.cleanup = await (result.design === 'weekly5' ? page.weeklyCleanup(write, error) : page.auditCleanup(write, error)); }
     catch (cleanupError) { if (cleanupError.connectionLost) { result.connectionReturnState = 'failed'; result.state = 'paused'; throw cleanupError; } diagnostic.fail(cleanupError, 'recovery'); result.cleanup = 'unconfirmed'; }
   } finally {
     result.outstanding = page.auditOutstanding(result.cleanup); release?.(); diagnostic.finish(); onUpdate(result);
@@ -11559,6 +11575,11 @@ const SMALL_LIVE_STEPS = {
   smallChange: 'Replace, combined Edit Submit and Cancel', smallDelete: 'Delete around a kept DNS day',
   smallPicture: 'Hover picture and plain A&A picture', smallUndo: 'Undo from the backup', cleanup: 'Clear and check empty',
 };
+const WEEKLY_LIVE_STEPS = {
+  smallOpen: 'Open and read', weeklySetup: 'Weekly setup: DNS 4 h a day, three weeks',
+  weeklyExit: 'Weekly A&A Exit: DNS in whole weeks, each Add checked', weeklyUndo: 'Undo from the backup',
+  cleanup: 'Clear and check empty',
+};
 const SMALL_TAX_STEPS = {
   taxEmpty: 'Open, read and check empty span', taxAdd: 'Add LOA, DNS, Holiday and Replace',
   taxHours: 'Lower and restore saved Hours', taxPartial: 'Partial-week apply and Undo',
@@ -11610,6 +11631,7 @@ function taxLiveReport(result) {
 __exports.LIVE_TEST_PARTS = LIVE_TEST_PARTS;
 __exports.testPart = testPart;
 __exports.SMALL_LIVE_STEPS = SMALL_LIVE_STEPS;
+__exports.WEEKLY_LIVE_STEPS = WEEKLY_LIVE_STEPS;
 __exports.SMALL_TAX_STEPS = SMALL_TAX_STEPS;
 __exports.TAX_LIVE_STEPS = TAX_LIVE_STEPS;
 __exports.TAX_LIVE_FINDINGS = TAX_LIVE_FINDINGS;
@@ -11623,6 +11645,8 @@ const { stageNotes, stageRemoval } = __require("./note-stage.js");
 const { createLiveGroups } = __require("./live-groups.js");
 const { createLivePictures } = __require("./live-pictures.js");
 const { PageError, setBatchGuard, shown, click, settled, text, waitFor, WAIT, closeWindow, cleanupAfter } = __require("./dom.js");
+const { withWeeklyRows } = __require("./schedule.js");
+const { emailKey } = __require("../rules/prepare.js");
 const { calendarView, openPerson, personIdentity, checkPersonIdentity, requireSchedulePage, scheduleFacts, findAssignments, findAssignmentsRange, readEditTable, closeEdit, setupView, pageReady } = __require("./schedule.js");
 const { sessionExpired, cancelBatchWindows } = __require("./batch.js");
 const { copyWindow, compareCopies, dayOf, entriesToAdd, knownAssignmentRows } = __require("./copy.js");
@@ -12300,6 +12324,28 @@ function auditLivePage(today, small = false) {
       await deleteAll(edit, { onWrite: notice });
     }, write);
   };
+  let weeklyCheckpoint = null;
+  const weeklyRead = () => withWeeklyRows(() => read());
+  const weeklyAdd = async (entry, write) => { bounded(entry); await addAssignment(entry, 'Normal', { onWrite: write, weekly: true }); };
+  const weeklyExpect = (copy, rows, message) => {
+    const want = rows.map(([offset, client, hours]) => `${usDate(addDays(scope.start, offset))} ${client} ${hours}`).sort();
+    const got = copy.days.map(row => `${usDate(mondayOf(row.day))} ${row.client} ${row.hours}`).sort();
+    if (want.join('|') !== got.join('|')) throw new PageError(message);
+  };
+  const weeklyEmpty = async write => {
+    known = await weeklyRead();
+    if (!known.days.length) return;
+    await withWeeklyRows(async () => {
+      const edit = await findAssignments(scope);
+      try {
+        const actual = { days: (await readEditTable(edit)).map(row => ({ ...row, day: dayOf(row.date) })) };
+        if (!matches(known, actual)) throw new PageError('The Weekly cleanup table changed.');
+      } catch (error) { await closeEdit(edit); throw error; }
+      await deleteAll(edit, { onWrite: write });
+    });
+    known = await weeklyRead();
+    if (known.days.length) throw new PageError('Weekly span is not empty.');
+  };
   const smallNote = 'Snooze small live test';
   let smallCheckpoint = null, smallKept = null, smallKeptOriginalId = null;
   const smallKeep = () => {
@@ -12323,8 +12369,50 @@ function auditLivePage(today, small = false) {
     },
     setStep(id) { step = id; },
     async smallStart(typedEmail, window) {
-      await this.auditStart(typedEmail, window);
-      return {};
+      const found = await this.auditStart(typedEmail, window);
+      return found?.week ? { weekly: true } : {};
+    },
+    async weeklySetup(write) {
+      const setup = { start: scope.start, end: addDays(scope.start, 18) };
+      await weeklyAdd({ ...setup, client: DNS, hoursPerDay: 4, billable: 'Non-Billable', utilization: 'No', notes: '' }, write);
+      weeklyCheckpoint = await weeklyRead();
+      weeklyExpect(weeklyCheckpoint, [[0, DNS, 20], [7, DNS, 20], [14, DNS, 20]], 'The Weekly setup was not saved as three weeks of 20 h.');
+      return { weeks: 3 };
+    },
+    async weeklyExit(write) {
+      known = await weeklyRead();
+      if (!matches(weeklyCheckpoint, known)) throw new PageError('The Weekly test rows changed.');
+      const person = { professional: identity.name.split('(')[0].trim(), business: 'Audit & Assurance', region: 'US - US', resourceManager: 'Planner, Invented', termDate: scheduleFacts().termDate || '12/31/9999' };
+      const lwd = addDays(scope.start, -3);
+      const record = { number: 'diagnostic', email, person, subcategory: { business: 'audit', kind: 'exit' },
+        notification: readNotification(`Date of resignation: ${usDate(addDays(lwd, -7))}\nPlanned last working day: ${usDate(lwd)}`) };
+      const entries = known.days.map(row => ({ ...row, email: emailKey(email), days: [{ day: row.day, hours: row.hours }], fields: { 'Assign Period': 'Weekly' } }));
+      const slice = { status: 'ready', mode: 'day', entries, backupEntries: entries, person, resourceManager: person.resourceManager, reportEnd: scope.end, liveScope: true };
+      one = { record, slice, decision: decideExit(record, scope.start, slice) };
+      if (!record.notification.dates.lastWorkingDay || !one.decision.plan?.withoutNotes) throw new PageError('The production A&A decision was not proved.');
+      one.decision.plan.dnsEnd = addDays(scope.start, 16);
+      prepared = await withReopen(() => prepare(one, 'diagnostic', scope.start));
+      if (prepared.stop || !prepared.weekly || !prepared.backup) throw new PageError('The production Weekly Exit was not prepared.');
+      applied = await withReopen(() => apply(one, prepared, { onWrite: write, step: fn => fn() }));
+      if (!applied.ok) throw new PageError('The production Weekly Exit result was not proved.');
+      known = await weeklyRead();
+      weeklyExpect(known, [[0, DNS, 40], [7, DNS, 40], [14, DNS, 24]], 'The Weekly Exit did not leave DNS 8 h a day to the third Wednesday.');
+      return { productionPrepare: true, productionApply: true };
+    },
+    async weeklyUndo(write) {
+      known = await weeklyRead();
+      const restored = await withReopen(() => restore(prepared.backup, { today: scope.start, after: applied.after, identity, onWrite: write }));
+      known = await weeklyRead();
+      if (!restored.same || !matches({ days: weeklyCheckpoint.days.map(row => ({ ...row, id: '', notes: 0 })) }, known)) throw new PageError('Weekly Undo was not proved.');
+      return { productionUndo: true, setupRestored: true };
+    },
+    async weeklyClear(write) { await weeklyEmpty(write); },
+    async weeklyCleanup(write, error) {
+      if (!started) return 'notNeeded';
+      if (error?.identityChanged || error?.session || error?.pageBlocked) return 'unconfirmed';
+      await cancelLiveWindows(); check();
+      try { await weeklyEmpty(write); } catch (cleanupError) { await cancelLiveWindows(); if (cleanupError?.session || cleanupError?.identityChanged) return 'unconfirmed'; }
+      return (await weeklyRead()).days.length ? 'unconfirmed' : 'empty';
     },
     async smallAdd(write) {
       const week = { start: scope.start, end: addDays(scope.start, 39) };
@@ -12434,8 +12522,9 @@ function auditLivePage(today, small = false) {
       known = await read();
       if (known.days.length) { known = null; throw new PageError('The A&A test span is not empty.'); }
       if (![scope.start, scope.end].every(day => isEditableDay(day, today, null))) throw new PageError('The A&A test span is greyed out.');
-      await preflightDates(workingDays(scope.start, scope.end), { anchor: scope.start });
+      const found = await preflightDates(workingDays(scope.start, scope.end), { anchor: scope.start });
       started = true;
+      return found;
     },
     async auditSetup(write) {
       await add(LOA, first, 8, '', write); await add(LOA, second, 8, '', write);
@@ -13183,7 +13272,7 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     box.replaceChildren(); email.disabled = active || !!result;
     back.disabled = active; go.disabled = active || !!result; downloadButton.disabled = active; logButton.disabled = active;
     if (photo && result && !active) {
-      const small = ['small7','tax5'].includes(result.design) || !Array.isArray(result.events);
+      const small = ['small7','weekly5','tax5'].includes(result.design) || !Array.isArray(result.events);
       const report = small ? el('div', { role: 'region', 'aria-label': 'Photo report' },
         el('pre', { style: 'font:13px/1.35 Consolas,monospace;white-space:pre;margin:0' }, shortLiveReport(result))) : renderPhotoReport(result);
       box.append(report);
@@ -13697,11 +13786,11 @@ __exports.errorReason = errorReason;
 },
 "run/live-diagnostics.js": function (__require, __exports, document, window) {
 'use strict';
-const { SMALL_LIVE_STEPS, SMALL_TAX_STEPS } = __require("./live-proof.js");
+const { SMALL_LIVE_STEPS, SMALL_TAX_STEPS, WEEKLY_LIVE_STEPS } = __require("./live-proof.js");
 const { observeRun, recordRun, STAGES, WINDOWS, FIELDS, WAIT_NAMES, REASON_CODES, reasonCode } = __require("../core/run-records.js");
 const { REASON_NAMES, errorReason } = __require("../core/reason-names.js");
 const { dayFromParts, mondayOf, weekday, usDate } = __require("../rules/dates.js");
-const steps = new Set('smallOpen smallAdd smallChange smallDelete smallPicture smallUndo aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
+const steps = new Set('weeklySetup weeklyExit weeklyUndo smallOpen smallAdd smallChange smallDelete smallPicture smallUndo aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
 const word = (value, allowed, fallback = 'unknown') => allowed.has(value) ? value : fallback;
 const count = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
 const stages = new Set([...STAGES, 'move calendar']);
@@ -13887,7 +13976,7 @@ function shortLiveReport(result) {
   const visible = page => page?.visibleWindows?.length ? page.visibleWindows : ['none'];
   const state = page => !page || page.unavailable ? 'unavailable' : `${page.view}; periods ${page.periods ?? 'unknown'}; open ${page.windows.open}; hidden ${page.windows.hidden}; covers ${page.covers}`;
   line('Verdict', `${report.verdict}; version ${report.version}`);
-  const smallSteps = result.design === 'small7' ? SMALL_LIVE_STEPS : result.design === 'tax5' ? SMALL_TAX_STEPS : null;
+  const smallSteps = result.design === 'small7' ? SMALL_LIVE_STEPS : result.design === 'weekly5' ? WEEKLY_LIVE_STEPS : result.design === 'tax5' ? SMALL_TAX_STEPS : null;
   if (smallSteps) for (const [index, [id, title]] of Object.entries(smallSteps).entries()) {
     const step = result.steps?.find(step => step.id === id);
     line(`Step ${index + 1}`, `${title}: ${step?.state === 'passed' ? 'PASS' : step?.state === 'failed' ? 'FAIL' : 'not exercised'}`);
@@ -14217,7 +14306,7 @@ function saveFile(name, content, type = 'application/json') {
   link.remove();
   setTimeout(() => URL.revokeObjectURL(link.href), 10000);
 }
-const RECOVERY_LINE = "Use the backup file from the batch's zip. A plain report only if the batch stopped before Save files: no Pricing ID or later days.";
+const RECOVERY_LINE = "Use the backup file from the batch's zip.";
 function recoveryGuide() {
   return el('div', { class: 'recovery-guide' }, RECOVERY_LINE);
 }
@@ -15471,5 +15560,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.14.2");
+__snoozeLoad("screen/panel.js").start("0.14.3");
 })();
