@@ -1,4 +1,4 @@
-// v0.14.0
+// v0.14.1
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -2750,9 +2750,10 @@ function hoursOf(value, where) {
   if (!Number.isFinite(number)) throw new InputFileError(`The Staff Schedule Hours Report has "${text}" where hours should be (${where}).`);
   return number;
 }
-async function fileKind(file) {
+async function fileKind(file, onWorkbook = () => {}) {
   let workbook;
   try { workbook = await reportWorkbook(await file.arrayBuffer(), 'The file'); } catch { return null; }
+  onWorkbook(workbook);
   for (const sheet of workbook.sheetNames) {
     let rows;
     try { rows = workbook.rows(sheet).slice(0, HEADER_SEARCH_ROWS); } catch { return null; }
@@ -2761,13 +2762,13 @@ async function fileKind(file) {
   }
   return null;
 }
-async function readReport(file, label = 'The Staff Schedule Hours Report') {
+async function readReport(file, label = 'The Staff Schedule Hours Report', unpacked = null) {
   const extension = (String(file.name).match(/\.[^.]+$/) || [''])[0].toLowerCase();
   if (extension === '.xls') throw new InputFileError(`${label} is an old Excel file (.xls). Save it as .xlsx.`);
   if (!['.csv', '.xlsx'].includes(extension)) throw new InputFileError(`${label} must be an XLSX or CSV file.`);
   let workbook;
   try {
-    workbook = await reportWorkbook(await file.arrayBuffer(), label);
+    workbook = unpacked || await reportWorkbook(await file.arrayBuffer(), label);
   } catch (error) {
     throw inputReadError(error, label);
   }
@@ -3534,7 +3535,7 @@ const { calendarHolds, showDate } = __require("./calendar.js");
 const sameDay = (a, b) => compareDays(a, b) === 0;
 const on = (copy, day) => ({ days: copy.days.filter(row => sameDay(row.day, day)) });
 const equal = (a, b) => compareCopies(a, b).same;
-const sameLive = (a, b) => equal(a, b) && a.days.every(old => b.days.some(row => row.id === old.id && row.notes === old.notes
+const sameTaxLive = (a, b) => equal(a, b) && a.days.every(old => b.days.some(row => row.id === old.id && row.notes === old.notes
   && (typeof old.noteText !== 'string' || noteTextKey(row.noteText || '') === noteTextKey(old.noteText))));
 function daySteps(day, wanted, actual, today) {
   const retained = [], add = [], used = new Set();
@@ -3568,7 +3569,7 @@ async function taxRestorePlan(backup, { after = null, today = todayOf(), verifyB
     const noteChanged = (backup.noteChangedDays || []).some(old => sameDay(old, day)) && actual.days.some(row => row.notes > 0);
     if (equal(wanted, actual) && !noteChanged) continue;
     if (compareDays(day, mondayOf(today)) < 0) { skippedPast++; continue; }
-    if (after && !sameLive(on(after, day), actual)) { skippedLater.push({ day, clients: actual.days.map(row => row.client) }); continue; }
+    if (after && !sameTaxLive(on(after, day), actual)) { skippedLater.push({ day, clients: actual.days.map(row => row.client) }); continue; }
     const step = daySteps(day, wanted.days, actual.days, today);
     if (!step) { skippedUnconfirmed.push(day); continue; }
     if (!calendarHolds(day)) await showDate(day);
@@ -3577,6 +3578,7 @@ async function taxRestorePlan(backup, { after = null, today = todayOf(), verifyB
   }
   return { window, before, changedDays, steps, skippedPast, skippedLater, skippedLocked, skippedUnconfirmed, nothing: changedDays.length ? '' : 'Nothing left to undo.' };
 }
+__exports.sameTaxLive = sameTaxLive;
 __exports.taxRestorePlan = taxRestorePlan;
 },
 "mysource/weekly-restore.js": function (__require, __exports, document, window) {
@@ -5526,12 +5528,11 @@ async function addAssignmentRecorded(entry, mode, { onWrite = () => {}, move = s
     }
   }
   const modal = formModal || await openAddForm(entry.start, move, onProgress);
-  let runs = null;
   if (!modal.isConnected || !shown(modal)) throw new PageError('The preflight Add Assignment window closed before the change. Nothing was changed.');
   try {
     if (retained?.required) proveAllowedDates(modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal, retained.required);
-    runs = weekFormRuns(modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal, entry, weekly);
-    await fillAndAdd(modal, runs ? { ...entry, ...runs[0] } : entry, mode, onWrite, onProgress);
+    weekFormRuns(modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal, entry, weekly);
+    await fillAndAdd(modal, entry, mode, onWrite, onProgress);
   } catch (error) {
     if (modal.isConnected && shown(modal) && !error.addPressed) {
       const how = await cleanupAfter(error, () => closeWindow(modal, 'Add Assignment'));
@@ -5539,50 +5540,76 @@ async function addAssignmentRecorded(entry, mode, { onWrite = () => {}, move = s
     }
     throw error;
   }
-  for (const run of runs?.slice(1) || []) await addAssignmentRecorded({ ...entry, ...run }, mode, { onWrite, move, onProgress, weekly });
 }
 const hasLabel = (form, label) => [...form.querySelectorAll('label')].some(node => sameText(text(node).replace(/[*?]/g, ''), label));
 const isWeekForm = form => !isTaxPage() && hasLabel(form, 'Hours Per Week');
-function weekRuns(start, end) {
+const wholeWeek = run => sameDay(run.start, mondayOf(run.start)) && sameDay(run.end, addDays(mondayOf(run.end), 4));
+function weekRuns(start, end, grouped = false) {
   const runs = [];
   for (const day of workingDays(start, end)) {
     const last = runs.at(-1);
     if (last && sameDay(mondayOf(last.start), mondayOf(day))) last.end = day;
     else runs.push({ start: day, end: day });
   }
-  return runs;
+  if (!grouped) return runs;
+  const out = [];
+  for (const run of runs) {
+    const last = out.at(-1);
+    if (last && wholeWeek(last) && wholeWeek(run)) last.end = run.end;
+    else out.push({ ...run });
+  }
+  return out;
 }
+const weekCount = (start, end) => {
+  let count = 1;
+  for (let monday = mondayOf(start); compareDays(monday, mondayOf(end)) < 0; monday = addDays(monday, 7)) count++;
+  return count;
+};
 function weekFormRuns(form, entry, weekly) {
   if (!isWeekForm(form)) return null;
   if (!weekly || entry.dates || entry.hoursPerWeek !== undefined || !Number.isFinite(Number(entry.hoursPerDay))) {
     throw new PageError('This person’s Add Assignment works in weeks (Hours Per Week); Snooze adds there only for a Weekly A&A Exit. Nothing was added.');
   }
-  const runs = weekRuns(entry.start, entry.end);
+  const runs = weekRuns(entry.start, entry.end, true);
   if (!runs.length) throw new PageError('The Weekly run has no working day. Nothing was added.');
+  if (runs.length > 1) throw new PageError('A Weekly Add Assignment takes one week, or whole weeks in a row, at a time. Nothing was added.');
   return runs;
 }
-const weekHours = entry => Number(entry.hoursPerDay) * workingDays(entry.start, entry.end).length;
+const weekHours = entry => Number(entry.hoursPerDay) * workingDays(entry.start, entry.end).length / weekCount(entry.start, entry.end);
 async function proveWeek(form, start, end, hours) {
   await waitForDates(form, start, end, null);
   const box = fieldByLabel(form, 'Hours Per Week');
+  const weeks = weekCount(start, end);
+  const said = weeks === 1 ? 'one week' : `${weeks} weeks`;
   const check = () => {
     const d = readDates(form);
-    return d.weeks === 1 && Math.abs(Number(box.value) - hours) < 0.001 && (d.totalHours === null || Math.abs(d.totalHours - hours) < 0.001);
+    return d.weeks === weeks && Math.abs(Number(box.value) - hours) < 0.001 && (d.totalHours === null || Math.abs(d.totalHours - hours * weeks) < 0.001);
   };
-  try { await waitFor(check, 'the Weekly Add Assignment to show one week', WAIT.proof); }
+  try { await waitFor(check, `the Weekly Add Assignment to show ${said}`, WAIT.proof); }
   catch (error) {
     if (stopFlagged(error)) throw error;
     const d = readDates(form);
-    throw Object.assign(new PageError(`Add Assignment does not show one week of ${hours} h for ${usDate(start)} – ${usDate(end)} (Weeks ${d.weeks ?? 'not shown'}, Hours Per Week ${box.value || 'blank'}, Total Hours ${d.totalHours ?? 'not shown'}). Nothing was added.`), { weekShown: true });
+    throw Object.assign(new PageError(`Add Assignment does not show ${said} of ${hours} h for ${usDate(start)} – ${usDate(end)} (Weeks ${d.weeks ?? 'not shown'}, Hours Per Week ${box.value || 'blank'}, Total Hours ${d.totalHours ?? 'not shown'}). Nothing was added.`), { weekShown: true });
   }
 }
 async function tryRun(form, { start, end, hoursPerDay, label }) {
+  const tryWeek = async run => {
+    const hours = weekHours({ ...run, hoursPerDay });
+    await setDates(form, run.start, run.end);
+    await typeInto(fieldByLabel(form, 'Hours Per Week'), hours);
+    await proveWeek(form, run.start, run.end, hours);
+  };
   try {
-    if (isWeekForm(form)) for (const run of weekRuns(start, end)) {
-      const hours = weekHours({ ...run, hoursPerDay });
-      await setDates(form, run.start, run.end);
-      await typeInto(fieldByLabel(form, 'Hours Per Week'), hours);
-      await proveWeek(form, run.start, run.end, hours);
+    if (isWeekForm(form)) {
+      const grouped = weekRuns(start, end, true);
+      let trying = null;
+      try { for (const run of grouped) { trying = run; await tryWeek(run); } }
+      catch (error) {
+        if (stopFlagged(error) || !(error instanceof PageError) || weekCount(trying.start, trying.end) === 1) throw error;
+        for (const run of weekRuns(start, end)) await tryWeek(run);
+        return { grouped: false };
+      }
+      return { grouped: grouped.length < weekRuns(start, end).length };
     } else {
       await setDates(form, start, end);
       await typeInto(fieldByLabel(form, 'Hours Per Day'), hoursPerDay);
@@ -5606,7 +5633,8 @@ async function preflightDates(required, { move = showDate, entries = [], keepOpe
     const form = modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal;
     const capability = proveAllowedDates(form, required, onBounds);
     let exact = capability.exact;
-    for (const run of [].concat(trial || [])) await tryRun(form, run);
+    let grouped;
+    for (const run of [].concat(trial || [])) grouped = (await tryRun(form, run))?.grouped ?? grouped;
     for (const entry of entries.filter(entry => entry.dates)) {
       if (!exact) break;
       await typeInto(fieldByLabel(form, 'Hours Per Day'), entry.hoursPerDay);
@@ -5615,7 +5643,7 @@ async function preflightDates(required, { move = showDate, entries = [], keepOpe
     }
     proved = true;
     if (keepOpen) rememberPreflightForm(modal, personIdentity(), required);
-    return { exact, ...(keepOpen ? { modal } : {}) };
+    return { exact, ...(grouped !== undefined ? { grouped } : {}), ...(keepOpen ? { modal } : {}) };
   } catch (error) {
     await cleanupAfter(error, () => closeWindow(modal, 'Add Assignment'));
     throw error;
@@ -5659,7 +5687,7 @@ async function fillAndAdd(modal, entry, mode, onWrite, onProgress) {
   }
   onProgress('dates');
   const week = !tax && isWeekForm(form);
-  if (week && (entry.dates || !sameDay(mondayOf(entry.start), mondayOf(entry.end)))) throw new PageError('A Weekly Add Assignment takes one week at a time. Nothing was added.');
+  if (week && (entry.dates || weekRuns(entry.start, entry.end, true).length !== 1)) throw new PageError('A Weekly Add Assignment takes one week, or whole weeks in a row, at a time. Nothing was added.');
   if (entry.dates) await setDateSet(form, entry.dates);
   else await setDates(form, entry.start, entry.end);
   const hoursLabel = tax || week ? 'Hours Per Week' : 'Hours Per Day';
@@ -6379,7 +6407,7 @@ __exports.checkLoaAdded = checkLoaAdded;
 },
 "mysource/restore.js": function (__require, __exports, document, window) {
 'use strict';
-const { taxRestorePlan } = __require("./tax-restore.js");
+const { taxRestorePlan, sameTaxLive } = __require("./tax-restore.js");
 const { weeklyRestorePlan, restoreWeeklyWindow } = __require("./weekly-restore.js");
 const { cancelBatchWindows } = __require("./batch.js");
 const { recordRun } = __require("../core/run-records.js");
@@ -6708,8 +6736,7 @@ function restoreWindow(backup, options = {}) {
 async function restoreTaxWindow(backup, options = {}) {
   const on = (copy, day) => ({ days: copy.days.filter(row => sameDay(row.day, day)) });
   const equal = (a, b) => compareCopies(a, b).same;
-  const sameLive = (a, b) => equal(a, b) && a.days.every(old => b.days.some(row => row.id === old.id && row.notes === old.notes
-    && (typeof old.noteText !== 'string' || noteTextKey(row.noteText || '') === noteTextKey(old.noteText))));
+  const sameLive = sameTaxLive;
   const { today = todayOf(), onWrite = () => {}, automaticRecovery = false, previewBefore, previewDays } = options;
   const plan = await taxRestorePlan(backup, options);
   if (previewBefore && !sameLive(previewBefore, plan.before)) throw new PageError('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
@@ -7277,7 +7304,7 @@ function undoRanges(rows) {
 }
 function undoChangeWords(days) {
   const ranges = undoRanges(days.map(day => ({ day })));
-  return `Puts back the report's entries on these dates, replacing this batch's change: ${ranges.map(range=>range.dates).join('; ')}. Original notes cannot be restored.`;
+  return `Puts back the backed-up entries on these dates, replacing this batch's change: ${ranges.map(range=>range.dates).join('; ')}. Original notes cannot be restored.`;
 }
 const failedRow = row => ['failed', 'restored', 'restoreFailed', 'undoFailed'].includes(row.state);
 const orderedRows = rows => [...rows].sort((a, b) => rank(a) - rank(b));
@@ -7778,7 +7805,8 @@ const BACKUP_FILE_WORDS = {
   newer: 'This backup file was saved by a newer Snooze. Use that version to restore.',
 };
 const PEOPLE = ['Ticket', 'Person', 'Email', 'Kind', 'Result', 'Site', 'Term Date', 'Window start', 'Window end', 'Watched start', 'Watched end',
-  'Report end', 'Later days backed up', 'Note changed days', 'Can be put back', 'Action'];
+  'Report end', 'Later days backed up', 'Note changed days', 'Can be put back', 'Action', 'Not backed up after'];
+const OPTIONAL = ['Not backed up after'];
 const DAYS = ['Email', 'Date', 'Client', 'WBS', 'Hours', 'Billable', 'Utilization Generating', 'Job Code', 'Assign Code 1', 'Assign Code 2', 'Pricing ID',
   'Pricing ID read', 'Entry id', 'From'];
 const FORMAT = '1';
@@ -7803,13 +7831,14 @@ function backupFileSheets(rows, version, made = new Date()) {
     people.push([backup.ticket || row.one.record.number, backup.professional || professionalName(row.one.record), backup.email,
       row.one.record.notification?.kind === 'exit' ? 'Exit' : 'LOA', row.state, backup.site || 'daily', text(backup.termDate),
       date(backup.window.start), date(backup.window.end), date(backup.watchedWindow?.start), date(backup.watchedWindow?.end), date(backup.reportEnd),
-      backup.laterBacked ? 'Yes' : 'No', (backup.noteChangedDays || []).map(usDate).join(' '), backup.undoBlocked ? 'No: greyed Exit' : 'Yes', text(backup.plan?.action)]);
+      backup.laterBacked ? 'Yes' : 'No', (backup.noteChangedDays || []).map(usDate).join(' '), backup.undoBlocked ? 'No: greyed Exit' : 'Yes', text(backup.plan?.action),
+      backup.laterBacked ? '' : date(backup.unbackedAfter)]);
     for (const day of backup.days) days.push([backup.email, date(day.day), text(day.client), text(day.wbs), text(day.hours), text(day.billable), text(day.utilization),
       text(day.jobCode), text(day.assignCode), text(day.assignCode2), text(day.pricingId), day.pricingCaptured ? 'Yes' : 'No', text(day.id), day.fromPage ? 'Page' : 'Report']);
   }
   const check = checkValue([people, days]);
   return [
-    { name: 'People', rows: people, widths: [16, 26, 34, 8, 14, 8, 12, 12, 12, 12, 12, 12, 10, 30, 16, 12], oneLine: true },
+    { name: 'People', rows: people, widths: [16, 26, 34, 8, 14, 8, 12, 12, 12, 12, 12, 12, 10, 30, 16, 12, 12], oneLine: true },
     { name: 'Days', rows: days, widths: [34, 12, 36, 18, 8, 14, 12, 14, 14, 14, 18, 10, 14, 8], oneLine: true },
     { name: 'Check', rows: [[BACKUP_FILE_TITLE, FORMAT], ['Snooze', version], ['Saved', made.toISOString()], ['Check value', check],
       ['Do not edit this file: Restore refuses an edited file.']], widths: [20, 40] },
@@ -7835,7 +7864,7 @@ async function readBackupFile(file) {
   const trim = rows => rows.filter(row => row.some(cell => cell !== ''));
   if (!people || !days || checkValue([trim(people), trim(days)]) !== checkRows.find(row => row[0] === 'Check value')?.[1]) throw new InputFileError(BACKUP_FILE_WORDS.edited);
   const P = index(people[0]), D = index(days[0]);
-  if (PEOPLE.some(name => !(name in P)) || DAYS.some(name => !(name in D))) throw new InputFileError(BACKUP_FILE_WORDS.edited);
+  if (PEOPLE.some(name => !(name in P) && !OPTIONAL.includes(name)) || DAYS.some(name => !(name in D))) throw new InputFileError(BACKUP_FILE_WORDS.edited);
   const daysOf = new Map();
   for (const row of trim(days).slice(1)) {
     const email = row[D.Email];
@@ -7856,7 +7885,8 @@ async function readBackupFile(file) {
       reportEnd: parseDay(row[P['Report end']]), plan: { action: row[P.Action] }, days: (daysOf.get(email) || []).sort((a, b) => compareDays(a.day, b.day)),
       ...(site ? { site } : {}), ...(watched ? { watchedWindow: watched } : {}), ...(row[P['Later days backed up']] === 'Yes' ? { laterBacked: true } : {}),
       ...(row[P['Note changed days']] ? { noteChangedDays: row[P['Note changed days']].split(' ').map(parseDay) } : {}),
-      ...(greyed ? { greyedExit: true, undoBlocked: TERM_DATE_UNDO } : {}) };
+      ...(greyed ? { greyedExit: true, undoBlocked: TERM_DATE_UNDO } : {}),
+      ...(row[P['Not backed up after']] ? { unbackedAfter: parseDay(row[P['Not backed up after']]) } : {}) };
     return { ticket: row[P.Ticket], name: row[P.Person], email, kind: row[P.Kind], result: row[P.Result], backup };
   });
 }
@@ -8163,9 +8193,12 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
   batch.invalidateFiles = () => {
     filesRevision++; batch.saved = false; batch.saveMessage = ''; tell();
   };
+  let hiddenTax = [];
   const remainingTickets = () => {
     if (!Array.isArray(tickets)) return null;
-    const numbers = new Set(batch.rows.filter(row => ['ready', 'pending'].includes(row.state))
+    const notStarted = row => ['ready', 'pending', 'timeLimit'].includes(row.state) && !row.diagnostic?.changeAttempted && row !== batch.pendingRestore;
+    const rows = [...batch.rows.filter(notStarted), ...hiddenTax, ...excludedRows.filter(row => row.one.decision?.code === 'wrongSite')];
+    const numbers = new Set(rows
       .flatMap(row => [row.one.record, ...(row.one.record.duplicates || [])]).map(record => String(record.number || '').trim()).filter(Boolean));
     return numbers.size ? tickets.filter(ticket => numbers.has(String(ticket.Number || '').trim())) : null;
   };
@@ -8609,7 +8642,10 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     try { if (!loadedReports(report).length) requireDayReport(null); for (const one of loadedReports(report)) { requireDayReport(one); requireFreshReport(one, now()); } } catch (error) { reportFailure(error); batch.state = 'failed'; tell(error.message); return; }
     try { batch.site = siteReader ? siteReader() : 'consulting'; }
     catch (error) { batch.state = 'failed'; tell(error.message); return; }
-    if (batch.site === 'consulting') batch.rows = batch.rows.filter(row => row.one.record.subcategory?.site !== 'tax');
+    if (batch.site === 'consulting') {
+      hiddenTax = batch.rows.filter(row => row.one.record.subcategory?.site === 'tax');
+      batch.rows = batch.rows.filter(row => !hiddenTax.includes(row));
+    }
     const otherSite = batch.rows.filter(row => (row.one.record.subcategory?.site || 'consulting') !== batch.site || row.one.personStop?.code === 'taxTalentGroup');
     for (const row of otherSite) {
       row.one.decision = (row.one.record.subcategory?.site || 'consulting') !== batch.site
@@ -9061,6 +9097,8 @@ __exports.batchControls = batchControls;
 const { compareDays, usDate } = __require("../rules/dates.js");
 const { valueKey } = __require("../rules/prepare.js");
 const { PageError } = __require("../mysource/dom.js");
+const { compareCopies } = __require("../mysource/copy.js");
+const BACKUP_KIND = 'Snooze backup 1';
 const RESTORE_FIELDS = {
   billable: 'Billable', utilization: 'Utilization Generating', jobCode: 'Job Code',
   assignCode: 'Assign Code 1', assignCode2: 'Assign Code 2',
@@ -9192,19 +9230,30 @@ function compareByDay(pageDays, reportRows, from = null, comparedFields = null) 
   differences.sort((x, y) => x.iso.localeCompare(y.iso));
   return differences;
 }
+const pageBackupRow = row => ({
+  day: row.day, date: usDate(row.day), hours: Number(row.hours), client: row.client, wbs: row.wbs || '', billable: row.billable || '', utilization: row.utilization || '',
+  jobCode: row.jobCode || '', assignCode: row.assignCode || '', assignCode2: row.assignCode2 || '', pricingId: row.pricingId || '', pricingCaptured: true, notes: 0, fromPage: true,
+});
+const pageRowsAfter = (reportEnd, copy) => !reportEnd || !copy?.window ? [] : copy.days
+  .filter(row => compareDays(row.day, reportEnd) > 0 && compareDays(row.day, copy.window.end) <= 0);
+const laterDays = (reportEnd, copy) => pageRowsAfter(reportEnd, copy).map(pageBackupRow);
 function withLaterDays(backup, copy, entriesToAdd) {
   if (!backup?.reportEnd || backup.site || !copy?.window || compareDays(copy.window.end, backup.reportEnd) <= 0) return backup;
-  const later = copy.days.filter(row => compareDays(row.day, backup.reportEnd) > 0 && compareDays(row.day, copy.window.end) <= 0).map(row => ({
-    day: row.day, date: usDate(row.day), hours: Number(row.hours), client: row.client, wbs: row.wbs || '', billable: row.billable || '', utilization: row.utilization || '',
-    jobCode: row.jobCode || '', assignCode: row.assignCode || '', assignCode2: row.assignCode2 || '', pricingId: row.pricingId || '', pricingCaptured: true, notes: 0, fromPage: true,
-  }));
+  const later = laterDays(backup.reportEnd, copy);
   const window = { ...backup.window, end: copy.window.end };
   const days = [...backup.days, ...later].sort((a, b) => compareDays(a.day, b.day) || String(a.client).localeCompare(String(b.client)));
   if (entriesToAdd({ window, days }).problems.length) return backup;
   return Object.assign(backup, { window, days, laterBacked: true });
 }
+function recordLaterChange(prepared, after, notesChanged = false) {
+  if (!prepared.reportEnd) return;
+  const tail = copy => ({ days: copy.days.filter(row => compareDays(row.day, prepared.reportEnd) > 0) });
+  if (prepared.backup.laterBacked) return;
+  if (notesChanged || !compareCopies(tail(prepared.copy), tail(after)).same) prepared.backup.unbackedAfter = prepared.reportEnd;
+}
 const pastReportWarning = backup => backup?.unbackedAfter && !backup.laterBacked
   ? `Days after ${usDate(backup.unbackedAfter)} are not backed up; Undo does not put them back.` : '';
+__exports.BACKUP_KIND = BACKUP_KIND;
 __exports.RESTORE_FIELDS = RESTORE_FIELDS;
 __exports.withPagePricing = withPagePricing;
 __exports.validatePageDays = validatePageDays;
@@ -9212,7 +9261,11 @@ __exports.reportComparedFields = reportComparedFields;
 __exports.clientOf = clientOf;
 __exports.reportDays = reportDays;
 __exports.compareByDay = compareByDay;
+__exports.pageBackupRow = pageBackupRow;
+__exports.pageRowsAfter = pageRowsAfter;
+__exports.laterDays = laterDays;
 __exports.withLaterDays = withLaterDays;
+__exports.recordLaterChange = recordLaterChange;
 __exports.pastReportWarning = pastReportWarning;
 },
 "run/audit-loa.js": function (__require, __exports, document, window) {
@@ -9453,18 +9506,17 @@ const { PageError, withPersonGuard, stopFlagged, cleanupAfter } = __require("../
 const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, beginScheduleTurn, exitCalendarSnapshot, settledExitCalendar, allowWeeklyRows, allowGreyedWeekStart, weeklyRowsShown } = __require("../mysource/schedule.js");
 const { leaveRuns, leavePeriod, loaBlocks, dayRanges, inRange } = __require("../rules/leaves.js");
 const { deleteAll, deleteRange, splitDeleteWeeks, addAssignment, preflightDates, refreshNotes, setAssignmentHours } = __require("../mysource/write.js");
-const { compareCopies, copyWindow, entriesToAdd, dayOf, ENTRY_FIELDS, knownAssignmentRows } = __require("../mysource/copy.js");
+const { compareCopies, copyWindow, entriesToAdd, dayOf, knownAssignmentRows } = __require("../mysource/copy.js");
 const { restoreWindow, restorePlan } = __require("../mysource/restore.js");
 const { LOA_CLIENT, DNS_CLIENT, checkDnsAdded, checkLoaAdded } = __require("../mysource/checks.js");
-const { compareByDay, reportDays, withPagePricing, validatePageDays, withLaterDays } = __require("./backup.js");
+const { BACKUP_KIND, recordLaterChange, compareByDay, reportDays, withPagePricing, validatePageDays, withLaterDays, laterDays } = __require("./backup.js");
 const { requireDayReport, reportAssignPeriod } = __require("../files/report.js");
 const { auditLoaExact } = __require("./audit-loa.js");
 const { checkPerson, termDayOf } = __require("../rules/shared.js");
 const { exitMailChoice, decideExit } = __require("../rules/exit.js");
 const { reasonLine, notOnReportReason } = __require("../screen/wording.js");
-const { batchCover, closeSkippedPerson, sessionExpired, cancelBatchWindows } = __require("../mysource/batch.js");
+const { batchCover, closeSkippedPerson, sessionExpired } = __require("../mysource/batch.js");
 const { isEditableDay } = __require("../mysource/editability.js");
-const BACKUP_KIND = 'Snooze backup 1';
 const HOURS_PER_DAY = 8;
 const TERM_DATE_UNDO = 'Cannot undo: MySource refuses entries after the Term Date';
 const firstDifference = first => `${first.date}, ${first.client}: ${first.field}${Math.abs(first.page - first.report) > 0.001 ? `; page ${first.page}h, Staff Schedule Hours Report ${first.report}h` : ''}`;
@@ -9568,9 +9620,10 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
   for (const day of [window.end, firstEditable]) {
     if (!isEditableDay(day, today, term)) return { stop: 'Future leave dates are greyed out. Nothing was changed; By hand.', reasonCode: 'futureScheduleGreyed' };
   }
-  const { problems } = entriesToAdd({ window: watchedWindow, days });
+  const reachesLater = !slice.liveScope && compareDays(window.end, reportEnd) > 0;
+  const { problems } = entriesToAdd({ window: watchedWindow, days: [...days, ...(reachesLater ? laterDays(reportEnd, copy) : [])] });
   if (problems.length) return { stop: `Snooze could not put these days back if needed: ${problems.join('; ')}.` };
-  const requiredDates = [...workingDays(plan.loaStart, plan.loaEnd), ...runs.flatMap(run => run.rows.map(row => row.day)).filter(day => compareDays(day, reportEnd) <= 0)]
+  const requiredDates = [...workingDays(plan.loaStart, plan.loaEnd), ...runs.flatMap(run => run.rows.map(row => row.day))]
     .filter(day => compareDays(day, today) >= 0);
   const retained = copy.days.filter(row => inRange(row.day, plan.loaStart || window.start, plan.loaEnd || window.end));
   const canRefreshNotes = knownAssignmentRows(futureCopy).canRefreshNotes;
@@ -9603,7 +9656,7 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
     kind: BACKUP_KIND, snooze: version, taken: copy.taken, ticket: record.number, email: record.email,
     professional: record.person.professional, plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')), window: { ...watchedWindow, end: compareDays(watchedWindow.end, reportEnd) < 0 ? watchedWindow.end : reportEnd }, days, reportEnd, termDate: termText,
     report: slice.fileName || 'the Staff Schedule Hours Report by Day',
-    noteChangedDays: copy.days.filter(row => inReport(row) && valueKey(row.client) === valueKey(LOA_CLIENT)
+    noteChangedDays: copy.days.filter(row => valueKey(row.client) === valueKey(LOA_CLIENT)
       && inRange(row.day, plan.loaStart, plan.loaEnd)).map(row => row.day),
   };
   if (!slice.liveScope) withLaterDays(backup, copy, entriesToAdd);
@@ -9623,12 +9676,6 @@ async function prepareAuditReadOnly(one, today, step) {
     && auditLoaExact({ slice: one.slice, email: one.record.email, start: plan.leaveStart, end: plan.loaEnd, today });
   return { nothing: loaExact ? 'A&A: LOA already exact; no schedule change.' : 'A&A: no schedule change.', identity, loaExact,
     checks: [['✓', loaExact ? 'The report shows the LOA exactly; nothing changed' : 'Schedule read only; nothing changed', '']] };
-}
-function recordLaterChange(prepared, after, notesChanged = false) {
-  if (!prepared.reportEnd) return;
-  const tail = copy => ({ days: copy.days.filter(row => compareDays(row.day, prepared.reportEnd) > 0) });
-  if (prepared.backup.laterBacked) return;
-  if (notesChanged || !compareCopies(tail(prepared.copy), tail(after)).same) prepared.backup.unbackedAfter = prepared.reportEnd;
 }
 function apply(one, prepared, options = {}) {
   return withPersonGuard(probe => checkPersonIdentity(prepared.identity, 'identity check', probe), () => applyRecorded(one, prepared, options));
@@ -9987,11 +10034,12 @@ async function prepareExit(one, version, today, { step }) {
     const beyond = copy.days.filter(row => !inReport(row));
     validatePageDays(beyond);
     const days = withPagePricing(reportPart, copy.days.filter(inReport), inChange);
-    const { problems } = greyedExit ? { problems: [] } : entriesToAdd({ window: watchedWindow, days });
+    const reachesLater = !slice.liveScope && (copy.days.some(row => !inReport(row) && inChange(row)) || addDns && compareDays(editableDnsEnd, reportEnd) > 0);
+    const { problems } = greyedExit ? { problems: [] } : entriesToAdd({ window: watchedWindow, days: [...days, ...(reachesLater ? laterDays(reportEnd, copy) : [])] });
     if (problems.length) return { stop: `Snooze could not put these days back if needed: ${problems.join('; ')}.` };
     const backup = { kind: BACKUP_KIND, snooze: version, taken: copy.taken, ticket: record.number, email: record.email,
       professional: professionalName(record), plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')), window: { ...watchedWindow, end: compareDays(watchedWindow.end, reportEnd) < 0 ? watchedWindow.end : reportEnd }, days, reportEnd, termDate: termText,
-      ...((addDns || repairDays.length) && !withoutNotes ? { noteChangedDays: copy.days.filter(row => inReport(row) && valueKey(row.client) === valueKey(DNS_CLIENT)
+      ...((addDns || repairDays.length) && !withoutNotes ? { noteChangedDays: copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT)
         && (addDns && inRange(row.day, plan.dnsStart, editableDnsEnd) || repairDays.some(day => compareDays(day, row.day) === 0))).map(row => row.day) } : {}),
       report: slice.fileName || 'the Staff Schedule Hours Report by Day',
       ...(greyedExit ? { greyedExit: true, undoBlocked: TERM_DATE_UNDO } : {}) };
@@ -10018,7 +10066,7 @@ async function prepareExit(one, version, today, { step }) {
         if (dateStop.stop) return dateStop;
       }
     } else if (!greyedExit) {
-      const dates = [...(addDns ? workingDays(plan.dnsStart, editableDnsEnd) : []), ...copy.days.filter(row => inChange(row) && inReport(row)).map(row => row.day)];
+      const dates = [...(addDns ? workingDays(plan.dnsStart, editableDnsEnd) : []), ...copy.days.filter(inChange).map(row => row.day)];
       if (exitReplaceEligible(plan, { exitRuns, copy, addDns, earlyDns, editableDnsEnd })) exitDatePreflight = { dates, anchor: today };
       else {
         const dateStop = await caseDates(dates, identity, step, { anchor: today });
@@ -10182,7 +10230,7 @@ async function applyTax(one, prepared, { step = fn => fn(), onWrite = () => {} }
   const written = async () => { await requirePersonIdentity(identity); await onWrite(); };
   const prove = async (expected, notes = []) => {
     const after = await copyWindow(window);
-    if (!compareCopies({ days: prepared.copy.days.filter(row => compareDays(row.day, prepared.reportEnd) > 0) }, { days: after.days.filter(row => compareDays(row.day, prepared.reportEnd) > 0) }).same) prepared.backup.unbackedAfter = prepared.reportEnd;
+    recordLaterChange(prepared, after);
     if (!compareCopies({ days: expected }, after).same || expected.some(old => old.id && !after.days.some(row => row.id === old.id && row.notes === old.notes)) || notes.some(wanted => !after.days.some(row => same(row.day, wanted.day) && match(row, wanted) && row.hours === wanted.hours && row.notes > 0))) {
       throw new PageError('The Tax schedule step could not be proved. Restore this person before continuing.');
     }
@@ -10254,7 +10302,7 @@ const { openPerson, personIdentity, checkPersonIdentity, canAddAssignment } = __
 const { showDate, calendarHolds } = __require("../mysource/calendar.js");
 const { copyWindow, compareCopies } = __require("../mysource/copy.js");
 const { preflightDates } = __require("../mysource/write.js");
-const { reportDays, compareByDay } = __require("./backup.js");
+const { BACKUP_KIND, reportDays, compareByDay } = __require("./backup.js");
 const { recordRun } = __require("../core/run-records.js");
 const { reportDifferenceSummary } = __require("../files/report-diagnostic.js");
 const within = (day, start, end) => compareDays(day, start) >= 0 && compareDays(day, end) <= 0;
@@ -10296,6 +10344,7 @@ async function prepareTax(one, version, today, { step = fn => fn() } = {}) {
   }) });
   if (proposal.outcome === 'byHand') return { stop: reasonLine(proposal), reasonCode: proposal.code };
   if (proposal.code === 'taxPastEnd' || proposal.code === 'leaveOver') return { nothing: reasonLine(proposal), code: proposal.code, identity, copy, checks: [], kept: proposal.kept };
+  if (proposal.weeks.some(week => compareDays(week.end, reportEnd) > 0)) return { stop: `This Tax change reaches past the Staff Schedule Hours Report's last day (${usDate(reportEnd)}); those days are not backed up for Tax. Nothing was changed; By hand.`, reasonCode: 'taxPastReport' };
   if (proposal.weeks.some(week => copy.days.some(row => loa(row) && same(mondayOf(row.day), week.monday) && compareDays(row.day, today) >= 0 && compareDays(row.day, week.start) < 0))) return { stop: 'An existing Tax weekly LOA starts outside the partial-week change. Nothing was changed; By hand.' };
   for (const week of proposal.weeks) {
     const covered = copy.days.filter(row => loa(row) && compareDays(row.day, today) < 0 && same(mondayOf(row.day), week.monday)).flatMap(row =>
@@ -10311,7 +10360,7 @@ async function prepareTax(one, version, today, { step = fn => fn() } = {}) {
   }
   const backupEnd = compareDays(copy.window.end, reportEnd) < 0 ? copy.window.end : reportEnd;
   const window = copy.window;
-  const backup = { kind: 'Snooze backup 1', site: 'tax', snooze: version, email: one.record.email, professional: one.record.person.professional, ticket: one.record.number,
+  const backup = { kind: BACKUP_KIND, site: 'tax', snooze: version, email: one.record.email, professional: one.record.person.professional, ticket: one.record.number,
     taken: copy.taken, window: { start, end: backupEnd }, watchedWindow: window, today, reportEnd, days: report.filter(row => compareDays(row.day, backupEnd) <= 0),
     plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')), report: one.slice.fileName || 'the Staff Schedule Hours Report by Day' };
   const pairedIds = new Set();
@@ -10348,9 +10397,9 @@ const { exitMailChoice } = __require("../rules/exit.js");
 const { PageError, withPersonGuard } = __require("../mysource/dom.js");
 const { checkPersonIdentity, waitForPersonIdentity } = __require("../mysource/schedule.js");
 const { copyWindow, compareCopies } = __require("../mysource/copy.js");
-const { deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("../mysource/write.js");
+const { deleteRange, addAssignment, preflightDates, setAssignmentHours, weekRuns } = __require("../mysource/write.js");
 const { DNS_CLIENT } = __require("../mysource/checks.js");
-const { compareByDay, reportDays, withPagePricing } = __require("./backup.js");
+const { compareByDay, reportDays, withPagePricing, validatePageDays, pageRowsAfter, pageBackupRow, recordLaterChange } = __require("./backup.js");
 const { recordRun } = __require("../core/run-records.js");
 const { sameDayClient } = __require("../mysource/weekly-restore.js");
 const { reportDifferenceSummary } = __require("../files/report-diagnostic.js");
@@ -10394,6 +10443,13 @@ async function prepareWeeklyExit(ctx) {
     return { nothing: weekly.dnsInPlace ? 'DNS already there; no change' : 'Schedule greyed out: no schedule change.',
       alreadyDone: weekly.dnsInPlace, checks: [], identity, copy, greyedExit, leftUnchanged };
   }
+  const later = pageRowsAfter(reportEnd, copy);
+  const reachesLater = !greyedExit && (changes.some(({ row }) => !inReport(row)) || !!weekly.addDns && compareDays(weekly.addDns.end, reportEnd) > 0);
+  if (reachesLater) validatePageDays(later);
+  let laterBacked = compareDays(copy.window.end, reportEnd) > 0;
+  if (!reachesLater) try { validatePageDays(later); } catch (error) { if (!(error instanceof PageError)) throw error; laterBacked = false; }
+  const noPutBack = weekly.remove.filter(row => !inReport(row) && !workingDays(row.day, addDays(mondayOf(row.day), 4)).length);
+  if (noPutBack.length) return { stop: `Snooze could not put these days back if needed: ${noPutBack.length} weekend day${noPutBack.length === 1 ? '' : 's'} (${usDate(noPutBack[0].day)} …).` };
   const paired = new Set();
   const days = withPagePricing(reportPart, copy.days.filter(inReport)).map(old => {
     const row = copy.days.find(row => !paired.has(row.id) && compareCopies({ days: [{ ...old, pricingId: row.pricingId }] }, { days: [row] }).same);
@@ -10403,14 +10459,19 @@ async function prepareWeeklyExit(ctx) {
   });
   const backup = { kind: backupKind, site: 'weekly', snooze: version, taken: copy.taken, ticket: record.number, email: record.email,
     professional: professionalName(record), plan: Object.fromEntries(Object.entries(plan).filter(([key]) => key !== 'notes')),
-    window: { start: readStart, end: backupEnd }, watchedWindow: copy.window, today, reportEnd, days, termDate: termText,
+    window: { start: readStart, end: laterBacked ? copy.window.end : backupEnd }, watchedWindow: copy.window, today, reportEnd,
+    days: laterBacked ? [...days, ...later.map(row => ({ ...pageBackupRow(row), id: row.id }))] : days, termDate: termText, ...(laterBacked ? { laterBacked: true } : {}),
     report: slice.fileName || 'the Staff Schedule Hours Report by Day',
     ...(greyedExit ? { greyedExit: true, undoBlocked } : {}) };
+  let dnsRuns = [];
   if (!greyedExit) {
-    const dates = [...(weekly.addDns ? workingDays(weekly.addDns.start, weekly.addDns.end) : []), ...weekly.remove.filter(inReport).map(row => row.day)];
+    const dates = [...(weekly.addDns ? workingDays(weekly.addDns.start, weekly.addDns.end) : []), ...weekly.remove.filter(row => inReport(row) || laterBacked).map(row => row.day)];
     if (dates.length) {
-      try { await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => preflightDates(dates, { anchor: dates.reduce((a, b) => compareDays(a, b) <= 0 ? a : b),
-        ...(weekly.addDns ? { trial: { start: weekly.addDns.start, end: weekly.addDns.end, hoursPerDay: 8, label: 'DNS' } } : {}) }))); }
+      try {
+        const held = await step(() => withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => preflightDates(dates, { anchor: dates.reduce((a, b) => compareDays(a, b) <= 0 ? a : b),
+          ...(weekly.addDns ? { trial: { start: weekly.addDns.start, end: weekly.addDns.end, hoursPerDay: 8, label: 'DNS' } } : {}) })));
+        if (weekly.addDns) dnsRuns = weekRuns(weekly.addDns.start, weekly.addDns.end, !!held?.grouped);
+      }
       catch (error) {
         if (error.trialDates) return { stop: error.message, reasonCode: 'addFormDates' };
         if (!/website.*allowed|Required dates/.test(error.message)) throw error;
@@ -10419,7 +10480,7 @@ async function prepareWeeklyExit(ctx) {
     }
   }
   return { weekly, greyedExit, identity, copy, watched: copy, window: copy.window, watchedWindow: copy.window, backup, reportEnd, checks: [],
-    removing: [...removing.values()], daysCompared: new Set(copy.days.map(row => usDate(row.day))).size, addDns: !!weekly.addDns, leftUnchanged };
+    removing: [...removing.values()], daysCompared: new Set(copy.days.map(row => usDate(row.day))).size, addDns: !!weekly.addDns, dnsRuns, leftUnchanged };
 }
 async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () => {} } = {}) {
   if (!prepared.backup || prepared.backup.email !== one.record.email || prepared.backup.site !== 'weekly') throw new PageError('The Weekly backup is not ready. Nothing was changed.');
@@ -10467,17 +10528,18 @@ async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () 
     const clients = weekly.keptDns.length ? { clients: [...new Set(laterRows.map(row => row.client))] } : {};
     await removeIn({ start: nextMonday, end: window.end, weekEndFriday: true, ...clients }, laterRows);
   }
-  if (weekly.addDns) await step(async () => {
-    await addAssignment({ client: DNS_CLIENT, start: weekly.addDns.start, end: weekly.addDns.end, hoursPerDay: 8,
+  const runs = weekly.addDns ? prepared.dnsRuns?.length ? prepared.dnsRuns : weekRuns(weekly.addDns.start, weekly.addDns.end) : [];
+  for (const run of runs) await step(async () => {
+    await addAssignment({ client: DNS_CLIENT, start: run.start, end: run.end, hoursPerDay: 8,
       billable: 'Non-Billable', utilization: 'No', notes: '' }, 'Normal', { onWrite: written, weekly: true });
-    const expected = weekly.expected.map(row => row.id ? current.days.find(live => live.id === row.id) || row : { jobCode: '', assignCode: '', assignCode2: '', wbs: '', pricingId: '', notes: 0, ...row });
+    const expected = weekly.expected.filter(row => row.id || compareDays(row.day, run.end) <= 0)
+      .map(row => row.id ? current.days.find(live => live.id === row.id) || row : { jobCode: '', assignCode: '', assignCode2: '', wbs: '', pricingId: '', notes: 0, ...row });
     await prove(expected);
   });
   const after = await read();
   const same = compareCopies({ days: weekly.expected.map(row => ({ jobCode: '', assignCode: '', assignCode2: '', wbs: '', pricingId: '', ...row })) }, after).same;
   if (!same) throw new PageError(stopWords);
-  const tail = copy => ({ days: copy.days.filter(row => compareDays(row.day, prepared.reportEnd) > 0) });
-  if (prepared.reportEnd && prepared.backup && !compareCopies(tail(prepared.copy), tail(after)).same) prepared.backup.unbackedAfter = prepared.reportEnd;
+  recordLaterChange(prepared, after);
   return { ok: true, method: 'Weekly hours edit, delete and DNS add', after, checks: [['✓', 'Weekly rows checked week by week', '']], problems: [] };
 }
 __exports.prepareWeeklyExit = prepareWeeklyExit;
@@ -10575,6 +10637,7 @@ const { bulkRestorePeople, backupRestorePeople, previewBulkRestore, applyBulkRes
 const { isBackupFile, readBackupFile } = __require("../files/backup-file.js");
 const { batchCover } = __require("../mysource/batch.js");
 const { dayRanges } = __require("../rules/leaves.js");
+const { usDate } = __require("../rules/dates.js");
 const { xlsxBytes } = __require("../files/xlsx-writer.js");
 function restoreReportButton(work, body, onBack) {
   const input = el('input', { type: 'file', accept: '.csv,.xlsx', hidden: true });
@@ -10594,6 +10657,9 @@ function restoreReportButton(work, body, onBack) {
   return el('div', { class: 'restore-entry' }, button, recoveryGuide(), input, message);
 }
 const RESTORE_TITLE = 'Restore from a backup or report';
+const RESULT_LABELS = { restored: 'Restored', partial: 'Partly restored', byHand: 'By hand', notRun: 'Not run', paused: 'Paused' };
+const notBackedUp = backup => backup?.unbackedAfter && !backup.laterBacked ? ` · days after ${usDate(backup.unbackedAfter)} were not backed up and are not put back` : '';
+const resultLabel = row => (RESULT_LABELS[row.state] || 'Not run') + (['restored', 'partial'].includes(row.state) ? notBackedUp(row.person.backup) : '');
 function mountRestorePanel(people, work, body, onBack, { fromBackup = false } = {}) {
   const selected = new Set();
   let previews = null, results = null, active = false, restoring = false, message = '';
@@ -10662,14 +10728,14 @@ function mountRestorePanel(people, work, body, onBack, { fromBackup = false } = 
       const row = rows.get(person.email);
       const preview = row?.preview || previews?.rows.find(row => row.person.email === person.email)?.preview;
       const chosen = selected.has(person.email);
-      const status = row?.state === 'checking' ? restoring ? 'Restoring…' : 'Checking…' : results ? ({ restored: 'Restored', partial: 'Partly restored', byHand: 'By hand', paused: 'Paused' }[row?.state] || (chosen ? 'Not run' : ''))
+      const status = row?.state === 'checking' ? restoring ? 'Restoring…' : 'Checking…' : results ? row && row.state !== 'notRun' ? resultLabel(row) : chosen ? 'Not run' : ''
         : checked && chosen ? preview ? preview.changedDays.length ? `${preview.changedDays.length} days` : preview.skippedLocked?.length ? 'Greyed out' : 'No changes' : row?.state === 'byHand' ? 'By hand' : row?.state === 'paused' ? 'Paused' : 'Not checked' : chosen ? 'Selected' : '';
       const input = el('input', { type: 'checkbox', checked: chosen, disabled: active || checked || !!results || !!person.stop || !person.period,
         'data-person': person.email, 'aria-label': person.name, onchange: () => {
           if (input.checked) selected.add(person.email); else selected.delete(person.email);
           draw();
         } });
-      const detail = preview && chosen ? preview.changedDays.length ? dayRanges(preview.changedDays) : preview.skippedLocked?.length ? 'No editable changes' : 'Already matches the report'
+      const detail = preview && chosen ? preview.changedDays.length ? dayRanges(preview.changedDays) : preview.skippedLocked?.length ? 'No editable changes' : fromBackup ? 'Already matches the backup' : 'Already matches the report'
         : person.period ? '' : 'Past dates only';
       const card = el('label', { class: `restore-person${chosen ? ' selected' : ''}` }, input,
         el('span', { class: 'restore-main' }, el('strong', {}, `${chosen?'\u2713 ':''}${person.name}`), el('span', { class: 'restore-state' }, status)),
@@ -10679,7 +10745,7 @@ function mountRestorePanel(people, work, body, onBack, { fromBackup = false } = 
       if (person.stop || row?.message) card.append(el('div', { class: 'restore-warning' }, person.stop || row.message));
       list.append(card);
     }
-    if (!people.length) list.append(el('div', { class: 'dates' }, 'No people found in this daily report.'));
+    if (!people.length) list.append(el('div', { class: 'dates' }, fromBackup ? 'No people in this backup file.' : 'No people found in this daily report.'));
     box.append(list);
     const footer = el('div', { class: 'restore-footer' });
     const pending = results?.rows.filter(row => ['notRun', 'paused'].includes(row.state)).length || 0;
@@ -10690,7 +10756,7 @@ function mountRestorePanel(people, work, body, onBack, { fromBackup = false } = 
     if (message) footer.append(el('div', { class: 'warn', role: 'status' }, message));
     const action = results
       ? el('button', { class: 'blue', disabled: active, onclick: () => {
-        const table = [['Person', 'Result', 'Planned dates', 'Skipped dates', 'Reason'], ...results.rows.map(row => [row.person.name, ({restored:'Restored',partial:'Partly restored',byHand:'By hand',notRun:'Not run',paused:'Paused'})[row.state] || 'Not run',
+        const table = [['Person', 'Result', 'Planned dates', 'Skipped dates', 'Reason'], ...results.rows.map(row => [row.person.name, resultLabel(row),
           dayRanges(previews?.rows.find(prior => prior.person.email === row.person.email)?.preview?.changedDays || []),
           dayRanges(row.result?.skippedLocked || previews?.rows.find(prior => prior.person.email === row.person.email)?.preview?.skippedLocked || []), row.message || ''])];
         saveFile('Snooze Restore results.xlsx', xlsxBytes([{ name: 'Restore results', rows: table }]), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -10705,6 +10771,7 @@ function mountRestorePanel(people, work, body, onBack, { fromBackup = false } = 
 }
 __exports.restoreReportButton = restoreReportButton;
 __exports.RESTORE_TITLE = RESTORE_TITLE;
+__exports.resultLabel = resultLabel;
 __exports.mountRestorePanel = mountRestorePanel;
 },
 "run/live-connection.js": function (__require, __exports, document, window) {
@@ -15320,10 +15387,10 @@ function start(version) {
     delete work.host.dataset.batchReserved;
     for (const listener of work.listeners) listener();
   };
-  const loadReport = async (file, replace = null) => {
+  const loadReport = async (file, replace = null, unpacked = null) => {
     const read = beginRead(); if (!read) return;
     try {
-      const next = await readReport(file);
+      const next = await readReport(file, undefined, unpacked);
       if (!currentRead(read)) return;
       requireFreshReport(next);
       const loaded = addLoadedReport(data, next, readSite(), replace);
@@ -15346,7 +15413,8 @@ function start(version) {
     try {
       kinds = await Promise.all(files.map(async file => {
         const copy = new File([await file.arrayBuffer()], file.name, { type: file.type || '' });
-        return { file: copy, kind: await fileKind(copy) || fallback };
+        let workbook = null;
+        return { file: copy, kind: await fileKind(copy, read => { workbook = read; }) || fallback, workbook };
       }));
     } catch (error) { if (currentRead(read)) errorLine(inputReadError(error, fallback === 'tickets' ? 'The ServiceNow export' : 'The Staff Schedule Hours Report').message); return; }
     finally { endRead(read); }
@@ -15355,7 +15423,7 @@ function start(version) {
     if (export_.length > 1) { errorLine(DROP_WORDS.twoExports); return; }
     if (!tickets && !export_.length) { errorLine(DROP_WORDS.exportFirst); return; }
     if (export_.length) { await loadTickets(export_[0].file); if (!tickets || body.querySelector('.load-error')) return; }
-    for (const { file } of reports) { await loadReport(file); if (body.querySelector('.load-error')) return; }
+    for (const { file, workbook } of reports) { await loadReport(file, null, workbook); if (body.querySelector('.load-error')) return; }
   };
   work.newBatch = () => {
     if (work.fileRead) { work.fileRead = null; loading = work.busy = false; delete work.host.dataset.batchReserved; }
@@ -15401,5 +15469,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.14.0");
+__snoozeLoad("screen/panel.js").start("0.14.1");
 })();
