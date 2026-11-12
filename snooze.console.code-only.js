@@ -1,4 +1,4 @@
-// v0.13.9
+// v0.14.0
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -7364,6 +7364,7 @@ const { professionalName, rememberPageName, emailKey } = __require("../rules/pre
 const { reasonLine, notOnReportReason } = __require("../screen/wording.js");
 const { dayRanges } = __require("../rules/leaves.js");
 const { runReportDocx } = __require("./run-report-docx.js");
+const { backupFileSheets, backupFileName, backupFilePeople } = __require("./backup-file.js");
 const { loadedReports, reportKind } = __require("./report.js");
 function needsPersonPicture(row) {
   if (row.state === 'done') return true;
@@ -7670,7 +7671,7 @@ function packageCheck(rows, files) {
 }
 const REMAINING_NAME = 'Tickets still to do.xlsx';
 const REMAINING_COLUMNS = ['Number', 'Name', 'Email', 'Description', 'Subcategory 1', 'Subcategory 2'];
-function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupReport = null, runReport = '', remainingTickets = null } = {}) {
+function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupReport = null, runReport = '', remainingTickets = null, version = '' } = {}) {
   const attachments = new Map();
   const files = [];
   const folders = personFolders(rows);
@@ -7728,6 +7729,7 @@ function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupRe
     const prefix = Array.isArray(backupReport) ? `${reportKind(report) === 'audit' ? 'Audit' : 'Consulting'} - ` : '';
     files.push({ name: `Backup/${prefix}${safeName(stem)}${extension}`, blob: report.sourceFile });
   }
+  if (backupFilePeople(rows).length) files.push({ name: backupFileName(excelName), blob: new Blob([xlsxBytes(backupFileSheets(rows, version))], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) });
   if (remainingTickets?.length) files.push({ name: REMAINING_NAME, blob: new Blob([xlsxBytes([{ name: 'Tickets', rows: [REMAINING_COLUMNS,
     ...remainingTickets.map(ticket => REMAINING_COLUMNS.map(column => String(ticket[column] ?? '')))] }])], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) });
   if (runReport) files.push({ name: 'Snooze run report.docx', blob: new Blob([runReportDocx(runReport)], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }) });
@@ -7741,8 +7743,8 @@ function auditRequestBytes(clients) {
   const sheetXml = () => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>${widths.map((width, i) => `<col min="${i + 1}" max="${i + 1}" width="${width}" customWidth="1"/>`).join('')}</cols><sheetData><row r="1">${fields.map((field, i) => cell(`${column(i)}1`, field, i === 1 || i === 2 ? 0 : 1)).join('')}</row>${clients.map((client, i) => `<row r="${i + 2}">${fields.map((_, c) => cell(`${column(c)}${i + 2}`, c === 1 ? client.client : c === 2 ? client.wbs : '')).join('')}</row>`).join('')}</sheetData></worksheet>`;
   return workbookBytes([{ name: 'Audit Request Template' }], { xml, sheetXml, styles });
 }
-async function saveBatch(rows, signOff, { excelName = batchExcelName(), backupReport = null, runReport = '', batchLabel = excelName.replace(/\.xlsx$/, ''), packVersion = 1, remainingTickets = null } = {}) {
-  const files = batchFiles(rows, signOff, { excelName, backupReport, runReport, remainingTickets });
+async function saveBatch(rows, signOff, { excelName = batchExcelName(), backupReport = null, runReport = '', batchLabel = excelName.replace(/\.xlsx$/, ''), packVersion = 1, remainingTickets = null, version = '' } = {}) {
+  const files = batchFiles(rows, signOff, { excelName, backupReport, runReport, remainingTickets, version });
   const parts = await Promise.all(files.map(async file => [file.name, new Uint8Array(await file.blob.arrayBuffer())]));
   const name = `${batchLabel} v${packVersion}.zip`;
   saveFile(name, new Blob([zip(parts)], { type: 'application/zip' }));
@@ -7760,6 +7762,112 @@ __exports.packageCheck = packageCheck;
 __exports.REMAINING_NAME = REMAINING_NAME;
 __exports.batchFiles = batchFiles;
 __exports.saveBatch = saveBatch;
+},
+"files/backup-file.js": function (__require, __exports, document, window) {
+'use strict';
+const { reportWorkbook, inputReadError, InputFileError } = __require("../servicenow/files.js");
+const { usDate, compareDays } = __require("../rules/dates.js");
+const { dayOf } = __require("../mysource/copy.js");
+const { professionalName } = __require("../rules/prepare.js");
+const { BACKUP_KIND, TERM_DATE_UNDO } = __require("../run/work.js");
+const BACKUP_FILE_TITLE = 'Snooze backup file';
+const backupFileName = excelName => `Backup/${excelName.replace(/^Snooze batch /, 'Snooze backup ')}`;
+const BACKUP_FILE_WORDS = {
+  edited: 'This backup file was changed after Snooze saved it. Nothing was restored; use the file from the zip as it was saved.',
+  notBackup: 'This is not a Snooze backup file.',
+  newer: 'This backup file was saved by a newer Snooze. Use that version to restore.',
+};
+const PEOPLE = ['Ticket', 'Person', 'Email', 'Kind', 'Result', 'Site', 'Term Date', 'Window start', 'Window end', 'Watched start', 'Watched end',
+  'Report end', 'Later days backed up', 'Note changed days', 'Can be put back', 'Action'];
+const DAYS = ['Email', 'Date', 'Client', 'WBS', 'Hours', 'Billable', 'Utilization Generating', 'Job Code', 'Assign Code 1', 'Assign Code 2', 'Pricing ID',
+  'Pricing ID read', 'Entry id', 'From'];
+const FORMAT = '1';
+const date = day => day ? usDate(day) : '';
+const text = value => value === undefined || value === null ? '' : String(value);
+function checkValue(sheets) {
+  const cells = row => { const out = row.map(text); while (out.length && out.at(-1) === '') out.pop(); return out; };
+  const source = JSON.stringify(sheets.map(rows => rows.map(cells).filter(row => row.length)));
+  let a = 0x811c9dc5, b = 0x01000193 ^ source.length;
+  for (let i = 0; i < source.length; i++) {
+    const c = source.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193) >>> 0;
+    b = Math.imul(b ^ c ^ (a >>> 7), 0x5bd1e995) >>> 0;
+  }
+  return a.toString(16).padStart(8, '0') + b.toString(16).padStart(8, '0');
+}
+const backupFilePeople = rows => rows.filter(row => row.prepared?.backup && !row.prepared.backup.diagnostic && row.diagnostic?.changeAttempted);
+function backupFileSheets(rows, version, made = new Date()) {
+  const people = [PEOPLE], days = [DAYS];
+  for (const row of backupFilePeople(rows)) {
+    const backup = row.prepared.backup;
+    people.push([backup.ticket || row.one.record.number, backup.professional || professionalName(row.one.record), backup.email,
+      row.one.record.notification?.kind === 'exit' ? 'Exit' : 'LOA', row.state, backup.site || 'daily', text(backup.termDate),
+      date(backup.window.start), date(backup.window.end), date(backup.watchedWindow?.start), date(backup.watchedWindow?.end), date(backup.reportEnd),
+      backup.laterBacked ? 'Yes' : 'No', (backup.noteChangedDays || []).map(usDate).join(' '), backup.undoBlocked ? 'No: greyed Exit' : 'Yes', text(backup.plan?.action)]);
+    for (const day of backup.days) days.push([backup.email, date(day.day), text(day.client), text(day.wbs), text(day.hours), text(day.billable), text(day.utilization),
+      text(day.jobCode), text(day.assignCode), text(day.assignCode2), text(day.pricingId), day.pricingCaptured ? 'Yes' : 'No', text(day.id), day.fromPage ? 'Page' : 'Report']);
+  }
+  const check = checkValue([people, days]);
+  return [
+    { name: 'People', rows: people, widths: [16, 26, 34, 8, 14, 8, 12, 12, 12, 12, 12, 12, 10, 30, 16, 12], oneLine: true },
+    { name: 'Days', rows: days, widths: [34, 12, 36, 18, 8, 14, 12, 14, 14, 14, 18, 10, 14, 8], oneLine: true },
+    { name: 'Check', rows: [[BACKUP_FILE_TITLE, FORMAT], ['Snooze', version], ['Saved', made.toISOString()], ['Check value', check],
+      ['Do not edit this file: Restore refuses an edited file.']], widths: [20, 40] },
+  ];
+}
+const index = header => Object.fromEntries(header.map((name, at) => [name, at]));
+const parseDay = value => value ? dayOf(value) : null;
+async function isBackupFile(file) {
+  if (!/\.xlsx$/i.test(String(file.name))) return false;
+  try {
+    const workbook = await reportWorkbook(await file.arrayBuffer(), 'The file');
+    return workbook.sheetNames.includes('Check') && String(workbook.rows('Check')[0]?.[0] ?? '') === BACKUP_FILE_TITLE;
+  } catch { return false; }
+}
+async function readBackupFile(file) {
+  let workbook;
+  try { workbook = await reportWorkbook(await file.arrayBuffer(), 'The backup file'); } catch (error) { throw inputReadError(error, 'The backup file'); }
+  const sheet = name => workbook.sheetNames.includes(name) ? workbook.rows(name).map(row => row.map(text)) : null;
+  const checkRows = sheet('Check');
+  if (!checkRows || checkRows[0]?.[0] !== BACKUP_FILE_TITLE) throw new InputFileError(BACKUP_FILE_WORDS.notBackup);
+  if (checkRows[0][1] !== FORMAT) throw new InputFileError(BACKUP_FILE_WORDS.newer);
+  const people = sheet('People'), days = sheet('Days');
+  const trim = rows => rows.filter(row => row.some(cell => cell !== ''));
+  if (!people || !days || checkValue([trim(people), trim(days)]) !== checkRows.find(row => row[0] === 'Check value')?.[1]) throw new InputFileError(BACKUP_FILE_WORDS.edited);
+  const P = index(people[0]), D = index(days[0]);
+  if (PEOPLE.some(name => !(name in P)) || DAYS.some(name => !(name in D))) throw new InputFileError(BACKUP_FILE_WORDS.edited);
+  const daysOf = new Map();
+  for (const row of trim(days).slice(1)) {
+    const email = row[D.Email];
+    if (!daysOf.has(email)) daysOf.set(email, []);
+    const day = parseDay(row[D.Date]);
+    daysOf.get(email).push({ day, date: usDate(day), client: row[D.Client], wbs: row[D.WBS], hours: Number(row[D.Hours]), billable: row[D.Billable],
+      utilization: row[D['Utilization Generating']], jobCode: row[D['Job Code']], assignCode: row[D['Assign Code 1']], assignCode2: row[D['Assign Code 2']],
+      pricingId: row[D['Pricing ID']], notes: 0, ...(row[D['Pricing ID read']] === 'Yes' ? { pricingCaptured: true } : {}),
+      ...(row[D['Entry id']] ? { id: row[D['Entry id']] } : {}), ...(row[D.From] === 'Page' ? { fromPage: true } : {}) });
+  }
+  return trim(people).slice(1).map(row => {
+    const email = row[P.Email];
+    const window = { start: parseDay(row[P['Window start']]), end: parseDay(row[P['Window end']]) };
+    const watched = row[P['Watched start']] ? { start: parseDay(row[P['Watched start']]), end: parseDay(row[P['Watched end']]) } : null;
+    const site = row[P.Site] === 'daily' ? undefined : row[P.Site];
+    const greyed = row[P['Can be put back']] !== 'Yes';
+    const backup = { kind: BACKUP_KIND, ticket: row[P.Ticket], email, professional: row[P.Person], termDate: row[P['Term Date']], window,
+      reportEnd: parseDay(row[P['Report end']]), plan: { action: row[P.Action] }, days: (daysOf.get(email) || []).sort((a, b) => compareDays(a.day, b.day)),
+      ...(site ? { site } : {}), ...(watched ? { watchedWindow: watched } : {}), ...(row[P['Later days backed up']] === 'Yes' ? { laterBacked: true } : {}),
+      ...(row[P['Note changed days']] ? { noteChangedDays: row[P['Note changed days']].split(' ').map(parseDay) } : {}),
+      ...(greyed ? { greyedExit: true, undoBlocked: TERM_DATE_UNDO } : {}) };
+    return { ticket: row[P.Ticket], name: row[P.Person], email, kind: row[P.Kind], result: row[P.Result], backup };
+  });
+}
+__exports.BACKUP_FILE_TITLE = BACKUP_FILE_TITLE;
+__exports.backupFileName = backupFileName;
+__exports.BACKUP_FILE_WORDS = BACKUP_FILE_WORDS;
+__exports.checkValue = checkValue;
+__exports.backupFilePeople = backupFilePeople;
+__exports.backupFileSheets = backupFileSheets;
+__exports.isBackupFile = isBackupFile;
+__exports.readBackupFile = readBackupFile;
 },
 "files/xlsx-writer.js": function (__require, __exports, document, window) {
 'use strict';
@@ -8067,7 +8175,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     const packVersion = batch.packVersion + (revision !== savedRevision || name !== savedSignOff ? 1 : 0);
     batch.saving = true; progress(); tell();
     try {
-      const result = await saveResults(batch.outputRows, name, { excelName: batch.excelName, backupReport: report, runReport: combinedReportText(batch, version), batchLabel: batch.batchLabel, packVersion, remainingTickets: remainingTickets() });
+      const result = await saveResults(batch.outputRows, name, { excelName: batch.excelName, backupReport: report, runReport: combinedReportText(batch, version), batchLabel: batch.batchLabel, packVersion, remainingTickets: remainingTickets(), version });
       batch.packVersion = packVersion; savedRevision = revision; savedSignOff = name;
       batch.packageCheck = Array.isArray(result?.packageCheck) ? result.packageCheck : null;
       batch.hasSaved = true;
@@ -9084,7 +9192,18 @@ function compareByDay(pageDays, reportRows, from = null, comparedFields = null) 
   differences.sort((x, y) => x.iso.localeCompare(y.iso));
   return differences;
 }
-const pastReportWarning = backup => backup?.unbackedAfter
+function withLaterDays(backup, copy, entriesToAdd) {
+  if (!backup?.reportEnd || backup.site || !copy?.window || compareDays(copy.window.end, backup.reportEnd) <= 0) return backup;
+  const later = copy.days.filter(row => compareDays(row.day, backup.reportEnd) > 0 && compareDays(row.day, copy.window.end) <= 0).map(row => ({
+    day: row.day, date: usDate(row.day), hours: Number(row.hours), client: row.client, wbs: row.wbs || '', billable: row.billable || '', utilization: row.utilization || '',
+    jobCode: row.jobCode || '', assignCode: row.assignCode || '', assignCode2: row.assignCode2 || '', pricingId: row.pricingId || '', pricingCaptured: true, notes: 0, fromPage: true,
+  }));
+  const window = { ...backup.window, end: copy.window.end };
+  const days = [...backup.days, ...later].sort((a, b) => compareDays(a.day, b.day) || String(a.client).localeCompare(String(b.client)));
+  if (entriesToAdd({ window, days }).problems.length) return backup;
+  return Object.assign(backup, { window, days, laterBacked: true });
+}
+const pastReportWarning = backup => backup?.unbackedAfter && !backup.laterBacked
   ? `Days after ${usDate(backup.unbackedAfter)} are not backed up; Undo does not put them back.` : '';
 __exports.RESTORE_FIELDS = RESTORE_FIELDS;
 __exports.withPagePricing = withPagePricing;
@@ -9093,6 +9212,7 @@ __exports.reportComparedFields = reportComparedFields;
 __exports.clientOf = clientOf;
 __exports.reportDays = reportDays;
 __exports.compareByDay = compareByDay;
+__exports.withLaterDays = withLaterDays;
 __exports.pastReportWarning = pastReportWarning;
 },
 "run/audit-loa.js": function (__require, __exports, document, window) {
@@ -9336,7 +9456,7 @@ const { deleteAll, deleteRange, splitDeleteWeeks, addAssignment, preflightDates,
 const { compareCopies, copyWindow, entriesToAdd, dayOf, ENTRY_FIELDS, knownAssignmentRows } = __require("../mysource/copy.js");
 const { restoreWindow, restorePlan } = __require("../mysource/restore.js");
 const { LOA_CLIENT, DNS_CLIENT, checkDnsAdded, checkLoaAdded } = __require("../mysource/checks.js");
-const { compareByDay, reportDays, withPagePricing, validatePageDays } = __require("./backup.js");
+const { compareByDay, reportDays, withPagePricing, validatePageDays, withLaterDays } = __require("./backup.js");
 const { requireDayReport, reportAssignPeriod } = __require("../files/report.js");
 const { auditLoaExact } = __require("./audit-loa.js");
 const { checkPerson, termDayOf } = __require("../rules/shared.js");
@@ -9486,6 +9606,7 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
     noteChangedDays: copy.days.filter(row => inReport(row) && valueKey(row.client) === valueKey(LOA_CLIENT)
       && inRange(row.day, plan.loaStart, plan.loaEnd)).map(row => row.day),
   };
+  if (!slice.liveScope) withLaterDays(backup, copy, entriesToAdd);
   return { window, watchedWindow, copy, watched: copy, backup, removing: [...removing.values()], daysCompared, checks, reportEnd, identity, replacedOldNote, runs, kept, canRefreshNotes, dateForm: dateCheck.modal };
 }
 async function prepareAuditReadOnly(one, today, step) {
@@ -9506,6 +9627,7 @@ async function prepareAuditReadOnly(one, today, step) {
 function recordLaterChange(prepared, after, notesChanged = false) {
   if (!prepared.reportEnd) return;
   const tail = copy => ({ days: copy.days.filter(row => compareDays(row.day, prepared.reportEnd) > 0) });
+  if (prepared.backup.laterBacked) return;
   if (notesChanged || !compareCopies(tail(prepared.copy), tail(after)).same) prepared.backup.unbackedAfter = prepared.reportEnd;
 }
 function apply(one, prepared, options = {}) {
@@ -9873,6 +9995,7 @@ async function prepareExit(one, version, today, { step }) {
         && (addDns && inRange(row.day, plan.dnsStart, editableDnsEnd) || repairDays.some(day => compareDays(day, row.day) === 0))).map(row => row.day) } : {}),
       report: slice.fileName || 'the Staff Schedule Hours Report by Day',
       ...(greyedExit ? { greyedExit: true, undoBlocked: TERM_DATE_UNDO } : {}) };
+    if (!slice.liveScope) withLaterDays(backup, copy, entriesToAdd);
     const later = copy.days.filter(row => compareDays(row.day, plan.dnsStart) >= 0);
     const clearLater = later.length > 0 && later.every(inChange);
     const separate = copy.days.filter(row => inChange(row) && (!clearLater || compareDays(row.day, plan.dnsStart) < 0));
@@ -10387,6 +10510,12 @@ function bulkRestorePeople(report, today = todayOf()) {
       period: compareDays(end, today) < 0 ? null : { start: compareDays(start, today) < 0 ? today : start, end } };
   });
 }
+function backupRestorePeople(entries, today = todayOf()) {
+  return entries.map(({ email, name, backup }) => ({ email, name, backup,
+    stop: backup.undoBlocked || '',
+    period: compareDays(backup.window.end, today) < 0 ? null
+      : { start: compareDays(backup.window.start, today) < 0 ? today : backup.window.start, end: backup.window.end } }));
+}
 const guard = () => {
   if (sessionExpired()) throw Object.assign(new PageError('The session expired. Sign in before continuing Restore.'), { session: true });
   requireSchedulePage();
@@ -10434,6 +10563,7 @@ async function applyBulkRestore(rows, { onPerson = () => {}, today = todayOf() }
   }, onPerson); } finally { release(); }
 }
 __exports.bulkRestorePeople = bulkRestorePeople;
+__exports.backupRestorePeople = backupRestorePeople;
 __exports.previewBulkRestore = previewBulkRestore;
 __exports.applyBulkRestore = applyBulkRestore;
 },
@@ -10441,32 +10571,37 @@ __exports.applyBulkRestore = applyBulkRestore;
 'use strict';
 const { el, saveFile, recoveryGuide } = __require("./ui.js");
 const { readReport } = __require("../files/report.js");
-const { bulkRestorePeople, previewBulkRestore, applyBulkRestore } = __require("../run/bulk-restore.js");
+const { bulkRestorePeople, backupRestorePeople, previewBulkRestore, applyBulkRestore } = __require("../run/bulk-restore.js");
+const { isBackupFile, readBackupFile } = __require("../files/backup-file.js");
 const { batchCover } = __require("../mysource/batch.js");
 const { dayRanges } = __require("../rules/leaves.js");
 const { xlsxBytes } = __require("../files/xlsx-writer.js");
 function restoreReportButton(work, body, onBack) {
   const input = el('input', { type: 'file', accept: '.csv,.xlsx', hidden: true });
   const message = el('div', { class: 'warn', role: 'status', hidden: true });
-  const button = el('button', { class: 'grey', onclick: () => { if (!work.busy) input.click(); } }, 'Restore from a report');
+  const button = el('button', { class: 'grey', onclick: () => { if (!work.busy) input.click(); } }, RESTORE_TITLE);
   input.addEventListener('change', async () => {
     const file = input.files[0]; input.value = '';
     if (!file || work.busy) return;
     button.disabled = true; work.busy = true;
-    try { mountRestorePanel(bulkRestorePeople(await readReport(file)), work, body, onBack); }
+    try {
+      const backup = await isBackupFile(file);
+      mountRestorePanel(backup ? backupRestorePeople(await readBackupFile(file)) : bulkRestorePeople(await readReport(file)), work, body, onBack, { fromBackup: backup });
+    }
     catch (error) { message.textContent = error.message; message.hidden = false; }
     finally { work.busy = false; button.disabled = false; }
   });
   return el('div', { class: 'restore-entry' }, button, recoveryGuide(), input, message);
 }
-function mountRestorePanel(people, work, body, onBack) {
+const RESTORE_TITLE = 'Restore from a backup or report';
+function mountRestorePanel(people, work, body, onBack, { fromBackup = false } = {}) {
   const selected = new Set();
   let previews = null, results = null, active = false, restoring = false, message = '';
   const rows = new Map();
   const box = el('div', { class: 'restore-screen' });
   const panel = body.closest('.panel');
   panel?.classList.add('restore-open');
-  work.setScreenTitle?.('Restore from a report');
+  work.setScreenTitle?.(RESTORE_TITLE);
   work.refreshClockControls = null;
   body.replaceChildren(box);
   const countDays = () => (previews?.rows || []).reduce((sum, row) => sum + (row.preview?.changedDays.length || 0), 0);
@@ -10551,7 +10686,7 @@ function mountRestorePanel(people, work, body, onBack) {
     const text = results ? `${results.rows.filter(row => row.state === 'restored').length} restored · ${results.rows.filter(row => row.state === 'partial').length} partial · ${results.rows.filter(row => row.state === 'byHand').length} by hand${pending ? ` · ${pending} not run` : ''}`
       : checked ? `${selected.size} selected · ${countDays()} days to restore` : `${selected.size} of ${people.length} selected`;
     footer.append(el('div', { class: 'restore-count', role: 'status' }, active ? restoring ? 'Restoring the selected schedules…' : 'Reading the selected schedules…' : text));
-    if (!results) footer.append(el('div', { class: 'restore-notice' }, 'Original notes and Pricing ID cannot be restored.'));
+    if (!results) footer.append(el('div', { class: 'restore-notice' }, fromBackup ? 'Original notes cannot be restored.' : 'Original notes and Pricing ID cannot be restored.'));
     if (message) footer.append(el('div', { class: 'warn', role: 'status' }, message));
     const action = results
       ? el('button', { class: 'blue', disabled: active, onclick: () => {
@@ -10569,6 +10704,7 @@ function mountRestorePanel(people, work, body, onBack) {
   return box;
 }
 __exports.restoreReportButton = restoreReportButton;
+__exports.RESTORE_TITLE = RESTORE_TITLE;
 __exports.mountRestorePanel = mountRestorePanel;
 },
 "run/live-connection.js": function (__require, __exports, document, window) {
@@ -12246,7 +12382,7 @@ function auditLivePage(today, small = false) {
       const record = { number: 'diagnostic', email, person, subcategory: { business: 'audit', kind: 'exit' },
         notification: readNotification(`Date of resignation: ${usDate(addDays(lwd, -7))}\nPlanned last working day: ${usDate(lwd)}`) };
       const entries = checkpoint.days.map(row => ({ ...row, days: [{ day: row.day, hours: row.hours }], fields: {} }));
-      const slice = { status: 'ready', mode: 'day', entries, backupEntries: entries, person, resourceManager: person.resourceManager, reportEnd: scope.end };
+      const slice = { status: 'ready', mode: 'day', entries, backupEntries: entries, person, resourceManager: person.resourceManager, reportEnd: scope.end, liveScope: true };
       one = { record, slice, decision: decideExit(record, scope.start, slice) };
       if (!record.notification.dates.lastWorkingDay || one.decision.audit?.template !== 4 || !one.decision.plan?.withoutNotes) throw new PageError('The production A&A decision was not proved.');
       one.decision.plan.dnsEnd = scope.end;
@@ -14012,16 +14148,14 @@ function saveFile(name, content, type = 'application/json') {
   link.remove();
   setTimeout(() => URL.revokeObjectURL(link.href), 10000);
 }
+const RECOVERY_LINE = "Use the backup file from the batch's zip. A plain report only if the batch stopped before Save files: no Pricing ID or later days.";
 function recoveryGuide() {
-  return el('details', { class: 'recovery-guide' }, el('summary', {}, 'Which recovery?'),
-    el('p', {}, el('strong', {}, "Undo this batch's change"),
-      ": per person, from this batch's backup, with Pricing ID read at the turn. Notes are not restored."),
-    el('p', {}, el('strong', {}, 'Bulk Restore from a report'),
-      ': report only, no notes or Pricing ID.'));
+  return el('div', { class: 'recovery-guide' }, RECOVERY_LINE);
 }
 __exports.el = el;
 __exports.wrongPageNotice = wrongPageNotice;
 __exports.saveFile = saveFile;
+__exports.RECOVERY_LINE = RECOVERY_LINE;
 __exports.recoveryGuide = recoveryGuide;
 },
 "rules/mails.js": function (__require, __exports, document, window) {
@@ -15267,5 +15401,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.13.9");
+__snoozeLoad("screen/panel.js").start("0.14.0");
 })();
