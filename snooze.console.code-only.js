@@ -1,4 +1,4 @@
-// v0.13.8
+// v0.13.9
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -2750,6 +2750,17 @@ function hoursOf(value, where) {
   if (!Number.isFinite(number)) throw new InputFileError(`The Staff Schedule Hours Report has "${text}" where hours should be (${where}).`);
   return number;
 }
+async function fileKind(file) {
+  let workbook;
+  try { workbook = await reportWorkbook(await file.arrayBuffer(), 'The file'); } catch { return null; }
+  for (const sheet of workbook.sheetNames) {
+    let rows;
+    try { rows = workbook.rows(sheet).slice(0, HEADER_SEARCH_ROWS); } catch { return null; }
+    if (rows.some(row => columnsIn(row.map(headerKey)))) return 'report';
+    if (rows.some(row => ['Number', 'Email', 'Description'].every(column => row.some(cell => headerKey(cell) === headerKey(column))))) return 'tickets';
+  }
+  return null;
+}
 async function readReport(file, label = 'The Staff Schedule Hours Report') {
   const extension = (String(file.name).match(/\.[^.]+$/) || [''])[0].toLowerCase();
   if (extension === '.xls') throw new InputFileError(`${label} is an old Excel file (.xls). Save it as .xlsx.`);
@@ -2913,6 +2924,7 @@ __exports.reportHasPerson = reportHasPerson;
 __exports.reportKind = reportKind;
 __exports.addLoadedReport = addLoadedReport;
 __exports.dateOf = dateOf;
+__exports.fileKind = fileKind;
 __exports.readReport = readReport;
 __exports.personSlice = personSlice;
 },
@@ -3012,18 +3024,19 @@ __exports.reasonLine = reasonLine;
 'use strict';
 const { valueKey } = __require("../rules/prepare.js");
 const { reasonName, REASON_NAMES } = __require("../core/reason-names.js");
-const { recordRun, observeRun, reasonCode, stopSentence, afterWriteSentence, windowName, diagnosticWaitName, FIELDS, WINDOWS } = __require("../core/run-records.js");
+const { recordRun, observeRun, reasonCode, REASON_CODES, stopSentence, afterWriteSentence, windowName, diagnosticWaitName, FIELDS, WINDOWS } = __require("../core/run-records.js");
 let refusalWriteDocument = null;
 function beginRefusalTurn() { refusalWriteDocument = null; }
 observeRun(event => { if (event.type === 'writeAttempt' && typeof document !== 'undefined') refusalWriteDocument = document; });
 const scheduleWriteAttempted = () => typeof document !== 'undefined' && refusalWriteDocument === document;
 class PageError extends Error {
-  constructor(message, { record = true, reasonName: fixedReason } = {}) {
+  constructor(message, { record = true, reasonName: fixedReason, reasonCode: fixedCode } = {}) {
     super(scheduleWriteAttempted() && (batchGuard || personGuards.size) ? afterWriteSentence(message) : message);
     this.name = 'PageError';
     this.reasonName = REASON_NAMES.has(fixedReason) ? fixedReason : reasonName(message);
+    this.reasonCode = REASON_CODES.has(fixedCode) ? fixedCode : reasonCode(message);
     if (record) {
-      const event = { type: 'error', code: reasonCode(message), reasonName: this.reasonName, sentence: stopSentence(message) };
+      const event = { type: 'error', code: this.reasonCode, reasonName: this.reasonName, sentence: stopSentence(message) };
       recordRun(event);
       if (event.liveStop) this.liveStop = event.liveStop;
     }
@@ -3144,7 +3157,7 @@ function waitFor(check, what, timeout = WAIT.timeout) {
   const waitStarted = Date.now();
   recordRun({ type: 'waitBegin', name: windowName(what) || 'Schedule window', waitName:diagnosticWaitName(what) });
   const finished = (result, error) => recordRun({ type: 'wait', name: windowName(what) || 'Schedule window', waitName:diagnosticWaitName(what), seconds: (Date.now() - waitStarted) / 1000, ceiling: timeout / 1000, result,
-    ...(error ? {code:reasonCode(error.message),reasonName:error.reasonName || reasonName(error.message)} : {}), ...(['the delete to finish', 'Add Assignment to save and close', 'Edit Assignments to save and close'].includes(what) ? { saveSeconds: (Date.now() - waitStarted) / 1000 } : {}) });
+    ...(error ? {code:reasonCode(error),reasonName:error.reasonName || reasonName(error.message)} : {}), ...(['the delete to finish', 'Add Assignment to save and close', 'Edit Assignments to save and close'].includes(what) ? { saveSeconds: (Date.now() - waitStarted) / 1000 } : {}) });
   return new Promise((resolve, reject) => {
     const started = waitStarted;
     let noticed = false, scheduleStarted = null, identityPending = null;
@@ -7022,7 +7035,7 @@ const PERSON_RESERVE_MS = 8 * 60 * 1000;
 const CONFIRM_RESERVE_MS = 5 * 60 * 1000;
 const SESSION_WORDS = {
   pause: 'Less than 8 minutes left: no new person starts.',
-  reload: 'Press Save files, reload, sign in, then load an export without the people already done (see the saved Excel).',
+  reload: "Press Save files, reload, sign in, then drop 'Tickets still to do.xlsx' with the reports.",
   confirm: 'MySource session ends soon: reload the page and sign in first.',
 };
 function createSessionClock({ now = () => Date.now(), origin = globalThis.window?.performance?.timeOrigin } = {}) {
@@ -7299,12 +7312,21 @@ function shortReason(row) {
   const reason = codes[decision.code] || row.message || reasonLine(decision);
   return reason.replace(/^[✗⚠✓]\s*/, '').replace(/\s*→.*$/, '').replace(/\s*Nothing was changed\.?/g, '').trim();
 }
+const STAGE_WORDS = {
+  'load person': 'opening their schedule', compare: 'checking their schedule against the report', change: 'changing their schedule',
+  'save notes': 'adding the note', 'move calendar': 'moving to the next weeks', screenshot: 'taking the screenshot',
+  'close person': 'closing their schedule', restore: 'putting their days back from the backup',
+};
+const stageWords = row => STAGE_WORDS[row?.diagnostic?.shownStage] || '';
 function runningText(row) {
-  const plan = row?.one.decision.plan || {};
-  if (plan.action === 'auditReadOnly') return { person: `${personName(row.one)} · No schedule change`, dates: plan.loaStart ? `${usDate(plan.loaStart)} – ${usDate(plan.loaEnd)}` : '' };
-  const dates = plan.action === 'dns' ? exitDnsDates(plan, row?.prepared) : null;
-  const action = plan.action === 'dns' ? 'Updating DNS' : plan.action === 'add' ? 'Updating LOA' : plan.action === 'clearClients' ? 'Removing entries' : 'Removing entries';
-  return { person: row ? `${personName(row.one)} · ${action}` : '', dates: plan.action === 'dns' ? `${usDate(dates.start)} – ${usDate(dates.end)}` : plan.action === 'add' ? `${usDate(plan.loaStart)} – ${usDate(plan.loaEnd)}` : `from ${usDate(plan.dnsStart)}` };
+  if (!row) return { person: '', dates: '', now: '' };
+  const plan = row.one.decision.plan || {};
+  const now = stageWords(row) ? `Now: ${stageWords(row)}` : '';
+  const line = (action, dates) => ({ person: [row.one.record.number, personName(row.one), [action, dates].filter(Boolean).join(' ')].filter(Boolean).join(' · '), dates, now });
+  if (plan.action === 'auditReadOnly') return line('No schedule change', plan.loaStart ? `${usDate(plan.loaStart)} – ${usDate(plan.loaEnd)}` : '');
+  const dates = plan.action === 'dns' ? exitDnsDates(plan, row.prepared) : null;
+  const action = plan.action === 'dns' ? 'Updating DNS' : plan.action === 'add' ? 'Updating LOA' : 'Removing entries';
+  return line(action, plan.action === 'dns' ? `${usDate(dates.start)} – ${usDate(dates.end)}` : plan.action === 'add' ? `${usDate(plan.loaStart)} – ${usDate(plan.loaEnd)}` : `from ${usDate(plan.dnsStart)}`);
 }
 __exports.mailFNoAction = mailFNoAction;
 __exports.undoRanges = undoRanges;
@@ -7318,6 +7340,8 @@ __exports.undoState = undoState;
 __exports.changeLine = changeLine;
 __exports.undoLine = undoLine;
 __exports.shortReason = shortReason;
+__exports.STAGE_WORDS = STAGE_WORDS;
+__exports.stageWords = stageWords;
 __exports.runningText = runningText;
 },
 "files/batch-outputs.js": function (__require, __exports, document, window) {
@@ -7553,6 +7577,7 @@ function mailGroup(row) {
 const attachWords = item => !item ? 'Nothing to attach'
   : item.missing.length ? `${item.missing.join(' and ')} missing: take it by hand${item.folder ? `; attach the rest from folder ${item.folder}` : ''}`
   : `Attach from folder ${item.folder}`;
+const MAILS_LEGEND = 'Ticket colour: amber = attach the files from its folder; red = a file is missing, take it by hand (attach the rest from its folder).';
 function mailsTable(rows, signOff = '', attachments = null, { headings = false } = {}) {
   const mails = excelRows(rows).map(row => ({ row, text: rowMailText(row, signOff) })).filter(item => item.text)
     .map(item => ({ ...item, group: mailGroup(item.row) }))
@@ -7643,7 +7668,9 @@ function packageCheck(rows, files) {
       report: item(expectsReport(row), report, 'report'), picture: item(needsPersonPicture(row), picture, 'picture') };
   });
 }
-function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupReport = null, runReport = '' } = {}) {
+const REMAINING_NAME = 'Tickets still to do.xlsx';
+const REMAINING_COLUMNS = ['Number', 'Name', 'Email', 'Description', 'Subcategory 1', 'Subcategory 2'];
+function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupReport = null, runReport = '', remainingTickets = null } = {}) {
   const attachments = new Map();
   const files = [];
   const folders = personFolders(rows);
@@ -7689,10 +7716,10 @@ function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupRe
     ['restoreFailed', 'undoFailed'].includes(row.state) ? 'Restore unconfirmed' : row.state === 'timeLimit' ? row.message : row.state === 'skipped' || failedRow(row) ? 'By hand' : ['done','nothing'].includes(row.state) ? mailRows.get(personTicketKey(row.one.record))?.[6] || 'No schedule change' : 'Not run',
     reasonWithMissing(mailRows.get(personTicketKey(row.one.record))?.[7] || rowWarnings(row), missingFiles(row))])];
   files.unshift({ name: excelName, blob: new Blob([xlsxBytes([
-    { name: 'Mails', rows: mails, widths: [20, 38, 80, 110, 30], rowHeight: 409, heading: cells => cells.length === 1,
-      highlight: (cells, index) => index === 4 && /^Attach from|missing/.test(String(cells[4])) },
-    { name: 'Needs attention', rows: needsAttention, widths: [20, 26, 24, 100], rowHeight: 100 },
-    { name: 'Batch', rows: table, widths: [20, 26, 36, 26, 36, 12, 52, 64, 48], rowHeight: 300 },
+    { name: 'Mails', rows: mails, widths: [20, 38, 80, 110, 30], oneLine: true, heading: cells => cells.length === 1, legend: MAILS_LEGEND,
+      highlight: (cells, index) => index === 0 && (/missing/.test(String(cells[4])) ? 'red' : /^Attach from/.test(String(cells[4]))) },
+    { name: 'Needs attention', rows: needsAttention, widths: [20, 26, 24, 100], oneLine: true },
+    { name: 'Batch', rows: table, widths: [20, 26, 36, 26, 36, 12, 52, 64, 48], oneLine: true },
   ])], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) });
   for (const report of loadedReports(backupReport).filter(report => report.sourceFile)) {
     const original = report.fileName || report.sourceFile.name || 'Staff Schedule Hours Report.xlsx';
@@ -7701,6 +7728,8 @@ function batchFiles(rows, signOff = '', { excelName = batchExcelName(), backupRe
     const prefix = Array.isArray(backupReport) ? `${reportKind(report) === 'audit' ? 'Audit' : 'Consulting'} - ` : '';
     files.push({ name: `Backup/${prefix}${safeName(stem)}${extension}`, blob: report.sourceFile });
   }
+  if (remainingTickets?.length) files.push({ name: REMAINING_NAME, blob: new Blob([xlsxBytes([{ name: 'Tickets', rows: [REMAINING_COLUMNS,
+    ...remainingTickets.map(ticket => REMAINING_COLUMNS.map(column => String(ticket[column] ?? '')))] }])], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) });
   if (runReport) files.push({ name: 'Snooze run report.docx', blob: new Blob([runReportDocx(runReport)], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }) });
   return files;
 }
@@ -7712,8 +7741,8 @@ function auditRequestBytes(clients) {
   const sheetXml = () => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>${widths.map((width, i) => `<col min="${i + 1}" max="${i + 1}" width="${width}" customWidth="1"/>`).join('')}</cols><sheetData><row r="1">${fields.map((field, i) => cell(`${column(i)}1`, field, i === 1 || i === 2 ? 0 : 1)).join('')}</row>${clients.map((client, i) => `<row r="${i + 2}">${fields.map((_, c) => cell(`${column(c)}${i + 2}`, c === 1 ? client.client : c === 2 ? client.wbs : '')).join('')}</row>`).join('')}</sheetData></worksheet>`;
   return workbookBytes([{ name: 'Audit Request Template' }], { xml, sheetXml, styles });
 }
-async function saveBatch(rows, signOff, { excelName = batchExcelName(), backupReport = null, runReport = '', batchLabel = excelName.replace(/\.xlsx$/, ''), packVersion = 1 } = {}) {
-  const files = batchFiles(rows, signOff, { excelName, backupReport, runReport });
+async function saveBatch(rows, signOff, { excelName = batchExcelName(), backupReport = null, runReport = '', batchLabel = excelName.replace(/\.xlsx$/, ''), packVersion = 1, remainingTickets = null } = {}) {
+  const files = batchFiles(rows, signOff, { excelName, backupReport, runReport, remainingTickets });
   const parts = await Promise.all(files.map(async file => [file.name, new Uint8Array(await file.blob.arrayBuffer())]));
   const name = `${batchLabel} v${packVersion}.zip`;
   saveFile(name, new Blob([zip(parts)], { type: 'application/zip' }));
@@ -7723,10 +7752,12 @@ __exports.needsPersonPicture = needsPersonPicture;
 __exports.capturePerson = capturePerson;
 __exports.BATCH_COLUMNS = BATCH_COLUMNS;
 __exports.rowWarnings = rowWarnings;
+__exports.MAILS_LEGEND = MAILS_LEGEND;
 __exports.mailsTable = mailsTable;
 __exports.batchTable = batchTable;
 __exports.batchExcelName = batchExcelName;
 __exports.packageCheck = packageCheck;
+__exports.REMAINING_NAME = REMAINING_NAME;
 __exports.batchFiles = batchFiles;
 __exports.saveBatch = saveBatch;
 },
@@ -7810,15 +7841,38 @@ function workbookBytes(sheets, { xml, sheetXml, styles }) {
   ];
   return zip(files);
 }
-function sheetXml({ rows, widths = [], rowHeight = 60, highlight = () => false, heading = () => false }) {
+function sheetXml({ rows, widths = [], rowHeight = 60, highlight = () => false, heading = () => false, oneLine = false, legend = '' }) {
   const count = rows.reduce((count, row) => Math.max(count, row.length), 1);
+  const top = legend ? 1 : 0;
   const cols = Array.from({ length: count }, (_, index) => `<col min="${index + 1}" max="${index + 1}" width="${widths[index] || Math.min(60, Math.max(16, String(rows[0]?.[index] || '').length + 3))}" customWidth="1"/>`).join('');
   const height = cells => Math.min(rowHeight, Math.max(26, 8 + 14 * Math.max(1, ...cells.map((cell, index) => String(cell ?? '').split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / (widths[index] || 24))), 0)))));
-  const body = rows.map((cells, row) => `<row r="${row + 1}" ht="${row === 0 ? 32 : height(cells)}" customHeight="1">${cells.map((cell, index) => (String(cell ?? '') === '' ? ''
-    : `<c r="${column(index)}${row + 1}" s="${row === 0 || heading(cells) ? 1 : highlight(cells, index) ? 3 : 2}" t="inlineStr"><is><t xml:space="preserve">${xml(cell)}</t></is></c>`)).join('')}</row>`).join('');
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${cols}</cols><sheetData>${body}</sheetData><autoFilter ref="A1:${column(count - 1)}${Math.max(1, rows.length)}"/></worksheet>`;
+  const style = (cells, row, index) => {
+    if (row === 0 || heading(cells)) return 1;
+    const mark = highlight(cells, index);
+    if (mark === 'red') return oneLine ? 6 : 7;
+    if (mark) return oneLine ? 5 : 3;
+    return oneLine ? 4 : 2;
+  };
+  const size = (cells, row) => oneLine ? '' : ` ht="${row === 0 ? 32 : height(cells)}" customHeight="1"`;
+  const legendRow = legend ? `<row r="1"><c r="A1" s="4" t="inlineStr"><is><t xml:space="preserve">${xml(legend)}</t></is></c></row>` : '';
+  const body = rows.map((cells, row) => `<row r="${row + 1 + top}"${size(cells, row)}>${cells.map((cell, index) => (String(cell ?? '') === '' ? ''
+    : `<c r="${column(index)}${row + 1 + top}" s="${style(cells, row, index)}" t="inlineStr"><is><t xml:space="preserve">${xml(cell)}</t></is></c>`)).join('')}</row>`).join('');
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="${1 + top}" topLeftCell="A${2 + top}" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${cols}</cols><sheetData>${legendRow}${body}</sheetData><autoFilter ref="A${1 + top}:${column(count - 1)}${Math.max(1, rows.length) + top}"/></worksheet>`;
 }
-const STYLES = '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="4"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF000000"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFC9AA68"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf><xf numFmtId="0" fontId="0" fillId="3" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf></cellXfs>';
+const WRAP = '<alignment vertical="top" wrapText="1"/>', LINE = '<alignment vertical="top"/>';
+const STYLES = '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts>'
+  + '<fills count="5"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF000000"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFC9AA68"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFC97972"/><bgColor indexed="64"/></patternFill></fill></fills>'
+  + '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+  + '<cellXfs count="8">'
+  + `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1">${WRAP}</xf>`
+  + '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>'
+  + `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1">${WRAP}</xf>`
+  + `<xf numFmtId="0" fontId="0" fillId="3" borderId="0" xfId="0" applyFill="1" applyAlignment="1">${WRAP}</xf>`
+  + `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1">${LINE}</xf>`
+  + `<xf numFmtId="0" fontId="0" fillId="3" borderId="0" xfId="0" applyFill="1" applyAlignment="1">${LINE}</xf>`
+  + `<xf numFmtId="0" fontId="0" fillId="4" borderId="0" xfId="0" applyFill="1" applyAlignment="1">${LINE}</xf>`
+  + `<xf numFmtId="0" fontId="0" fillId="4" borderId="0" xfId="0" applyFill="1" applyAlignment="1">${WRAP}</xf>`
+  + '</cellXfs>';
 function xlsxBytes(sheets) {
   return workbookBytes(sheets, { xml, sheetXml, styles: STYLES });
 }
@@ -7872,11 +7926,12 @@ const { setRunRecorder, timedRun, reasonCode, stopSentence, afterWriteSentence }
 const { safePageInfo } = __require("../mysource/pageinfo.js");
 const { combinedReportText } = __require("../files/run-report.js");
 const { estimateBatch, TIME_LIMIT_WORDS } = __require("./time-limit.js");
+const { personName, stageWords } = __require("../screen/compact.js");
 const BATCH = {
   title: 'Run the batch', confirm: 'Confirm batch',
   pause: 'Pause', resume: 'Resume', stop: 'Stop safely',
-  pausing: 'Pause requested. Finishing and checking this person first.',
-  stopping: 'Stop requested. Finishing and checking this person first.',
+  pausing: row => row ? `Pausing after ${personName(row.one)}: finishing and checking them first.` : 'Pausing.',
+  stopping: row => row ? `Stopping after ${personName(row.one)}: finishing and checking them first.` : 'Stopping.',
   session: 'MySource session expired. Sign in again in this tab, then press Resume.',
   expired: 'The page still says the session expired. Sign in again before Resume.',
   pageBlocked: 'Paused. Close the open schedules with the ✕ and wait for loading to finish, then Resume.',
@@ -7889,13 +7944,13 @@ const BATCH = {
   checkingDone: 'Checking the recorded schedule before skipping this person.',
 };
 const STALL_MS = 2 * 60 * 1000;
-const STALL_WORDS = 'Snooze has not moved for 2 minutes.';
+const stallWords = row => `No progress for 2 minutes${row ? ` on ${personName(row.one)}` : ''}${stageWords(row) ? `, while ${stageWords(row)}` : ''}.`;
 const methodOf = plan => plan?.action === 'dns' ? 'delete and DNS add' : plan?.action === 'clearClients' ? 'delete' : 'Replace';
 class SessionError extends PageError {
   constructor() { super(BATCH.session); this.session = true; }
 }
 function createBatch(cases, report, version, { notify = () => {}, lock = () => batchCover(), today = todayOf(), now = () => Date.now(), capture = capturePerson, noAction = 0, excludedCases = [],
-  readSite: siteReader = null,
+  readSite: siteReader = null, tickets = null,
   saveResults = saveBatch, signOff = () => '', clock = createSessionClock(),
   watchNow = () => Date.now(), scheduleWatch = fn => setInterval(fn, 1000), cancelWatch = id => clearInterval(id), localToday = () => todayOf() } = {}) {
   const createdLocalDay = localToday();
@@ -7976,7 +8031,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     if (batch.active && batch.state === 'running' && watchTimer === null) watchTimer = scheduleWatch(() => {
       if (!batch.active || batch.state !== 'running') { stopWatch(); return; }
       if (!batch.stallMessage && watchNow() - lastProgress >= STALL_MS) {
-        batch.stallMessage = STALL_WORDS;
+        batch.stallMessage = stallWords(progressRow);
         batch.diagnostic.stalls.push({ time: watchNow(), person: progressRow ? batch.rows.indexOf(progressRow) + 1 : null,
           stage: progressRow?.diagnostic.currentStage || null, wait: lastWait, seconds: (watchNow() - lastProgress) / 1000 });
         tell();
@@ -7985,7 +8040,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     if (warned) tell();
   };
   const reportFailure = error => {
-    batch.diagnostic.reason = reasonCode(error.message); batch.diagnostic.failedStage = 'report';
+    batch.diagnostic.reason = reasonCode(error); batch.diagnostic.failedStage = 'report';
     batch.diagnostic.unread.push({ code: batch.diagnostic.reason, stage: 'report' });
   };
   batch.clock = clock;
@@ -8000,13 +8055,19 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
   batch.invalidateFiles = () => {
     filesRevision++; batch.saved = false; batch.saveMessage = ''; tell();
   };
+  const remainingTickets = () => {
+    if (!Array.isArray(tickets)) return null;
+    const numbers = new Set(batch.rows.filter(row => ['ready', 'pending'].includes(row.state))
+      .flatMap(row => [row.one.record, ...(row.one.record.duplicates || [])]).map(record => String(record.number || '').trim()).filter(Boolean));
+    return numbers.size ? tickets.filter(ticket => numbers.has(String(ticket.Number || '').trim())) : null;
+  };
   batch.save = async () => {
     if (!batch.confirmed || batch.active || batch.saving) return;
     const revision = filesRevision, name = signOff();
     const packVersion = batch.packVersion + (revision !== savedRevision || name !== savedSignOff ? 1 : 0);
     batch.saving = true; progress(); tell();
     try {
-      const result = await saveResults(batch.outputRows, name, { excelName: batch.excelName, backupReport: report, runReport: combinedReportText(batch, version), batchLabel: batch.batchLabel, packVersion });
+      const result = await saveResults(batch.outputRows, name, { excelName: batch.excelName, backupReport: report, runReport: combinedReportText(batch, version), batchLabel: batch.batchLabel, packVersion, remainingTickets: remainingTickets() });
       batch.packVersion = packVersion; savedRevision = revision; savedSignOff = name;
       batch.packageCheck = Array.isArray(result?.packageCheck) ? result.packageCheck : null;
       batch.hasSaved = true;
@@ -8032,6 +8093,8 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       if (['waitBegin', 'wait', 'waiting'].includes(event.type) && event.name) lastWait = event.name;
     }
     if (event.type === 'begin' && data) data.currentStage = event.stage;
+    const shown = event.type === 'begin' ? event.stage : event.type === 'write' ? 'change' : null;
+    if (shown && data && data.shownStage !== shown) { data.shownStage = shown; if (batch.active) tell(); }
     if (event.type === 'step' && data) {
       data.steps.push({ stage: event.stage, seconds: event.seconds, ok: event.ok, retry: retrying });
       if (!event.ok && !recordingPicture && event.stage !== 'screenshot') data.failedStage = event.stage;
@@ -8129,7 +8192,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     await checkedPage();
     try { return await fn(); } catch (error) {
       if (error.connectionLost) throw error;
-      if (error.name !== 'PageError') batch.record(observedRow, { type: 'error', code: reasonCode(error.message), sentence: stopSentence(error.message) });
+      if (error.name !== 'PageError') batch.record(observedRow, { type: 'error', code: reasonCode(error), sentence: stopSentence(error.message) });
       if (error.session || sessionExpired()) { error.session = true; throw error; }
       if (error.schedulePage && !error.identityChanged && !error.session && !error.batchWide && !error.pageBlocked) {
         await checkedPage();
@@ -8367,7 +8430,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
             if (error.identityChanged || !error.pageBlocked || error.session || sessionExpired() || (wrote && row.state !== 'done')) throw error;
             if (row.state !== 'done') {
               row.state = 'skipped'; row.message = error.message;
-              row.diagnostic.reason = reasonCode(error.message);
+              row.diagnostic.reason = reasonCode(error);
               row.diagnostic.failedStage ||= row.diagnostic.currentStage || 'open person';
               await picture(row);
             }
@@ -8417,7 +8480,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       } else {
         batch.state = 'failed';
         const row = batch.rows[batch.index];
-        if (row) { row.state = 'failed'; row.message = error.message; row.diagnostic.reason = reasonCode(error.message); row.diagnostic.failedStage ||= row.diagnostic.currentStage || 'prepare'; if (batch.phase === 'run') await picture(row); }
+        if (row) { row.state = 'failed'; row.message = error.message; row.diagnostic.reason = reasonCode(error); row.diagnostic.failedStage ||= row.diagnostic.currentStage || 'prepare'; if (batch.phase === 'run') await picture(row); }
         tell(error.message);
       }
     } finally {
@@ -8438,6 +8501,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     try { if (!loadedReports(report).length) requireDayReport(null); for (const one of loadedReports(report)) { requireDayReport(one); requireFreshReport(one, now()); } } catch (error) { reportFailure(error); batch.state = 'failed'; tell(error.message); return; }
     try { batch.site = siteReader ? siteReader() : 'consulting'; }
     catch (error) { batch.state = 'failed'; tell(error.message); return; }
+    if (batch.site === 'consulting') batch.rows = batch.rows.filter(row => row.one.record.subcategory?.site !== 'tax');
     const otherSite = batch.rows.filter(row => (row.one.record.subcategory?.site || 'consulting') !== batch.site || row.one.personStop?.code === 'taxTalentGroup');
     for (const row of otherSite) {
       row.one.decision = (row.one.record.subcategory?.site || 'consulting') !== batch.site
@@ -8481,11 +8545,12 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     batch.total = batch.rows.filter(row => row.state === 'ready' || needsPersonPicture(row)).length;
     return drive();
   };
-  batch.pause = () => { if (batch.active) { batch.pauseRequested = true; tell(BATCH.pausing); } };
+  const workingRow = () => batch.rows[batch.displayIndex] ?? null;
+  batch.pause = () => { if (batch.active) { batch.pauseRequested = true; tell(BATCH.pausing(workingRow())); } };
   batch.stop = () => {
     batch.stopRequested = true;
     batch.diagnostic.stopped = true;
-    if (batch.active) tell(BATCH.stopping);
+    if (batch.active) tell(BATCH.stopping(workingRow()));
     else {
       batch.invalidateFiles();
       if (batch.pendingRestore) { batch.pendingRestore.state = 'restoreFailed'; batch.state = 'failed'; tell(BATCH.stopNeedsRestore); }
@@ -8560,7 +8625,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       await picture(row, { alreadyOpen: true, identity, operation: 'retake' });
       return !row.pictureToTakeByHand;
     } catch (error) {
-      row.pictureToTakeByHand = true; row.pictureRetakeReason = reasonCode(error.message);
+      row.pictureToTakeByHand = true; row.pictureRetakeReason = reasonCode(error);
       (row.one.outputs ||= { screenshots: [] }).warnings = `Screenshot not made: ${error.message}`;
       if (error.schedulePage && !error.scheduleRecorded) batch.record(row, { type: 'schedulePage', facts: error.scheduleFacts, operation: 'retake' });
       if (error.identityChanged && !error.identityRecorded) batch.record(row, { type: 'identity', facts: error.identityFacts, operation: 'retake' });
@@ -8587,7 +8652,6 @@ const { restore, previewRestore } = __require("../run/work.js");
 const { usDate } = __require("../rules/dates.js");
 const { failedRow, personName, runningText, undoLine, undoRanges, undoChangeWords, mailFNoAction, canUndo, changedRow, undoState } = __require("./compact.js");
 const { LOA_CLIENT, DNS_CLIENT } = __require("../mysource/checks.js");
-const { runReportScreenButton } = __require("./live-test-report.js");
 const { setRunRecorder, timedRun, reasonCode } = __require("../core/run-records.js");
 const { REPORT_TIME_WORDS } = __require("../files/report-time.js");
 const { reportTimeLine } = __require("../files/report-time.js");
@@ -8625,7 +8689,6 @@ function renderBatch(batch, work, box, draw) {
     work.busy = true; work.outputActive = true; draw();
     try { await batch.save(); } finally { work.busy = false; work.outputActive = false; draw(); }
   }, work.busy || batch.active || batch.saving);
-  const reportButton = () => runReportScreenButton(work, box, draw);
   const countLine = parts => el('div', { class: 'counts', role: 'status' }, ...parts.filter((part, i) => part[0] !== null && (i === 0 || !part[0].startsWith('0 ')))
     .flatMap(([text, tone], i) => [...(i ? [el('span', { class: 'c-sep' }, '·')] : []), el('span', { class: tone || '' }, text)]));
   if (running) {
@@ -8637,9 +8700,9 @@ function renderBatch(batch, work, box, draw) {
     const doneSoFar = listedRows.filter(isDone).length;
     if (current) {
       const text = runningText(current);
-      box.append(el('div', { class: 'status', role: 'status' }, text.person), el('div', { class: 'run-now' }, text.dates));
+      box.append(el('div', { class: 'status', role: 'status' }, text.person), el('div', { class: 'run-now' }, text.now));
     }
-    box.append(el('div', { class: 'run-line' }, countLine([[`${doneSoFar} done`, 'c-done'], [`${byHand} by hand`, 'c-hand'], [`${noAction} no action`, 'c-no-action'], [`${failed} failed`, 'c-fail'], [`${notRun} to do`, 'c-todo'], [`${undone} undone`, '']]),
+    box.append(el('div', { class: 'run-line' }, countLine([[`${doneSoFar} done`, 'c-done'], [`${byHand} By hand`, 'c-hand'], [`${noAction} no action`, 'c-no-action'], [`${failed} failed`, 'c-fail'], [`${notRun} to do`, 'c-todo'], [`${undone} undone`, '']]),
         el('span', { class: 'run-of' }, `${Math.min(completed + (current ? 1 : 0), total)}/${total}`)),
       el('div', { class: 'progress', role: 'progressbar', 'aria-valuenow': completed, 'aria-valuemin': 0, 'aria-valuemax': total },
         el('div', { style: `width:${total ? Math.min(100, completed / total * 100) : 0}%` })));
@@ -8649,7 +8712,7 @@ function renderBatch(batch, work, box, draw) {
       if (message && !['Paused', 'Paused. Press Resume to carry on.'].includes(message)) box.append(el('div', { class: 'warn', role: 'status' }, message));
       if (batch.clockPaused && !batch.active) box.append(el('div', { class: 'dates' }, SESSION_WORDS.reload));
       if (batch.saveMessage) box.append(el('div', { class: 'warn', role: 'status' }, batch.saveMessage));
-      stack.append(saveButton(), reportButton());
+      stack.append(saveButton());
       const resume = button('Resume', 'amber', () => { if (!work.busy && !batch.active && clockLeft() >= PERSON_RESERVE_MS) batch.resume(); });
       work.refreshClockControls = () => { resume.disabled = work.busy || batch.active || clockLeft() < PERSON_RESERVE_MS; };
       work.refreshClockControls(); stack.append(resume);
@@ -8659,15 +8722,18 @@ function renderBatch(batch, work, box, draw) {
     box.append(stack);
     return;
   }
-  box.append(ended
-    ? countLine([[`${done} done`, 'c-done'], [`${byHand} by hand`, 'c-hand'], [`${noAction} no action`, 'c-no-action'], [`${failed} failed`, 'c-fail'], [`${notRun} to do`, 'c-todo'], [`${undone} undone`, '']])
-    : countLine([[`${ready} to do`, 'c-todo'], [`${byHand} by hand`, 'c-hand'], [`${noAction} no action`, 'c-no-action'], [`${failed} failed`, 'c-fail']]));
+  const endLine = ended && countLine([[`${done} done`, 'c-done'], [`${byHand} By hand`, 'c-hand'], [`${noAction} no action`, 'c-no-action'], [`${failed} failed`, 'c-fail'], [`${notRun} to do`, 'c-todo'], [`${undone} undone`, '']]);
+  if (endLine && batch.state === 'complete' && !notRun) {
+    endLine.classList.add('finished');
+    endLine.prepend(el('span', { class: 'c-finished' }, '✓ Finished: '));
+    endLine.append(el('span', { class: 'c-finished' }, batch.confirmed && !batch.saved ? '. Next: Save files.' : '.'));
+  }
+  box.append(endLine || countLine([[`${ready} to do`, 'c-todo'], [`${byHand} By hand`, 'c-hand'], [`${noAction} no action`, 'c-no-action'], [`${failed} failed`, 'c-fail']]));
   if (ended) {
     if (batch.saveMessage) box.append(el('div', { class: batch.saved ? 'dates' : 'warn', role: 'status' }, batch.saveMessage));
     if (batch.state === 'failed' && (failed === 0 || Object.values(REPORT_TIME_WORDS).includes(batch.message))) box.append(el('div', { class: 'warn', role: 'status' }, batch.message));
     const stack = el('div', { class: 'stack' });
     if (batch.confirmed) stack.append(saveButton());
-    stack.append(reportButton());
     if (typeof batch.retakePicture === 'function' && !batch.active && !batch.pendingRestore) {
       rows.forEach((row, index) => {
         if (!['done', 'nothing'].includes(row.state) || !row.pictureToTakeByHand) return;
@@ -8730,7 +8796,7 @@ function renderBatch(batch, work, box, draw) {
     if (['paused', 'session'].includes(batch.state)) {
       const message = batch.pauseMessage || batch.message || (batch.state === 'session' ? BATCH.session : '');
       if (message && !['Paused', 'Paused. Press Resume to carry on.'].includes(message)) box.append(el('div', { class: 'warn', role: 'status' }, message));
-      box.append(button('Resume', 'amber', () => batch.resume(), batch.active || clockLeft() < PERSON_RESERVE_MS), button('Stop', 'red', () => batch.stop()),reportButton());
+      box.append(button('Resume', 'amber', () => batch.resume(), batch.active || clockLeft() < PERSON_RESERVE_MS), button('Stop', 'red', () => batch.stop()));
     }
   }
 }
@@ -8753,6 +8819,7 @@ async function undoPopup(row, work, draw) {
   const detail = el('div', { role: 'status' }, 'Reading the days for Undo…');
   const keep = el('button', { class: 'grey', onclick: () => dismiss() }, 'Keep');
   const resume = el('button', { class: 'amber undo-resume', hidden: true, onclick: () => { if (!work.busy) readPreview(); } }, 'Resume');
+  const retry = el('button', { class: 'amber undo-retry', hidden: true, onclick: () => { if (!work.busy) readPreview(); } }, 'Try again');
   const undo = el('button', { class: 'red', onclick: async () => {
     if (work.busy || !undoable() || !preview || undo.disabled) return;
     try { requireSchedulePage(); } catch (error) { if (error.schedulePage) { pausePreview(); return; } throw error; }
@@ -8789,7 +8856,7 @@ async function undoPopup(row, work, draw) {
     if (event.key === 'Escape') { event.preventDefault(); dismiss(); }
     if (event.key === 'Tab') {
       event.preventDefault();
-      const choices = [keep, resume, undo].filter(button => !button.hidden && !button.disabled);
+      const choices = [keep, resume, retry, undo].filter(button => !button.hidden && !button.disabled);
       const index = choices.indexOf(parent.activeElement || document.activeElement);
       choices[(index + (event.shiftKey ? choices.length - 1 : 1)) % choices.length].focus();
     }
@@ -8797,7 +8864,7 @@ async function undoPopup(row, work, draw) {
   parent.querySelector('.popup-shade')?.remove(); parent.append(popup); keep.focus();
   return readPreview();
   async function readPreview() {
-    preview = null; undo.disabled = true; resume.hidden = true; resume.remove();
+    preview = null; undo.disabled = true; resume.hidden = true; resume.remove(); retry.hidden = true; retry.remove();
     detail.textContent = 'Reading the days for Undo…';
     work.busy = true; work.undoActive = true; work.host.dataset.batchReserved = 'true';
     const release = batchCover(work.host, work.host);
@@ -8818,9 +8885,10 @@ async function undoPopup(row, work, draw) {
     } catch (error) {
       if (error.schedulePage) pausePreview();
       else {
-        detail.textContent = `Undo preview could not be read: ${error.message}. Nothing changed. Press Keep, then Undo again.`;
+        detail.textContent = `Undo preview could not be read: ${error.message}. Nothing changed. Press Try again.`;
+        retry.hidden = false; undo.before(retry);
         row.diagnostic ||= { steps: [], paint: [] };
-        row.diagnostic.reason = reasonCode(error.message); row.diagnostic.failedStage = 'undo preview';
+        row.diagnostic.reason = reasonCode(error); row.diagnostic.failedStage = 'undo preview';
       }
     }
     finally { popup.style.pointerEvents = ''; releaseGuard(); releaseRecord(); release(); work.busy = false; work.undoActive = false; delete work.host.dataset.batchReserved; for (const listener of work.listeners || []) listener(); }
@@ -10741,7 +10809,7 @@ async function runLongLiveTest({ email, week, length = 'year', through, version,
       if (id === 'bDns') current.notExercised = true;
       if (LIVE_TEST_PARTS.has(error.livePart)) current.part = error.livePart;
       else if (['loaReplace','dnsAdd','dnsReplace','aClear','bClear','cClear','sevenClear'].includes(id)) current.part='Saved rows failed.';
-      current.state = 'failed'; current.code = error.identityChanged ? 'identityChanged' : error.session ? 'sessionExpired' : reasonCode(error.message);
+      current.state = 'failed'; current.code = error.identityChanged ? 'identityChanged' : error.session ? 'sessionExpired' : reasonCode(error);
       if (isNoteStageRefusal(error.stagedDiagnosis)) current.reason = error.stagedDiagnosis;
       if (Object.hasOwn(LIVE_TEST_PROBLEMS, error.testProblem)) current.problem = error.testProblem;
       const dates = dateEvidence(error.dateDiagnostics);
@@ -10814,7 +10882,7 @@ async function runLongLiveTest({ email, week, length = 'year', through, version,
   } catch (error) {
     if (error.connectionLost) throw error;
     diagnostic.fail(error, current?.id); diagnostic.cleanup();
-    result.state = 'failed'; result.code = error.identityChanged ? 'identityChanged' : error.session ? 'sessionExpired' : reasonCode(error.message);
+    result.state = 'failed'; result.code = error.identityChanged ? 'identityChanged' : error.session ? 'sessionExpired' : reasonCode(error);
     if (!result.writes) result.cleanup = 'notNeeded';
     if (result.writes) result.cleanup = 'unconfirmed';
     if (result.writes && !uncertainWrite && known && !error.identityChanged && !error.session && !error.pageBlocked) {
@@ -12591,8 +12659,6 @@ __exports.createLivePictures = createLivePictures;
 },
 "screen/live-test-report.js": function (__require, __exports, document, window) {
 'use strict';
-const { combinedReportText, downloadRunReport } = __require("../files/run-report.js");
-const { clockFace, SESSION_MS } = __require("./session-clock.js");
 const { LIVE_TEST_PARTS } = __require("../run/live-proof.js");
 const { el } = __require("./ui.js");
 const { LIVE_TEST_STEPS, LIVE_TEST_PROBLEMS, liveTimingSummary, liveRefusalReason, liveStepTitle } = __require("../run/live-test.js");
@@ -12817,132 +12883,10 @@ function renderPhotoReport(result) {
   section.append(resultPage,stepsPage);box.append(section);
   return box;
 }
-const styled = (node, style) => { Object.assign(node.style, style); return node; };
-const heading = text => styled(el('h3', {}, text), { fontSize: '11px', margin: '6px 0 3px' });
-function table(headers) {
-  const node = styled(el('table'), { width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed', font: 'inherit' });
-  const head = el('tr', {}, headers.map(text => styled(el('th', {}, text), { textAlign: 'left', padding: '2px 3px', borderBottom: `1px solid ${COLOURS.grey}` })));
-  const body = el('tbody'); node.append(el('thead', {}, head), body); return { node, body };
-}
-function cells(values, attributes = {}, compact = false) {
-  return el('tr', attributes, values.map(value => styled(el('td', {}, value), { padding: `${compact ? 1 : 2}px 3px`, verticalAlign: 'top', overflowWrap: 'anywhere', borderBottom: `1px solid ${COLOURS.divider}` })));
-}
-function section(lines, title, next) {
-  const start = lines.indexOf(title);
-  if (start < 0) return [];
-  const end = next ? lines.indexOf(next, start + 1) : lines.length;
-  return lines.slice(start + 1, end < 0 ? lines.length : end).filter(Boolean);
-}
-const pairs = line => new Map(line.split('; ').map(part => {
-  const match = part.match(/^(.*?) (not recorded|yes|no|-?\d+)$/);
-  return match ? [match[1], match[2]] : [part, ''];
-}));
-const flags = (facts, keys) => keys.map(key => facts.get(key) ?? '?').join('/');
-function renderRunReport(work) {
-  const text = combinedReportText(work.batch, work.version, work.pageInfo), lines = text.split('\n');
-  const compact = (work.batch?.rows?.length || 0) > 12 || (globalThis.window?.innerHeight || Infinity) < 800;
-  const report = styled(el('section', { role: 'region', 'aria-label': 'Batch run report' }), {
-    fontFamily: 'Segoe UI, sans-serif', fontSize: compact ? '10px' : '11px', lineHeight: compact ? '1.1' : '1.15', color: COLOURS.text,
-    background: COLOURS.surface, padding: '10px', borderRadius: '8px',
-  });
-  const overview = el('div', { 'data-report-overview': true });
-  overview.append(styled(el('strong', {}, `Snooze ${/^\d+\.\d+\.\d+$/.test(work.version) ? work.version : 'unknown'} · Run report`), { fontSize: '13px' }));
-  for (const line of lines.filter(line => /^(Date:|Batch:|Counts:|Paused:|Run reason:)/.test(line))) overview.append(el('div', {}, line));
-  const left = (work.batch?.clock || work.clock)?.left?.();
-  overview.append(el('div', {}, `Session time: ${Number.isFinite(left) ? `${clockFace(SESSION_MS - left).text} elapsed; ${clockFace(left).text} left` : 'not recorded'}`));
-  const columns = styled(el('div', { 'data-report-columns': true }), { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: '12px' });
-  const people = el('div'), checks = el('div'); columns.append(people, checks); overview.append(columns);
-  people.append(heading('People'));
-  const persons = table(['# / change and dates', 'Result / reason', 'Method', 'Time / picture']);
-  const starts = lines.map((line, index) => /^#\d+ (?:LOA|Exit|unknown); rule /.test(line) ? index : -1).filter(index => index >= 0);
-  const saves = [];
-  for (const [index, start] of starts.entries()) {
-    const end = starts[index + 1] ?? lines.indexOf('Page structure misses:');
-    const block = lines.slice(start, end < 0 ? lines.length : end);
-    const match = block[0].match(/^#(\d+) (LOA|Exit|unknown); rule ([^;]+); mail ([^;]+); ([^;]+); (.*?); Time: ([^;]+); method: ([^;]+); Screenshots: (.*?); painter omissions:/);
-    if (!match) continue;
-    const [, id, kind, , , state, change, time, method, picture] = match;
-    const reason = block.find(line => line.startsWith('Reason:'));
-    const reasonWords = compact ? reason?.split('; failed stage:')[0] : reason;
-    const pictureFailed = picture.includes('picture to take by hand') || block.some(line => /^Step: screenshot .*; failed/.test(line));
-    const pictureWords = pictureFailed ? `${picture.startsWith('not made') ? 'failed' : picture.split(';')[0] + '; failed'}; take by hand` : picture;
-    persons.body.append(cells([`#${id} ${kind}\n${change}`, `${state}${reasonWords ? '\n' + reasonWords : ''}`, method, `${time}\nPicture: ${pictureWords}`], { 'data-report-person': id }, compact));
-    for (const line of block.filter(line => line.startsWith('Step:'))) {
-      if (/Submit|save|Delete All|Add Assignment/.test(line)) saves.push(`#${id} ${line.slice(6)}; limit not recorded`);
-    }
-  }
-  persons.node.style.whiteSpace = 'pre-line'; people.append(persons.node);
-  checks.append(heading('Person identity checks'));
-  const identities = table(['# / stage / operation', 'Name', 'ID', 'Calendar']);
-  const identityLines = section(lines, 'Person identity checks:', 'Find Assignments sub-steps:');
-  const lengths = new Map();
-  for (const line of identityLines.filter(line => /name spacing\/case only/.test(line))) {
-    const id = line.match(/^#([^ ]+)/)?.[1];
-    lengths.set(id, [...(lengths.get(id) || []), line]);
-  }
-  for (const line of identityLines.filter(line => /; names /.test(line))) {
-    const parts = line.split('; '), id = parts[0].slice(1), facts = pairs(line), length = pairs(lengths.get(id)?.shift() || '');
-    identities.body.append(cells([
-      `${parts[0]} ${parts[1]} / ${parts[2]}`,
-      `${flags(facts, ['names', 'name present', 'expected name present', 'name equal'])}; ${flags(length, [`#${id} name spacing/case only`, 'name length difference'])}`,
-      flags(facts, ['IDs', 'ID readable', 'expected ID readable', 'ID equal']),
-      flags(facts, ['calendar present', 'calendar ambiguous', 'loading cover']),
-    ], { 'data-identity-check': id }, compact));
-  }
-  checks.append(el('div', {}, 'Name: count/present/expected/equal; spacing-case only/length difference. ID: count/readable/expected/equal. Calendar: present/ambiguous/cover. ? = not recorded.'), identities.node);
-  if (!identities.body.children.length) checks.append(el('div', {}, 'none recorded'));
-  checks.append(heading('Schedule page checks'));
-  for (const line of section(lines, 'Schedule page checks:', 'Person identity checks:')) checks.append(el('div', {}, line));
-  checks.append(heading('Slowest waits and saves'));
-  const waits = section(lines, 'Waits:').filter(line => line !== 'none recorded');
-  const slow = [...waits, ...saves].sort((a, b) => Number(b.match(/ (\d+(?:\.\d+)?) s/)?.[1] || 0) - Number(a.match(/ (\d+(?:\.\d+)?) s/)?.[1] || 0));
-  for (const line of slow.slice(0, 5)) checks.append(el('div', {}, line));
-  if (!slow.length) checks.append(el('div', {}, 'none recorded'));
-  checks.append(el('div', {}, 'All waits, saves and limits are in Diagnostic facts below.'));
-  checks.append(heading('Find Assignments sub-steps'));
-  const find = new Map();
-  for (const line of section(lines, 'Find Assignments sub-steps:', 'Tab visibility:')) {
-    const match = line.match(/^(#\d+); (.*)$/);
-    if (match) find.set(match[1], [...(find.get(match[1]) || []), match[2]]);
-  }
-  for (const [person, steps] of find) checks.append(el('div', {}, `${person}: ${steps.join('; ')}`));
-  if (!find.size) checks.append(el('div', {}, 'none recorded'));
-  overview.append(styled(el('div', {}, 'Send a photo of this report.'), { fontWeight: '700', marginTop: '6px' }));
-  const arrow = el('span', { 'aria-hidden': true }, '▸ ');
-  const details = el('details', {}, el('summary', {}, arrow, 'Diagnostic facts · all recorded lines'));
-  details.addEventListener('toggle', () => { arrow.textContent = details.open ? '▾ ' : '▸ '; });
-  const facts = styled(el('div'), { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', columns: '2', columnGap: '12px', marginTop: '6px' });
-  for (const line of lines) facts.append(el('div', { 'data-report-line': true }, line));
-  details.append(facts); report.append(overview, details); return report;
-}
-function mountRunReport(work, body, onBack, { download = downloadRunReport } = {}) {
-  const panel = body.closest('.panel'), width = panel?.style.width || '';
-  const wasOpen = panel?.classList.contains('restore-open');
-  const refresh = work.refreshClockControls; work.refreshClockControls = null;
-  panel?.classList.add('restore-open'); if (panel) panel.style.width = '1280px';
-  work.setScreenTitle?.('Run report');
-  const box = styled(el('div', { class: 'restore-screen' }), { overflow: 'auto', maxHeight: 'calc(100vh - 90px)' });
-  const warning = el('div', { role: 'status', class: 'restore-warning' });
-  const back = el('button', { class: 'grey', onclick: () => {
-    if (!wasOpen) panel?.classList.remove('restore-open'); if (panel) panel.style.width = width;
-    work.refreshClockControls = refresh; work.setScreenTitle?.(''); onBack();
-  } }, 'Back');
-  const save = el('button', { class: 'blue', onclick: async () => {
-    try { await download(work); } catch { warning.textContent = 'Download did not finish. Try Download report again.'; }
-  } }, 'Download report');
-  box.append(renderRunReport(work), warning, el('div', { class: 'restore-footer' }, el('div', { class: 'buttons' }, back, save)));
-  body.replaceChildren(box);
-}
-function runReportScreenButton(work, body, onBack) {
-  return el('button', { class: 'grey', onclick: () => mountRunReport(work, body, onBack) }, 'Run report');
-}
 __exports.photoReportLines = photoReportLines;
 __exports.liveVerdict = liveVerdict;
 __exports.fitPhotoReport = fitPhotoReport;
 __exports.renderPhotoReport = renderPhotoReport;
-__exports.renderRunReport = renderRunReport;
-__exports.mountRunReport = mountRunReport;
-__exports.runReportScreenButton = runReportScreenButton;
 },
 "screen/live-test-panel.js": function (__require, __exports, document, window) {
 'use strict';
@@ -13049,7 +12993,7 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     if (!result) {
       box.append(el('label', { class: 'sign-off' }, 'Professional email', email),
         el('div', { class: 'restore-notice' }, mode === 'tax' ? 'April 3–June 23, 2028 · twelve Monday–Friday weeks' : 'May 1–July 21, 2028 · twelve Monday–Friday weeks'),
-        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'Checks an empty span with LOA, DNS, Holiday and Undo, then clears its entries. Separately lowers and restores this week’s past Monday only when exactly one eligible entry is present.' : 'One Consulting and A&A test: open and read, Add, Change, Delete, Picture, Undo and Clear. Run once with a Weekly person and once with a Time person.'));
+        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'Checks an empty span with LOA, DNS, Holiday and Undo, then clears its entries. Separately lowers and restores this week’s past Monday only when exactly one eligible entry is present.' : 'One Consulting and A&A test: open and read, Add, Change, Delete, Picture, Undo and Clear. Run with a Time person.'));
     } else {
       box.append(el('div', { class: 'restore-top' }, el('strong', {}, (active ? 'Testing…' : result.state === 'complete' ? 'Tests complete' : 'Test stopped'))),
         el('div', { class: 'restore-notice' }, `${result.week.start} – ${result.week.end}`));
@@ -13132,8 +13076,9 @@ const MENU_ITEMS = new Set(['New Assignment', 'Paste', 'Select Assignments', 'De
 const CALENDAR_CHECK_PARTS = { weekUnreadable: 'a shown week could not be read', currentWeekNotShownBefore: 'this week was not shown before the delete',
   weekNotShown: 'a week up to the last deleted day is not shown', tileUnreadable: 'a calendar entry could not be read', keptEntryNotDns: 'a kept later entry is not DNS',
   hoursDiffer: 'a week shows other hours than expected', entryStillShown: 'an entry not expected is still shown' };
-function reasonCode(message) {
-  const text = String(message || '');
+function reasonCode(value) {
+  if (value && typeof value === 'object') { if (REASON_CODES.has(value.reasonCode)) return value.reasonCode; value = value.message; }
+  const text = String(value || '');
   const rules = [
     [/website.*allowed|Required dates.*(?:outside|disabled)/i, 'allowedDatesUnreadableOrOutside'],
     [/^No professional found for |^\d+ professionals (?:found for|show exactly) .*Snooze will not guess|^The Search for a Professional result does not show exactly .*Snooze will not guess|^Not found on MySource:/i, 'personNotFound'],
@@ -13824,8 +13769,6 @@ __exports.liveEventLog = liveEventLog;
 'use strict';
 const { pastReportWarning } = __require("../run/backup.js");
 const { compareDays, usDate, todayOf } = __require("../rules/dates.js");
-const { saveFile } = __require("../screen/ui.js");
-const { runReportDocx, runReportName } = __require("./run-report-docx.js");
 const { failedRow } = __require("../screen/compact.js");
 const { chooseMail } = __require("../rules/mails.js");
 const { RULE_CODES, REASON_CODES, STAGES, WINDOWS, FIELDS, STRUCTURES, PAGE_LIBRARIES, PAGE_SELECTORS, MENU_ITEMS, CALENDAR_CHECK_PARTS, stopSentence } = __require("../core/run-records.js");
@@ -14006,13 +13949,8 @@ function combinedReportText(batch, version, pageInfo) {
   if (lines.length === 1) lines.push('not recorded');
   return `Snooze ${safeVersion} report\n\n${lines.join('\n')}${batch?.confirmed ? '\n\n' + runReportText(batch, version) : ''}`;
 }
-function downloadRunReport(work) {
-  const text = combinedReportText(work.batch, work.version, work.pageInfo);
-  saveFile(runReportName(), new Blob([runReportDocx(text)], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }));
-}
 __exports.runReportText = runReportText;
 __exports.combinedReportText = combinedReportText;
-__exports.downloadRunReport = downloadRunReport;
 },
 "files/run-report-docx.js": function (__require, __exports, document, window) {
 'use strict';
@@ -14103,27 +14041,38 @@ const ATTACHED = {
   withReport: 'Please find the screenshot and the Staff Schedule Hours Report attached.',
   noReport: 'Please find the screenshot attached.',
   noReportLoa: 'Please find the screenshot attached. No Staff Schedule Hours Report has been attached as there were no Client Service Hours in the schedule.',
+  template: 'Please find the template and the screenshot attached.',
 };
 const HELP = 'Please reach out if there are any further changes.';
+const OPENING = {
+  leave: "We have received the ELE notification for this professional's Leave of Absence.",
+  exit: "We have received the ELE notification for this professional's exit.",
+};
 function exitDnsDates(plan, worked = null) {
   if (!plan?.dnsStart || !(worked?.editableDnsEnd || plan.dnsEnd)) return { start: null, end: null };
   const start = workdayFrom(plan.dnsStart);
   const days = workingDays(start, worked?.editableDnsEnd || plan.dnsEnd);
   return { start, end: days.at(-1) || null };
 }
+const fill = (words, values) => words.replace(/\{(\w+)\}/g, (_, key) => String(values[key]));
 function chooseMail(one, worked = null) {
+  const mail = pickMail(one, worked);
+  if (!mail) return null;
+  const { closing, ...rest } = mail;
+  return { ...rest, paragraphs: dnsInFull([...mail.paragraphs, [closing, HELP].filter(Boolean).join(' ')]) };
+}
+function pickMail(one, worked) {
   if (one.slice?.status === 'notOnReport') return null;
   if (one.record.subcategory?.business === 'audit') return chooseAuditMail(one, worked);
   const tax = one.record.subcategory?.site === 'tax';
-  if (tax && one.personStop?.code === 'taxPartnerMd') return { template: 2, attachReport: false, paragraphs: [TAX_MAIL_WORDS.partner, TAX_MAIL_WORDS.partnerPicture] };
-  if (tax && (one.decision.code === 'taxPastEnd' || worked?.code === 'taxPastEnd')) return { template: 2, attachReport: false, paragraphs: [TAX_MAIL_WORDS.pastEnd, `${ATTACHED.noReport} ${HELP}`] };
+  if (tax && one.personStop?.code === 'taxPartnerMd') return { template: 2, attachReport: false, paragraphs: [TAX_MAIL_WORDS.partner], closing: ATTACHED.noReport };
+  if (tax && (one.decision.code === 'taxPastEnd' || worked?.code === 'taxPastEnd')) return { template: 2, attachReport: false, paragraphs: [TAX_MAIL_WORDS.pastEnd], closing: ATTACHED.noReport };
   if (one.record.notification?.kind === 'exit' || one.decision.plan?.action === 'dns') return chooseExitMail(one, worked);
   const { decision } = one;
   const plan = decision.plan;
   if (decision.outcome === 'report') {
     if (!worked) return null;
     const clientHours = (worked.removing || []).reduce((sum, item) => sum + item.clientHours, 0);
-    const attach = clientHours > 0 ? ATTACHED.withReport : ATTACHED.noReportLoa;
     const kept = worked.kept?.length ? [`Other LOA already on the schedule was left unchanged: ${dayRanges(worked.kept.map(row => row.day))}.`] : [];
     const result = plan.pastDated
       ? `The LOA has been updated from ${usDate(workdayFrom(plan.loaStart))} through ${usDate(plan.loaEnd)}. The leave starts on ${usDate(plan.leaveStart || plan.loaStart)}, but past dates cannot be changed in the schedule.`
@@ -14131,17 +14080,12 @@ function chooseMail(one, worked = null) {
       ? `LOA is in place through ${usDate(plan.loaEnd)}, as per the details below.`
       : `LOA is in place from ${usDate(plan.leaveStart || plan.loaStart)} through ${usDate(plan.loaEnd)}, as per the details below.`;
     return { template: plan.pastDated ? 3 : 2, attachReport: clientHours > 0,
-      paragraphs: [result, ...kept, ...(tax ? taxMailLines(worked) : []), ...leftLines({ ...worked, lockedPeriod: worked.lockedPeriod || plan.lockedPeriod }), `${attach} ${HELP}`] };
+      paragraphs: [result, ...kept, ...(tax ? taxMailLines(worked) : []), ...leftLines({ ...worked, lockedPeriod: worked.lockedPeriod || plan.lockedPeriod })],
+      closing: clientHours > 0 ? ATTACHED.withReport : ATTACHED.noReportLoa };
   }
-  switch (decision.code) {
-    case 'leaveOver':
-      return {
-        template: 5, attachReport: false,
-        paragraphs: ['We are unable to edit past dates, as the schedule is greyed out. Hence, no action has been taken from our end.', `Please find the screenshot attached. ${HELP}`],
-      };
-    default:
-      return null;
-  }
+  if (decision.code === 'leaveOver') return { template: 5, attachReport: false,
+    paragraphs: ['We are unable to edit past dates, as the schedule is greyed out. Hence, no action has been taken from our end.'], closing: ATTACHED.noReport };
+  return null;
 }
 function detailsBlock(record) {
   const date = field => record.notification.dates?.[field] ? usDate(record.notification.dates[field]) : 'not given';
@@ -14152,36 +14096,38 @@ function detailsBlock(record) {
         ...(record.notification.dates?.estimatedReturn ? [`Estimated Return Date: ${date('estimatedReturn')}`] : [])])];
 }
 const signOffName = signOff => signOff.trim().replace(/^(?:thank you!?|thanks & regards,?|regards,?)\s*\n/i, '').trim();
-const mailBody = (greeting, paragraphs, details, nameOnly) => [`Hi ${greeting},`, '', ...paragraphs.flatMap(p => [p, '']),
-  ...details, '', 'Regards,', nameOnly || '<Your Name>'].join('\n');
+function dnsInFull(paragraphs) {
+  let done = false;
+  return paragraphs.map(paragraph => done ? paragraph : paragraph.replace(/(Do Not Schedule \()?\bDNS\b/, (match, full) => { done = true; return full ? match : 'Do Not Schedule (DNS)'; }));
+}
 function mailText(one, mail, { dpName = '', dpEmail = '', signOff = '' } = {}) {
-  if (one.record.subcategory?.business === 'audit') return auditMailText(one, mail, { dpName, signOff });
   const { record } = one;
+  const audit = record.subcategory?.business === 'audit', missingDp = mail.template === 'AAMissingDp';
   const tax = record.subcategory?.site === 'tax';
-  if (tax) dpEmail = '';
-  const name = professionalName(record);
+  const email = audit || tax ? '' : dpEmail;
   const greeting = greetingName(dpName);
   const rmNotApplicable = !greeting && String(dpName || '').trim() !== '';
-  const body = mailBody(greeting || '<Deployment Professional Name>', mail.paragraphs, detailsBlock(record), signOffName(signOff));
-  return {
-    to: dpEmail || (greeting ? tax ? dpName : `(${dpName}: email not in the files)` : rmNotApplicable ? '(RM not applicable)' : '(no Resource Manager on the profile)'),
-    subject: subjectLine(record.number, name),
-    body,
-    copyBody: dpEmail ? `${dpEmail}\n\n${body}` : body,
-    missing: [!greeting && (rmNotApplicable ? 'RM not applicable' : 'the Resource Manager'), greeting && !dpEmail.trim() && 'Resource Manager email missing: add the recipient before sending', !signOff.trim() && 'your name for mail sign-off'].filter(Boolean),
-  };
+  const nameOnly = signOffName(signOff);
+  const body = [`Hi ${missingDp ? '<POC Name>' : greeting || '<Deployment Professional Name>'},`, '', ...mail.paragraphs.flatMap(p => [p, '']),
+    ...detailsBlock(record), '', 'Regards,', nameOnly || '<Your Name>'].join('\n');
+  const to = audit ? (missingDp ? '' : greeting ? dpName : '')
+    : email || (greeting ? tax ? dpName : `(${dpName}: email not in the files)` : rmNotApplicable ? '(RM not applicable)' : '(no Resource Manager on the profile)');
+  const missing = audit
+    ? [missingDp && 'the mail recipient', !missingDp && !greeting && 'the Resource Manager']
+    : [!greeting && (rmNotApplicable ? 'RM not applicable' : 'the Resource Manager'), greeting && !tax && !email.trim() && 'Resource Manager email missing: add the recipient before sending'];
+  return { to, subject: subjectLine(record.number, professionalName(record)), body, copyBody: email ? `${email}\n\n${body}` : body,
+    missing: [...missing, !(audit ? nameOnly : signOff.trim()) && 'your name for mail sign-off'].filter(Boolean) };
 }
-const AUDIT_LOA_ASK = "We have received the ELE notification for this professional's Leave of Absence. As per the Audit & Assurance process, we update the LOA only with your approval. Please let us know if we should add the LOA for the dates below and remove the scheduled hours in that period.";
-const AUDIT_LOA_EXACT = "We have received the ELE notification for this professional's Leave of Absence. As per the Audit & Assurance process, we checked the schedule: the LOA for the dates below is already on it exactly, so no change was needed.";
+const AUDIT_LOA_ASK = `${OPENING.leave} As per the Audit & Assurance process, we update the LOA only with your approval. Please let us know if we should add the LOA for the dates below and remove the scheduled hours in that period.`;
+const AUDIT_LOA_EXACT = `${OPENING.leave} As per the Audit & Assurance process, we checked the schedule: the LOA for the dates below is already on it exactly, so no change was needed.`;
 function chooseAuditMail(one, worked) {
-  if (one.personStop?.code === 'auditMissingDp') return { template: 'AAMissingDp', attachReport: false, paragraphs: [
+  if (one.personStop?.code === 'auditMissingDp') return { template: 'AAMissingDp', attachReport: false, closing: '', paragraphs: [
     'This profile in MySource does not have a Deployment Professional aligned. As per the instructions from Audit & Assurance Deployment Leadership, we are forwarding this to you for further action.',
-    HELP,
   ] };
   if (one.personStop || ['byHand', 'notHandled'].includes(one.decision.outcome) || !worked) return null;
   if (one.record.notification.kind === 'leave') return worked?.loaExact
-    ? { template: 'AALoaExact', attachReport: false, paragraphs: [AUDIT_LOA_EXACT, `${ATTACHED.noReport} ${HELP}`] }
-    : { template: 'AALoaAsk', attachReport: false, paragraphs: [AUDIT_LOA_ASK, `${ATTACHED.noReport} ${HELP}`] };
+    ? { template: 'AALoaExact', attachReport: false, paragraphs: [AUDIT_LOA_EXACT], closing: ATTACHED.noReport }
+    : { template: 'AALoaAsk', attachReport: false, paragraphs: [AUDIT_LOA_ASK], closing: ATTACHED.noReport };
   const audit = one.decision.audit;
   if (!audit) return null;
   const date = usDate(audit.from);
@@ -14195,38 +14141,25 @@ function chooseAuditMail(one, worked) {
       : `There is no client time scheduled after ${date}. ${EXIT_MAIL_WORDS.greyed}`,
   }[audit.template];
   const attachTemplate = [1, 3].includes(audit.template);
-  return middle ? { template: `AA${audit.template}`, attachReport: false, attachTemplate, paragraphs: [
-    `We have received the notification about this professional's exit. ${middle}`,
-    ...leftLines(worked),
-    `${attachTemplate ? 'Please find the template and the screenshot attached.' : ATTACHED.noReport} ${HELP}`,
-  ] } : null;
-}
-function auditMailText(one, mail, { dpName, signOff }) {
-  const record = one.record, name = professionalName(record);
-  const greeting = greetingName(dpName), missingDp = mail.template === 'AAMissingDp';
-  const nameOnly = signOffName(signOff);
-  const body = mailBody(missingDp ? '<POC Name>' : greeting || '<Deployment Professional Name>', mail.paragraphs, detailsBlock(record), nameOnly);
-  return { to: missingDp ? '' : greeting ? dpName : '', subject: subjectLine(record.number, name), body, copyBody: body,
-    missing: [missingDp && 'the mail recipient', !missingDp && !greeting && 'the Resource Manager', !nameOnly && 'your name for mail sign-off'].filter(Boolean) };
+  return middle ? { template: `AA${audit.template}`, attachReport: false, attachTemplate,
+    paragraphs: [`${OPENING.exit} ${middle}`, ...leftLines(worked)], closing: attachTemplate ? ATTACHED.template : ATTACHED.noReport } : null;
 }
 const TAX_MAIL_WORDS = {
   pastEnd: 'The LOA on the schedule already runs beyond the end date in the details below; as per the process it has been left as it is.',
-  holiday: 'The Holiday on MM/DD/YYYY was kept, and the LOA for that week was reduced by 8 hours.',
-  partialWeek: 'The client hours in the week of MM/DD/YYYY were reduced to the days outside the leave.',
+  holiday: 'The Holiday on {date} was kept, and the LOA for that week was reduced by 8 hours.',
+  partialWeek: 'The client hours in the week of {date} were reduced to the days outside the leave.',
   partner: 'As the Professional is Partner/Managing Director, the Scheduled hours are not available in MySource, nor are we supposed to update the schedule with LOA.',
-  partnerPicture: 'Please find the screenshot attached.',
 };
 function taxMailLines(worked) {
-  return [...(worked.holidays || []).map(row => TAX_MAIL_WORDS.holiday.replace('MM/DD/YYYY', usDate(row.day))),
-    ...(worked.partialWeeks || []).map(day => TAX_MAIL_WORDS.partialWeek.replace('MM/DD/YYYY', usDate(day)))];
+  return [...(worked.holidays || []).map(row => fill(TAX_MAIL_WORDS.holiday, { date: usDate(row.day) })),
+    ...(worked.partialWeeks || []).map(day => fill(TAX_MAIL_WORDS.partialWeek, { date: usDate(day) }))];
 }
 const LEFT_WORDS = {
-  unclear: 'The {client} entry of {date} ({hours} h) was left unchanged because it was not clear whether it should change. If it needs to be corrected, please reply with the details.',
+  unclear: 'The {client} entry of {date} ({hours} h) was left unchanged because it was not clear whether it should change.',
   locked: '{from} to {to} are on or after the Term Date and cannot be changed on the schedule, so they were left as they are.',
-  lockedWeek: 'The {client} entry for the week of {date} ({hours} h) is on or after the Term Date and cannot be changed on the schedule, so it was left as it is. If it needs to be corrected, please reply with the details.',
+  lockedWeek: 'The {client} entry for the week of {date} ({hours} h) is on or after the Term Date and cannot be changed on the schedule, so it was left as it is.',
 };
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-const fill = (words, values) => words.replace(/\{(\w+)\}/g, (_, key) => String(values[key]));
 const named = day => `${DAY_NAMES[weekday(day)]} ${usDate(day)}`;
 function leftLines(worked) {
   return [...(worked?.leftUnchanged || []).map(row => row.locked
@@ -14237,7 +14170,7 @@ function leftLines(worked) {
 const EXIT_MAIL_WORDS = {
   greyed: 'DNS could not be added, as the schedule is greyed out.',
   deactivate: 'Profile will be automatically de-activated on the date of termination.',
-  waiting: "We have received the ELE notification for the PR's resignation and are waiting for the ELE Exits Team to update the LWD details. For now, we are sharing the resignation date for reference only, and we will share the LWD once we receive it from the ELE Exits Team.",
+  waiting: `${OPENING.exit.slice(0, -1)} and are waiting for the ELE Exits Team to update the last working day details. For now, we are sharing the resignation date for reference only, and we will share the last working day once we receive it from the ELE Exits Team.`,
   noAction: 'No action has been taken in MySource for this professional at this time.',
 };
 function chooseExitMail(one, worked) {
@@ -14245,7 +14178,7 @@ function chooseExitMail(one, worked) {
   const template = one.decision.code === 'exitNoLwd' ? 'F' : one.exit?.template;
   if (!['A', 'B', 'C', 'D', 'F'].includes(template) || (!worked && !['B', 'C', 'F'].includes(template))) return null;
   const w = EXIT_MAIL_WORDS;
-  if (template === 'F') return { template, attachReport: false, paragraphs: [w.waiting, `${w.noAction} ${HELP}`] };
+  if (template === 'F') return { template, attachReport: false, paragraphs: [w.waiting], closing: w.noAction };
   const clientHours = (worked?.removing || []).reduce((sum, item) => sum + item.clientHours, 0);
   const attachReport = clientHours > 0;
   const plan = one.decision.plan;
@@ -14256,8 +14189,8 @@ function chooseExitMail(one, worked) {
     : `As per the details below, ${attachReport ? `client hours after the last working day have been removed, and ${dns}` : dns}`;
   return { template, attachReport, paragraphs: [result,
     ...(attachReport && !dnsInPlace ? ['Client hours after the last working day have been removed.'] : []),
-    ...leftLines(worked),
-    `${attachReport ? ATTACHED.withReport : ATTACHED.noReportLoa} ${HELP}`] };
+    ...leftLines(worked)],
+    closing: attachReport ? ATTACHED.withReport : ATTACHED.noReportLoa };
 }
 __exports.greetingName = greetingName;
 __exports.subjectLine = subjectLine;
@@ -14990,7 +14923,7 @@ __exports.reportFile = reportFile;
 const { COLOURS } = __require("../family/look.js");
 const { createLeaveWarning } = __require("../family/leave-warning.js");
 const { createSessionClock, paintClock } = __require("./session-clock.js");
-const { SN_COLUMNS, readTable } = __require("../servicenow/files.js");
+const { SN_COLUMNS, readTable, inputReadError } = __require("../servicenow/files.js");
 const { todayOf, compareDays, addDays, mondayOf, reportWindow } = __require("../rules/dates.js");
 const { sortCases } = __require("../servicenow/sort.js");
 const { reportPull } = __require("../files/groups.js");
@@ -15003,7 +14936,7 @@ const { alreadyAdded } = __require("../run/work.js");
 const { DNS_CLIENT, LOA_CLIENT } = __require("../mysource/checks.js");
 const { leavePeriod, leaveRuns } = __require("../rules/leaves.js");
 const { valueKey } = __require("../rules/prepare.js");
-const { personSlice, readReport, loadedReports, reportHasPerson, reportKind, addLoadedReport } = __require("../files/report.js");
+const { fileKind, personSlice, readReport, loadedReports, reportHasPerson, reportKind, addLoadedReport } = __require("../files/report.js");
 const { readSite } = __require("../mysource/site.js");
 const { el, wrongPageNotice } = __require("./ui.js");
 const { isSchedulePage, SCHEDULE_PAGE_WORDS } = __require("../mysource/schedule.js");
@@ -15037,7 +14970,7 @@ button{font:bold 13px system-ui,sans-serif;border:0;border-radius:8px;padding:8p
 .body,.batch{gap:12px}button{font-weight:700;transition:filter .15s ease,transform .15s ease,box-shadow .15s ease}button:hover:not(:disabled){box-shadow:0 4px 12px rgba(0,0,0,.4)}button:active:not(:disabled){transform:scale(.985)}
 .red{background:${COLOURS.red};color:${COLOURS.page}}.stack{display:grid;gap:8px}.stack>button{width:100%}
 .status{font-weight:600;font-size:12px;line-height:1.35;overflow-wrap:anywhere;white-space:normal}
-.counts{font-size:12px;font-weight:500}.c-todo{color:var(--family-lavender)}.c-no-action{color:var(--family-muted)}.c-done{color:${COLOURS.greenText}}.c-hand{color:${COLOURS.amber}}.c-fail{color:${COLOURS.redText}}.c-sep{color:${COLOURS.grey};margin:0 5px}
+.counts{font-size:12px;font-weight:500}.counts.finished,.counts.finished>span{color:${COLOURS.greenText}}.c-todo{color:var(--family-lavender)}.c-no-action{color:var(--family-muted)}.c-done{color:${COLOURS.greenText}}.c-hand{color:${COLOURS.amber}}.c-fail{color:${COLOURS.redText}}.c-sep{color:${COLOURS.grey};margin:0 5px}
 .run-line{display:flex;align-items:baseline;gap:8px}.run-line>.counts{flex:1;min-width:0}.run-of{font-size:11px;white-space:nowrap;color:${COLOURS.muted};font-variant-numeric:tabular-nums}
 .run-now{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:${COLOURS.muted};overflow-wrap:anywhere;white-space:normal}
 .progress{height:8px;margin-top:6px;background:${COLOURS.surface};border-radius:8px}.progress>div{background:${COLOURS.green};border-radius:8px;transition:width .2s linear}
@@ -15048,7 +14981,7 @@ button{font:bold 13px system-ui,sans-serif;border:0;border-radius:8px;padding:8p
 .undo-fold{display:grid;gap:6px}.undo-toggle{width:100%}.stack>button,.undo-toggle{line-height:17px}.undo-list{max-height:240px;overflow-y:auto;overscroll-behavior:contain}.undo-list .person-row{min-height:44px}
 .recovery-guide,.package-check{font-size:11px;line-height:1.5;overflow-wrap:anywhere}.recovery-guide summary,.package-check summary{cursor:pointer;padding:4px 0}.package-scroll{overflow:auto;max-height:240px}.package-check table{border-collapse:collapse;min-width:620px;font-size:11px}.package-check th{background:${COLOURS.header};color:${COLOURS.text};font-weight:bold}.package-check td,.package-check th{padding:5px;border:1px solid ${COLOURS.divider};text-align:left;vertical-align:top;white-space:pre-wrap}
 .screen-title{font-size:11px;color:${COLOURS.muted};white-space:nowrap}.sign-off{display:grid;gap:4px;font-size:12px;color:${COLOURS.muted}}.sign-off input{margin:0;padding:7px 9px;line-height:18px}.review-actions{margin-top:0}.batch{gap:8px}.restore-entry>button{width:100%}
-.live-test-entry{margin-top:8px;padding-top:8px;border-top:1px solid ${COLOURS.grey}}.live-test-entry>button{font:11px system-ui,sans-serif;background:transparent;color:${COLOURS.muted};padding:2px 0}.live-test-entry>button:hover:not(:disabled){box-shadow:none;filter:none;transform:none;text-decoration:underline}
+.live-test-entry{display:flex;align-items:center;gap:6px}.head .live-test-entry>button{width:auto;padding:0 6px}.live-test-entry .restore-warning{font-size:11px}.live-test-entry .restore-warning:empty{display:none}.live-test-entry>button{font:11px system-ui,sans-serif;background:transparent;color:${COLOURS.muted};padding:2px 0}.live-test-entry>button:hover:not(:disabled){box-shadow:none;filter:none;transform:none;text-decoration:underline}
 .panel.restore-open{display:flex;flex-direction:column;overflow:hidden}.restore-open>.head{flex:none}.restore-open>.body{display:flex;flex-direction:column;min-height:0;overflow:hidden}.restore-screen{display:flex;flex-direction:column;min-height:0;gap:0}.restore-top{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex:none}.restore-top strong{font-size:12px;flex:1}.restore-small{padding:6px 8px;font-size:11px;white-space:nowrap}.restore-list{max-height:calc(100vh - 265px);min-height:0;overflow:auto;overscroll-behavior:contain}.restore-person{display:block;background:${COLOURS.surface};border-radius:8px;padding:8px 10px 9px;margin-bottom:4px;cursor:pointer}.restore-person:hover{filter:brightness(1.08)}.restore-person:focus-within{outline:2px solid ${COLOURS.selection};outline-offset:2px}.restore-person input{position:absolute;width:1px;height:1px;opacity:0;margin:0}.restore-main{display:flex;align-items:baseline;gap:8px;line-height:17px}.restore-main strong{font-size:12px;font-weight:600;flex:1;min-width:0;overflow-wrap:anywhere}.restore-state{font-size:11px;white-space:nowrap;color:${COLOURS.muted}}.restore-person.selected strong,.restore-person.selected .restore-state{color:${COLOURS.greenText}}.restore-dates{display:inline-block;margin-top:3px;padding:1px 5px;border-radius:4px;font-size:10px;color:${COLOURS.muted};background:${COLOURS.divider}}.restore-warning{font-size:10px;color:${COLOURS.amber};margin-top:3px;overflow-wrap:anywhere}.restore-footer{flex:none}.restore-count{font-size:11px;font-weight:600;color:${COLOURS.muted};margin-top:8px}.restore-footer .buttons{margin-top:8px}.restore-notice{font-size:11px;line-height:1.45;color:${COLOURS.muted};margin-top:8px}
 `;
 function mountPanel(version, { clock = createSessionClock(), schedule = fn => window.setInterval(fn, 1000), cancel = id => window.clearInterval(id) } = {}) {
@@ -15065,7 +14998,8 @@ function mountPanel(version, { clock = createSessionClock(), schedule = fn => wi
   work.setScreenTitle = text => { screenTitle.textContent = text; };
   work.backToFiles = null;
   const title=el('span',{class:'title'},'Snooze');
-  const head = el('div', { class: 'head' }, title, screenTitle, work.counter,
+  const liveEntry = work.liveEntry = liveTestButton(work, body, () => work.newBatch());
+  const head = el('div', { class: 'head' }, title, screenTitle, liveEntry, work.counter,
     el('button', { 'aria-label': 'Close', title: 'Close', onclick: () => { if(work.busy)return;if(work.batch?.confirmed&&!work.batch.saved || (work.liveTest?.result || work.liveTest?.changed)&&!work.liveTest.saved){newBatchPopup({ ...work, saved: false },work.close);}else work.close(); } }, '✕'));
   const panel = el('div', { class: 'panel', role: 'dialog', 'aria-label': 'Snooze' }, head, body);
   root.append(el('style', {}, COMPACT_STYLE), panel); document.body.append(host);
@@ -15088,7 +15022,16 @@ function mountPanel(version, { clock = createSessionClock(), schedule = fn => wi
   });
   return { work, body, root };
 }
-function showLoad(body, sorted, onReport, work, { onTickets = () => {}, report = null, pull = null } = {}) {
+const DROP_WORDS = {
+  twoExports: 'Two ServiceNow exports were dropped. Drop one export with the reports.',
+  exportFirst: 'Drop the ServiceNow export first, or together with the reports.',
+};
+function hideTaxOnConsulting(sorted, site = (() => { try { return readSite(); } catch { return null; } })()) {
+  if (site !== 'consulting') return sorted;
+  const keep = one => one.record.subcategory?.site !== 'tax';
+  return { cases: sorted.cases.filter(keep), lists: Object.fromEntries(Object.entries(sorted.lists).map(([name, list]) => [name, list.filter(keep)])) };
+}
+function showLoad(body, sorted, onReport, work, { onTickets = () => {}, report = null, pull = null, onDrop = files => { if (!work.busy) return onReport(files[0]); } } = {}) {
   const cases = sorted.cases;
   const actionable = cases.filter(one => one.decision.outcome !== 'notHandled');
   const loa = actionable.filter(one => one.record.notification.kind === 'leave').length;
@@ -15101,10 +15044,10 @@ function showLoad(body, sorted, onReport, work, { onTickets = () => {}, report =
   if (pull && compareDays(pull.start, reportWindow(todayOf()).start) < 0) body.append(el('div', { class: 'dates early-pull' }, earlyPullLine(pull.start)));
   if (Array.isArray(report)) {
     for (const one of report) body.append(fileLine(`${reportKind(one) === 'audit' ? 'Audit' : 'Consulting'} · ${reportTimeLine(one.pullTime.time)}`, file => onReport(file, reportKind(one)), work));
-    if (report.length < 2) body.append(dropArea(`Drop ${reportKind(report[0]) === 'audit' ? 'Consulting' : 'Audit'} Staff Schedule Hours Report · max 2 h old`, file => { if (!work.busy) return onReport(file); }));
+    if (report.length < 2) body.append(dropArea(`Drop ${reportKind(report[0]) === 'audit' ? 'Consulting' : 'Audit'} Staff Schedule Hours Report · max 2 h old`, onDrop));
   }
   else if (report) body.append(fileLine(reportTimeLine(report.pullTime.time), file => onReport(file), work));
-  else body.append(dropArea('Drop Staff Schedule Hours Report · max 2 h old', file => { if (!work.busy) return onReport(file); }));
+  else body.append(dropArea('Drop Staff Schedule Hours Report · max 2 h old', onDrop));
 }
 function fileLine(label, receive, work) {
   const input = el('input', { type: 'file', accept: '.csv,.xlsx', hidden: true });
@@ -15115,18 +15058,19 @@ function fileLine(label, receive, work) {
   return el('div', { class: 'file-line' }, el('span', {}, label), change, input);
 }
 function dropArea(label, receive) {
-  const input = el('input', { type: 'file', accept: '.csv,.xlsx', hidden: true });
+  const input = el('input', { type: 'file', accept: '.csv,.xlsx', hidden: true, multiple: true });
   const drop = el('button', { class: 'drop', onclick: () => { if (!drop.disabled) input.click(); } }, label);
-  const read = async file => {
-    if (!file || drop.disabled) return;
+  const read = async list => {
+    const files = [...(list || [])];
+    if (!files.length || drop.disabled) return;
     drop.disabled = input.disabled = true;
-    drop.textContent = label.includes('ServiceNow') ? 'Reading ServiceNow export…' : 'Reading Staff Schedule Hours Report…';
-    try { await receive(file); }
+    drop.textContent = files.length > 1 ? 'Reading files…' : label.includes('ServiceNow') ? 'Reading ServiceNow export…' : 'Reading Staff Schedule Hours Report…';
+    try { await receive(files); }
     finally { drop.disabled = input.disabled = false; drop.textContent = label; }
   };
-  input.addEventListener('change', () => { const file = input.files[0]; input.value = ''; read(file); });
+  input.addEventListener('change', () => { const files = [...input.files]; input.value = ''; read(files); });
   drop.addEventListener('dragover', event => event.preventDefault());
-  drop.addEventListener('drop', event => { event.preventDefault(); read(event.dataTransfer.files[0]); });
+  drop.addEventListener('drop', event => { event.preventDefault(); read(event.dataTransfer.files); });
   return el('div', { class: 'drop-wrap' }, drop, input);
 }
 function attachReport(cases, input, pull) {
@@ -15203,12 +15147,12 @@ function start(version) {
   const errorLine = message => { body.querySelector('.load-error')?.remove(); body.append(el('div', { class: 'load-error warn', role: 'status' }, `✗ ${message}`)); };
   const rebuild = (review = false) => {
     work.saveMessage = ''; work.saved = false; work.batch = null; work.refreshClockControls = null; work.undoExpanded = false;
-    const sorted = sortCases({ tickets }, todayOf());
+    const sorted = hideTaxOnConsulting(sortCases({ tickets }, todayOf()));
     const cases = sorted.cases.filter(one => one.decision.outcome !== 'notHandled');
     const pull = reportPull(cases.filter(one => one.record.email), todayOf());
     if (data) attachReport(cases, data, pull);
     const files = el('div', { class: 'start-files' });
-    showLoad(files, sorted, loadReport, work, { onTickets: loadTickets, report: data, pull });
+    showLoad(files, sorted, loadReport, work, { onTickets: loadTickets, report: data, pull, onDrop: files => loadAll(files, 'report') });
     work.setScreenTitle('');
     work.backToFiles = () => {
       if (work.busy || work.batch?.active) return;
@@ -15219,7 +15163,7 @@ function start(version) {
     body.replaceChildren(files);
     if (review && data) {
       const excludedCases = sorted.cases.filter(one => one.decision.outcome === 'notHandled');
-      const box = batchControls(cases, data, work, () => { files.hidden = true; }, { noAction: excludedCases.length, excludedCases });
+      const box = batchControls(cases, data, work, () => { files.hidden = true; }, { noAction: excludedCases.length, excludedCases, tickets });
       body.append(box);
     } else {
       const next = el('button', { class: 'blue', onclick: () => { if (!work.busy && tickets && data) rebuild(true); } }, 'Review batch');
@@ -15262,19 +15206,42 @@ function start(version) {
     } catch (error) { if (currentRead(read)) errorLine(error.message); }
     finally { endRead(read); }
   };
+  const loadAll = async (files, fallback) => {
+    const read = beginRead(); if (!read) return;
+    let kinds;
+    try {
+      kinds = await Promise.all(files.map(async file => {
+        const copy = new File([await file.arrayBuffer()], file.name, { type: file.type || '' });
+        return { file: copy, kind: await fileKind(copy) || fallback };
+      }));
+    } catch (error) { if (currentRead(read)) errorLine(inputReadError(error, fallback === 'tickets' ? 'The ServiceNow export' : 'The Staff Schedule Hours Report').message); return; }
+    finally { endRead(read); }
+    if (!(work.host.isConnected && body.firstChild === read.screen)) return;
+    const export_ = kinds.filter(item => item.kind === 'tickets'), reports = kinds.filter(item => item.kind === 'report');
+    if (export_.length > 1) { errorLine(DROP_WORDS.twoExports); return; }
+    if (!tickets && !export_.length) { errorLine(DROP_WORDS.exportFirst); return; }
+    if (export_.length) { await loadTickets(export_[0].file); if (!tickets || body.querySelector('.load-error')) return; }
+    for (const { file } of reports) { await loadReport(file); if (body.querySelector('.load-error')) return; }
+  };
   work.newBatch = () => {
     if (work.fileRead) { work.fileRead = null; loading = work.busy = false; delete work.host.dataset.batchReserved; }
     tickets = data = null; work.batch = null; work.refreshClockControls = null; work.saved = false; work.saveMessage = ''; work.undoExpanded = false;
     work.setScreenTitle('');
     body.closest('.panel')?.classList.remove('restore-open');
-    body.replaceChildren(dropArea('Drop ServiceNow export', loadTickets), restoreReportButton(work, body, work.newBatch), liveTestButton(work, body, work.newBatch));
+    const start = dropArea('Drop the ServiceNow export, or it and the reports together', files => loadAll(files, 'tickets'));
+    body.replaceChildren(start, restoreReportButton(work, body, work.newBatch));
+    work.liveEntry.hidden = false;
+    work.startScreen = start;
   };
+  new window.MutationObserver(() => { work.liveEntry.hidden = !body.contains(work.startScreen); }).observe(body, { childList: true });
   work.newBatch();
   return work;
 }
 __exports.reportTimeLine = reportTimeLine;
 __exports.COMPACT_STYLE = COMPACT_STYLE;
 __exports.mountPanel = mountPanel;
+__exports.DROP_WORDS = DROP_WORDS;
+__exports.hideTaxOnConsulting = hideTaxOnConsulting;
 __exports.showLoad = showLoad;
 __exports.attachReport = attachReport;
 __exports.start = start;
@@ -15300,5 +15267,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.13.8");
+__snoozeLoad("screen/panel.js").start("0.13.9");
 })();
