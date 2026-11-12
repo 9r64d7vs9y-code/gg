@@ -1,4 +1,4 @@
-// v0.13.7
+// v0.13.8
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -3572,14 +3572,13 @@ const { addDays, compareDays, mondayOf, todayOf, usDate, workingDays } = __requi
 const { within } = __require("../rules/leaves.js");
 const { PageError, stopFlagged } = __require("./dom.js");
 const { cancelBatchWindows } = __require("./batch.js");
-const { pageReady, allowWeeklyRows } = __require("./schedule.js");
+const { pageReady } = __require("./schedule.js");
 const { copyWindow, compareCopies } = __require("./copy.js");
 const { deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
 const sameRow = (a, b) => compareCopies({ days: [a] }, { days: [b] }).same;
 const sameBut = (old, row) => sameRow({ ...old, hours: row.hours }, row);
 async function weeklyRestorePlan(backup, { after = null, today = todayOf(), verifyBefore } = {}) {
   const window = backup.watchedWindow || backup.window;
-  allowWeeklyRows();
   const before = await copyWindow(window, { future: true });
   await verifyBefore?.(before);
   const inside = row => within(row.day, backup.window);
@@ -3859,7 +3858,16 @@ const visibleCovers = styleOf => {
   const visible = screenReader(document, styleOf);
   return [...document.querySelectorAll(BUSY)].filter(node => visible(node) && styleOf(node).pointerEvents !== 'none');
 };
-async function pageReady(what, timeout = WAIT.person) {
+let quietProof = null;
+const ownChange = record => {
+  const node = record.target?.nodeType === 1 ? record.target : record.target?.parentElement;
+  return !!node?.closest?.('#snooze-panel-host');
+};
+const stillQuiet = () => !!quietProof && quietProof.document === document && !quietProof.touched && !quietProof.watch.takeRecords().some(record => !ownChange(record)) && !busyCovers().length;
+async function pageReady(what, timeout = WAIT.person, { reuseQuiet = false } = {}) {
+  if (reuseQuiet && stillQuiet()) { pageReady.waited = 0; return; }
+  quietProof?.watch.disconnect();
+  quietProof = null;
   const started = Date.now();
   let clearSince = null;
   await waitFor(() => {
@@ -3874,6 +3882,10 @@ async function pageReady(what, timeout = WAIT.person) {
     throw keepFlags(error, new PageError(`${error.message} The loading cover ${describe(cover)} is still there${box ? ` (${Math.round(box.width)}×${Math.round(box.height)} px, opacity ${style.opacity}, z-index ${style.zIndex}, position ${style.position})` : ''}.`));
   });
   pageReady.waited = Date.now() - started - WAIT.quiet;
+  const proof = { touched: false, document };
+  proof.watch = new document.defaultView.MutationObserver(records => { if (records.some(record => !ownChange(record))) proof.touched = true; });
+  proof.watch.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+  quietProof = proof;
 }
 pageReady.waited = 0;
 function currentPerson() {
@@ -3992,6 +4004,11 @@ function weeklyRowsShown(rows, range) {
   });
 }
 function allowWeeklyRows(on = true) { weeklyRowsAllowed = on; }
+const weeklyRowsOn = () => weeklyRowsAllowed;
+async function withWeeklyRows(read, on = true) {
+  weeklyRowsAllowed = on;
+  try { return await read(); } finally { weeklyRowsAllowed = false; }
+}
 let greyedWeekStart = false;
 function allowGreyedWeekStart(on = true) { greyedWeekStart = on; }
 function beginScheduleTurn() { beginRefusalTurn(); weeklyRowsAllowed = false; greyedWeekStart = false; }
@@ -4436,7 +4453,7 @@ function entryPointIn(entry) {
   return null;
 }
 async function menuItem(spots, label, again = true, inspect = false, optional = false) {
-  await pageReady(`before right-clicking for ${label}`);
+  await pageReady(`before right-clicking for ${label}`, WAIT.person, { reuseQuiet: true });
   const tried = [];
   let clicks = 0;
   for (const spot of spots) {
@@ -4939,6 +4956,8 @@ __exports.requirePersonIdentity = requirePersonIdentity;
 __exports.waitForPersonIdentity = waitForPersonIdentity;
 __exports.weeklyRowsShown = weeklyRowsShown;
 __exports.allowWeeklyRows = allowWeeklyRows;
+__exports.weeklyRowsOn = weeklyRowsOn;
+__exports.withWeeklyRows = withWeeklyRows;
 __exports.allowGreyedWeekStart = allowGreyedWeekStart;
 __exports.beginScheduleTurn = beginScheduleTurn;
 __exports.pageCalm = pageCalm;
@@ -6356,7 +6375,7 @@ const { addDays, compareDays, sameDay, todayOf, usDate } = __require("../rules/d
 const { within } = __require("../rules/leaves.js");
 const { termDayOf } = __require("../rules/shared.js");
 const { compareByDay, RESTORE_FIELDS, pastReportWarning } = __require("../run/backup.js");
-const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity, scheduleFacts, pageReady } = __require("./schedule.js");
+const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity, scheduleFacts, pageReady, withWeeklyRows } = __require("./schedule.js");
 const { isEditableDay } = __require("./editability.js");
 const { deleteAll, deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
 const { copyWindow, coverAssignmentRange, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows } = __require("./copy.js");
@@ -6666,12 +6685,12 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
 function restorePlan(backup, options = {}) {
   const identity = options.identity || personIdentity();
   return withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), async () => ({
-    ...await (backup.site === 'tax' ? taxRestorePlan : backup.site === 'weekly' ? weeklyRestorePlan : restorePlanRecorded)(backup, options), identity,
+    ...await withWeeklyRows(() => (backup.site === 'tax' ? taxRestorePlan : backup.site === 'weekly' ? weeklyRestorePlan : restorePlanRecorded)(backup, options), backup.site === 'weekly'), identity,
   }));
 }
 function restoreWindow(backup, options = {}) {
   const identity = options.identity || personIdentity();
-  return withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), async () => ({ ...await (backup.site === 'tax' ? restoreTaxWindow : backup.site === 'weekly' ? restoreWeeklyWindow : restoreWindowRecorded)(backup, options), warning: pastReportWarning(backup) })).finally(retireAddRead);
+  return withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), async () => ({ ...await withWeeklyRows(() => (backup.site === 'tax' ? restoreTaxWindow : backup.site === 'weekly' ? restoreWeeklyWindow : restoreWindowRecorded)(backup, options), backup.site === 'weekly'), warning: pastReportWarning(backup) })).finally(retireAddRead);
 }
 async function restoreTaxWindow(backup, options = {}) {
   const on = (copy, day) => ({ days: copy.days.filter(row => sameDay(row.day, day)) });
@@ -7520,7 +7539,7 @@ function mailGroup(row) {
   const one = row.one, mail = rowMail(row), template = mail?.template;
   if (one.record.subcategory?.site === 'tax' || one.slice?.site === 'tax') return 'Tax LOA';
   if (template === 'AAMissingDp') return 'A&A: no Deployment Professional';
-  if (template === 'AALoaAsk') return 'A&A LOA';
+  if (template === 'AALoaAsk' || template === 'AALoaExact') return 'A&A LOA';
   if (/^AA[123]$/.test(template)) return 'A&A Exit: asking permission';
   if (template === 'AA4') return 'A&A Exit: DNS';
   if (template === 'F') return 'Exit: no last working day';
@@ -7844,7 +7863,7 @@ const { PageError, setBatchGuard, stopFlagged, waitFor, WAIT, guardReady } = __r
 const { sessionExpired, cancelBatchWindows, closeSkippedPerson, batchCover, unlockPage, watchConnection, connectionPageReady, CONNECTION_WORDS } = __require("../mysource/batch.js");
 const { todayOf, compareDays, workingDays, usDate } = __require("../rules/dates.js");
 const { compareCopies, copyWindow } = __require("../mysource/copy.js");
-const { openPerson, personIdentity, checkPersonIdentity, waitForPersonIdentity, pageCalm, resumePageReady, requireSchedulePage, SCHEDULE_PAGE_WORDS, IDENTITY_PAUSE_WORDS, sameExitCalendar, allowWeeklyRows } = __require("../mysource/schedule.js");
+const { openPerson, personIdentity, checkPersonIdentity, waitForPersonIdentity, pageCalm, resumePageReady, requireSchedulePage, SCHEDULE_PAGE_WORDS, IDENTITY_PAUSE_WORDS, sameExitCalendar, withWeeklyRows } = __require("../mysource/schedule.js");
 const { reasonLine, notOnReportReason, PAST_DATES_WORDS, reportNotReadyLine } = __require("../screen/wording.js");
 const { checkLoaAdded, checkDnsAdded, DNS_CLIENT } = __require("../mysource/checks.js");
 const { valueKey } = __require("../rules/prepare.js");
@@ -8245,9 +8264,9 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
             ? row.prepared.addDns ? { ...plan, dnsEnd: row.prepared.editableDnsEnd } : null
             : plan.action === 'dns' ? plan : null;
           const greyed = row.prepared.greyedExit;
-          if (row.prepared.weekly) allowWeeklyRows();
-          const again = await step(() => copyWindow(row.prepared.watchedWindow, { future: ['dns', 'clearClients'].includes(row.one.decision.plan.action),
-            ...(greyed ? { anchors: row.after.days.filter(one => valueKey(one.client) === valueKey(DNS_CLIENT)), allowUnavailable: true } : {}) }));
+          const read = () => copyWindow(row.prepared.watchedWindow, { future: ['dns', 'clearClients'].includes(row.one.decision.plan.action),
+            ...(greyed ? { anchors: row.after.days.filter(one => valueKey(one.client) === valueKey(DNS_CLIENT)), allowUnavailable: true } : {}) });
+          const again = await step(() => withWeeklyRows(read, !!row.prepared.weekly));
           if (!again) {
             if (!sameExitCalendar(row.prepared.calendarAfter, row.prepared.watchedWindow.start)) throw new PageError('A completed person changed after the run stopped. The batch stopped.');
             continue;
@@ -9008,6 +9027,48 @@ __exports.reportDays = reportDays;
 __exports.compareByDay = compareByDay;
 __exports.pastReportWarning = pastReportWarning;
 },
+"run/audit-loa.js": function (__require, __exports, document, window) {
+'use strict';
+const { addDays, compareDays, mondayOf, workingDays } = __require("../rules/dates.js");
+const { entryKind } = __require("../rules/entries.js");
+const { reportAssignPeriod } = __require("../files/report.js");
+const { reportDays } = __require("./backup.js");
+const DAY_HOURS = 8;
+const near = (a, b) => Math.abs(a - b) < 0.001;
+const later = (a, b) => (compareDays(a, b) >= 0 ? a : b);
+const earlier = (a, b) => (compareDays(a, b) <= 0 ? a : b);
+function auditLoaExact({ slice, email, start, end, today }) {
+  if (!slice || !start || !end || !slice.reportEnd || compareDays(end, today) < 0) return false;
+  const period = reportAssignPeriod({ entries: slice.backupEntries ?? slice.entries ?? [] }, email);
+  if (period !== 'Time' && period !== 'Weekly') return false;
+  const from = later(start, today);
+  const after = workingDays(addDays(end, 1), addDays(end, 7))[0];
+  const before = workingDays(addDays(start, -7), addDays(start, -1)).at(-1);
+  const checkBefore = before && compareDays(start, today) > 0 && compareDays(before, today) >= 0;
+  if (!after || compareDays(after, slice.reportEnd) > 0) return false;
+  let rows;
+  try {
+    rows = reportDays({ ...slice, entries: slice.backupEntries ?? slice.entries }, { start: addDays(mondayOf(from), -7), end: addDays(mondayOf(after), 6) });
+  } catch { return false; }
+  const loa = row => entryKind(row) === 'loa';
+  const on = day => rows.filter(row => compareDays(row.day, day) === 0);
+  if (period === 'Time') {
+    for (const day of workingDays(from, end)) {
+      const here = on(day);
+      if (!here.length || !here.every(loa) || !near(here.reduce((sum, row) => sum + row.hours, 0), DAY_HOURS)) return false;
+    }
+    return ![after, ...(checkBefore ? [before] : [])].some(day => on(day).some(loa));
+  }
+  const weekLoa = monday => rows.filter(row => loa(row) && compareDays(mondayOf(row.day), monday) === 0).reduce((sum, row) => sum + row.hours, 0);
+  for (let monday = mondayOf(from); compareDays(monday, end) <= 0; monday = addDays(monday, 7)) {
+    const leaveDays = workingDays(later(start, monday), earlier(end, addDays(monday, 4))).length;
+    if (!near(weekLoa(monday), DAY_HOURS * leaveDays)) return false;
+  }
+  const outside = [mondayOf(after), ...(checkBefore ? [mondayOf(before)] : [])].filter(monday => compareDays(monday, mondayOf(end)) > 0 || compareDays(monday, mondayOf(start)) < 0);
+  return outside.every(monday => near(weekLoa(monday), 0));
+}
+__exports.auditLoaExact = auditLoaExact;
+},
 "rules/leaves.js": function (__require, __exports, document, window) {
 'use strict';
 const { addDays, compareDays, usDate, workingDays } = __require("./dates.js");
@@ -9208,7 +9269,8 @@ const { compareCopies, copyWindow, entriesToAdd, dayOf, ENTRY_FIELDS, knownAssig
 const { restoreWindow, restorePlan } = __require("../mysource/restore.js");
 const { LOA_CLIENT, DNS_CLIENT, checkDnsAdded, checkLoaAdded } = __require("../mysource/checks.js");
 const { compareByDay, reportDays, withPagePricing, validatePageDays } = __require("./backup.js");
-const { requireDayReport } = __require("../files/report.js");
+const { requireDayReport, reportAssignPeriod } = __require("../files/report.js");
+const { auditLoaExact } = __require("./audit-loa.js");
 const { checkPerson, termDayOf } = __require("../rules/shared.js");
 const { exitMailChoice, decideExit } = __require("../rules/exit.js");
 const { reasonLine, notOnReportReason } = __require("../screen/wording.js");
@@ -9221,6 +9283,17 @@ const firstDifference = first => `${first.date}, ${first.client}: ${first.field}
 function reportMismatch(stop, differences) {
   return { stop, reasonCode: 'pageReportMismatch',
     skipReason: `Schedule differs from the Staff Schedule Hours Report: ${differences.length} day${differences.length === 1 ? '' : 's'} (first: ${firstDifference(differences[0])}); nothing changed` };
+}
+function reportAlreadyDone({ slice, plan, today, email, greyed, withoutNotes }) {
+  if (plan.action !== 'dns' || greyed || !slice?.reportEnd) return null;
+  const window = { start: today, end: addDays(plan.dnsEnd, 56) };
+  if (compareDays(window.end, slice.reportEnd) > 0) return null;
+  const entries = slice.backupEntries ?? slice.entries ?? [];
+  if (withoutNotes && reportAssignPeriod({ entries }, email) === 'Weekly') return null;
+  let days;
+  try { days = reportDays({ ...slice, entries }, window); } catch { return null; }
+  if (days.some(row => compareDays(row.day, plan.dnsStart) < 0)) return null;
+  return alreadyAdded({ days }, plan.dnsStart, plan.dnsEnd, DNS_CLIENT, true) ? { days, window, fromReport: true } : null;
 }
 function alreadyAdded(copy, start, end, client, future = false) {
   const rows = copy.days.filter(row => compareDays(row.day, start) >= 0 && (future || compareDays(row.day, end) <= 0));
@@ -9356,8 +9429,11 @@ async function prepareAuditReadOnly(one, today, step) {
   rememberPageName(one.record, await step(() => openPerson(one.record.email, one.record.person.professional, one.record, { today, termDate: one.record.person.termDate })));
   const identity = personIdentity();
   await requirePersonIdentity(identity);
-  return { nothing: 'A&A: no schedule change.', identity,
-    checks: [['✓', 'Schedule read only; nothing changed', '']] };
+  const plan = one.decision.plan;
+  const loaExact = one.record.notification.kind === 'leave'
+    && auditLoaExact({ slice: one.slice, email: one.record.email, start: plan.leaveStart, end: plan.loaEnd, today });
+  return { nothing: loaExact ? 'A&A: LOA already exact; no schedule change.' : 'A&A: no schedule change.', identity, loaExact,
+    checks: [['✓', loaExact ? 'The report shows the LOA exactly; nothing changed' : 'Schedule read only; nothing changed', '']] };
 }
 function recordLaterChange(prepared, after, notesChanged = false) {
   if (!prepared.reportEnd) return;
@@ -9608,11 +9684,28 @@ async function prepareExit(one, version, today, { step }) {
   let greyed = startGreyed || termLimitsDns;
   const editableDnsEnd = permittedEnd || (termLimitsDns ? addDays(termDay, -1) : plan.dnsEnd);
   let addDns = !startGreyed && workingDays(plan.dnsStart, editableDnsEnd).length > 0;
+  const reportSays = reportAlreadyDone({ slice, plan, today, email: record.email, greyed: startGreyed || termLimitsDns, withoutNotes });
+  if (reportSays) {
+    one.exit = { template: exitMailChoice({ clientHours: 0, greyed: false }), greyed: false, clientHours: 0, dnsInPlace: true,
+      dpName: facts.resourceManager || slice.resourceManager || record.person.resourceManager || '',
+      dpEmail: facts.resourceManagerEmail || slice.resourceManagerEmail || '', dpNotFound: valueKey(facts.resourceManager || slice.resourceManager || record.person.resourceManager) === 'not applicable' };
+    plan.greyed = false;
+    return { nothing: 'DNS already there; no change', alreadyDone: true, fromReport: true, checks: [], identity, copy: reportSays, termGreyed, greyedExit };
+  }
   if (withoutNotes) allowWeeklyRows();
   if (withoutNotes && greyedExit) allowGreyedWeekStart();
-  const copy = await step(() => copyWindow({ start: today, end: addDays(plan.dnsEnd, 56) }, { future: true, keepOpen: greyedExit }));
+  let copy;
+  try { copy = await step(() => copyWindow({ start: today, end: addDays(plan.dnsEnd, 56) }, { future: true, keepOpen: greyedExit })); }
+  catch (error) { if (withoutNotes) { allowWeeklyRows(false); allowGreyedWeekStart(false); } throw error; }
   const initialEdit = knownAssignmentRows(copy).edit;
-  const weeklyPerson = withoutNotes && weeklyRowsShown(knownAssignmentRows(copy).rows, knownAssignmentRows(copy).range);
+  const reportPeriod = withoutNotes ? reportAssignPeriod({ entries: slice.backupEntries ?? slice.entries ?? [] }, record.email) : 'unknown';
+  const pageWeekly = withoutNotes && weeklyRowsShown(knownAssignmentRows(copy).rows, knownAssignmentRows(copy).range);
+  if (reportPeriod === 'Time' && pageWeekly) {
+    allowWeeklyRows(false); allowGreyedWeekStart(false);
+    if (initialEdit?.isConnected) await step(() => closeEdit(initialEdit));
+    return { stop: 'The report says Time but the schedule shows Weekly rows. Nothing was changed; By hand.', reasonCode: 'assignPeriodDisagrees' };
+  }
+  const weeklyPerson = withoutNotes && (reportPeriod === 'Weekly' || pageWeekly);
   if (withoutNotes && greyedExit && !weeklyPerson && knownAssignmentRows(copy).range?.weekBoxes && compareDays(mondayOf(today), today) < 0) {
     allowGreyedWeekStart(false);
     if (initialEdit?.isConnected) await step(() => closeEdit(initialEdit));
@@ -9946,6 +10039,7 @@ async function applyTax(one, prepared, { step = fn => fn(), onWrite = () => {} }
 }
 __exports.BACKUP_KIND = BACKUP_KIND;
 __exports.TERM_DATE_UNDO = TERM_DATE_UNDO;
+__exports.reportAlreadyDone = reportAlreadyDone;
 __exports.alreadyAdded = alreadyAdded;
 __exports.prepare = prepare;
 __exports.apply = apply;
@@ -13795,7 +13889,7 @@ function runReportText(batch, version, now = Date.now()) {
     const kind = one.record.notification?.kind === 'exit' ? 'Exit' : one.record.notification?.kind === 'leave' || one.decision.plan?.action === 'add' ? 'LOA' : 'unknown';
     let mail;
     try { mail = row.state === 'timeLimit' || one.slice?.status === 'notOnReport' ? null : one.record.subcategory?.business === 'audit' ? chooseMail(one, row.prepared)?.template : one.exit?.template || chooseMail(one, row.prepared)?.template; } catch { mail = null; }
-    const safeMail = ['A', 'B', 'C', 'D', 'F', 1, 2, 3, 4, 5, '1', '2', '3', '4', '5', 'AA1', 'AA2', 'AA3', 'AA4', 'AALoaAsk', 'AAMissingDp'].includes(mail) ? mail : 'none';
+    const safeMail = ['A', 'B', 'C', 'D', 'F', 1, 2, 3, 4, 5, '1', '2', '3', '4', '5', 'AA1', 'AA2', 'AA3', 'AA4', 'AALoaAsk', 'AALoaExact', 'AAMissingDp'].includes(mail) ? mail : 'none';
     const comparison = data.comparison;
     const fields = (comparison?.fields || []).filter(value => FIELDS.has(value));
     const pictures = number(data.pictures) ?? one.outputs?.screenshots?.length ?? 0;
@@ -14078,14 +14172,16 @@ function mailText(one, mail, { dpName = '', dpEmail = '', signOff = '' } = {}) {
   };
 }
 const AUDIT_LOA_ASK = "We have received the ELE notification for this professional's Leave of Absence. As per the Audit & Assurance process, we update the LOA only with your approval. Please let us know if we should add the LOA for the dates below and remove the scheduled hours in that period.";
+const AUDIT_LOA_EXACT = "We have received the ELE notification for this professional's Leave of Absence. As per the Audit & Assurance process, we checked the schedule: the LOA for the dates below is already on it exactly, so no change was needed.";
 function chooseAuditMail(one, worked) {
   if (one.personStop?.code === 'auditMissingDp') return { template: 'AAMissingDp', attachReport: false, paragraphs: [
     'This profile in MySource does not have a Deployment Professional aligned. As per the instructions from Audit & Assurance Deployment Leadership, we are forwarding this to you for further action.',
     HELP,
   ] };
   if (one.personStop || ['byHand', 'notHandled'].includes(one.decision.outcome) || !worked) return null;
-  if (one.record.notification.kind === 'leave') return { template: 'AALoaAsk', attachReport: false,
-    paragraphs: [AUDIT_LOA_ASK, `${ATTACHED.noReport} ${HELP}`] };
+  if (one.record.notification.kind === 'leave') return worked?.loaExact
+    ? { template: 'AALoaExact', attachReport: false, paragraphs: [AUDIT_LOA_EXACT, `${ATTACHED.noReport} ${HELP}`] }
+    : { template: 'AALoaAsk', attachReport: false, paragraphs: [AUDIT_LOA_ASK, `${ATTACHED.noReport} ${HELP}`] };
   const audit = one.decision.audit;
   if (!audit) return null;
   const date = usDate(audit.from);
@@ -15204,5 +15300,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.13.7");
+__snoozeLoad("screen/panel.js").start("0.13.8");
 })();
