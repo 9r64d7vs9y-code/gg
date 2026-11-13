@@ -1,4 +1,4 @@
-// v0.15.5
+// v0.15.6
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -15162,7 +15162,7 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
       const source = error?.liveStop || data.events.findLast(e => e.type === 'error' && e.reasonName === failure.reasonName && e.step === failure.step);
       const stopped = { ...failure, time: elapsed(), lastAction:source?.lastAction || (stageStep === failure.step ? lastAction : 'unknown'), stage: source?.stage || word(error?.stage, stages, stageStep === failure.step ? stage : 'unknown'), page: source?.page || snapshot(), held: heldDates(error?.dateDiagnostics || error?.pickerDateDiagnostics),
         at: Number.isSafeInteger(source?.at) ? source.at : source ? data.events.lastIndexOf(source) : -1, closeUp: cleanCloseUp(error?.leaveSnapshot),
-        message: error?.name === 'PageError' ? stopSentence(error.message) || redactMessage(error.message, privateWords()) : null };
+        message: error?.name === 'PageError' ? stopSentence(error.message) || redactMessage(error.message, privateWords()) : programError(error, privateWords()) };
       data.stop ||= stopped;
       Object.assign(result.steps.find(s => s.id === step) || {}, { code:failure.code, reasonName:failure.reasonName });
       recordRun({ type:'stop', ...failure, result:'failed' });
@@ -15442,6 +15442,14 @@ function shortLiveReport(result) {
     lines.splice(closeUp >= 0 ? closeUp : after >= 0 ? after+1 : lines.length, 0, ...trail);
   }
   return lines.join('\n');
+}
+function programError(error, words = {}) {
+  if (!error || typeof error !== 'object' || typeof error.name !== 'string') return null;
+  const kind = /^[A-Za-z]{1,40}$/.test(error.name) ? error.name : 'Error';
+  const where = [...String(error.stack || '').matchAll(/\bat (?:async )?(?:new )?([A-Za-z_$][\w$.]{0,60})(?: \[as [\w$]+\])? \(([^)\s]*)/g)]
+    .filter(match => !/^node:|node_modules/.test(match[2])).map(match => match[1].replace(/^Object\./, ''))
+    .filter(name => !/^(?:Promise|Array|Generator|process)\b/.test(name)).slice(0, 3);
+  return redactMessage(`Program error ${kind}: ${String(error.message || '').slice(0, 160)}${where.length ? ` · in ${where.join(' < ')}` : ''}`, words);
 }
 function liveEventLog(result) {
   const report=liveReportSummary(result,false), events=(result.diagnostic?.events || []).map(cleanEvent);
@@ -16977,5 +16985,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.5");
+__snoozeLoad("screen/panel.js").start("0.15.6");
 })();
