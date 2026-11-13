@@ -1,4 +1,4 @@
-// v0.15.7
+// v0.15.8
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -3030,6 +3030,18 @@ const CLASS_WORDS = ['odd', 'even', 'selected', 'shown', 'parent', 'child', 'act
   'danger', 'warning', 'success', 'info', 'deleted', 'removed', 'strike', 'hidden', 'disabled', 'other'];
 const ATTRIBUTE_WORDS = ['style', 'data-id', 'role', 'id', 'hidden', 'aria-hidden', 'aria-selected', 'tabindex', 'data-dt-row', 'other'];
 const words = (list, allowed) => [...new Set((Array.isArray(list) ? list : []).filter(item => allowed.includes(item)))].slice(0, 4);
+const HEAD_ATTRIBUTE_WORDS = [...ATTRIBUTE_WORDS, 'aria-sort', 'aria-label', 'aria-controls', 'aria-describedby', 'aria-disabled', 'aria-checked', 'disabled', 'checked', 'colspan', 'rowspan', 'width', 'title', 'type', 'name', 'value'];
+const HEAD_CLASS_WORDS = [...CLASS_WORDS, 'sorting', 'sorting_asc', 'sorting_desc', 'sorting_disabled', 'dataTable', 'no-footer', 'table', 'table-bordered', 'table-hover', 'table-data-grid', 'inline-edit', 'action-column', 'notes-editable', 'collapsed', 'dtr-inline', 'checked'];
+const STYLE_WORDS = ['width', 'min-width', 'max-width', 'height', 'display', 'visibility', 'padding-right', 'padding-left', 'box-sizing', 'position', 'opacity', 'order', 'other'];
+const PLACE = /^(?:(?:table|caption|colgroup|col|thead|tbody|tfoot|tr|th|td|input|select|button|span|div|i|a|label|other)(?: \d{1,3})?(?: |$)){1,3}$/;
+const CONTROL = /^(?:controls \d{1,3}→\d{1,3}|(?:input|select|textarea) \d{1,3} (?:value|checked|disabled|options)(?:\/(?:value|checked|disabled|options)){0,3})$/;
+function cleanHead(raw) {
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.list)) return null;
+  const list = raw.list.slice(0, 3).filter(item => item && typeof item.where === 'string' && PLACE.test(item.where)).map(item => ({
+    where: item.where, kinds: words(item.kinds, ['node', 'text', 'children']), attributes: words(item.attributes, HEAD_ATTRIBUTE_WORDS),
+    style: words(item.style, STYLE_WORDS), classFrom: words(item.classFrom, HEAD_CLASS_WORDS), classTo: words(item.classTo, HEAD_CLASS_WORDS) }));
+  return { list, more: count(raw.more) || 0 };
+}
 function cleanCloseUp(raw) {
   if (!raw || typeof raw !== 'object') return null;
   if (raw.unreadable === true) return { unreadable: true };
@@ -3041,7 +3053,8 @@ function cleanCloseUp(raw) {
     tables: { here: count(raw.tables?.here), page: count(raw.tables?.page), shown: count(raw.tables?.shown) },
     window: pick(raw.window, ['shown', 'hidden', 'gone']), editsShown: count(raw.editsShown), viewNotes: yes(raw.viewNotes),
     shell: pick(raw.shell, ['same', 'differs', 'values', 'unread']), ids: pick(raw.ids, ['same', 'differ']),
-    missing: count(raw.missing), extra: count(raw.extra), changed: count(raw.changed), first: null };
+    missing: count(raw.missing), extra: count(raw.extra), changed: count(raw.changed), first: null,
+    head: cleanHead(raw.head), headControls: (Array.isArray(raw.headControls) ? raw.headControls : []).filter(item => typeof item === 'string' && CONTROL.test(item)).slice(0, 3) };
   const first = raw.first;
   if (first && typeof first === 'object') safe.first = { classOnly: yes(first.classOnly), classFrom: words(first.classFrom, CLASS_WORDS), classTo: words(first.classTo, CLASS_WORDS),
     attributes: words(first.attributes, ATTRIBUTE_WORDS), cells: yes(first.cells), text: yes(first.text), values: yes(first.values) };
@@ -3058,7 +3071,14 @@ function closeUpWords(raw) {
   else if (c.target) parts.push(`binned row still in, ${c.target}${c.copies > 1 ? ` (${c.copies} copies)` : ''}: display ${c.display || '?'}, marked ${yn(c.marked)}, struck ${yn(c.struck)}`);
   parts.push(`tables ${n(c.tables.here)} in window, ${n(c.tables.page)} on page, ${n(c.tables.shown)} shown`);
   parts.push(`window ${c.window || '?'}`, `Edit shown ${n(c.editsShown)}`, `View Notes ${c.viewNotes === true ? 'open' : c.viewNotes === false ? 'closed' : '?'}`);
-  if (c.shell) parts.push(`head ${c.shell === 'values' ? 'values differ' : c.shell}`);
+  if (c.shell) {
+    const list = l => l.length ? l.join('/') : 'none';
+    const where = c.head?.list.map(item => `${item.where} ${[item.kinds.length ? item.kinds.join('/') : null, item.attributes.length ? `attributes ${item.attributes.join('/')}` : null,
+      item.style.length ? `style ${item.style.join('/')}` : null, item.classFrom.length || item.classTo.length ? `class ${list(item.classFrom)}→${list(item.classTo)}` : null].filter(Boolean).join(', ') || 'unclear'}`) || [];
+    const more = c.head?.more ? [`${c.head.more} more`] : [];
+    const detail = c.shell === 'differs' ? [...where, ...more] : c.shell === 'values' ? c.headControls : [];
+    parts.push(`head ${c.shell === 'values' ? 'values differ' : c.shell}${detail.length ? ` (${detail.join('; ')})` : ''}`);
+  }
   if (c.ids) parts.push(`ids ${c.ids}${c.missing ? `, ${c.missing} missing` : ''}${c.extra ? `, ${c.extra} extra` : ''}`);
   if (c.changed != null) {
     const f = c.first;
@@ -6234,6 +6254,55 @@ function rowDifference(old, now, sameValues) {
     cells, text: text(old) !== text(now), values: !sameValues,
   };
 }
+const PLACE_TAGS = new Set(['table', 'caption', 'colgroup', 'col', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td', 'input', 'select', 'button', 'span', 'div', 'i', 'a', 'label']);
+const HEAD_ATTRIBUTE_WORDS = new Set([...ATTRIBUTE_WORDS, 'aria-sort', 'aria-label', 'aria-controls', 'aria-describedby', 'aria-disabled', 'aria-checked', 'disabled', 'checked', 'colspan', 'rowspan', 'width', 'title', 'type', 'name', 'value']);
+const HEAD_CLASS_WORDS = new Set([...CLASS_WORDS, 'sorting', 'sorting_asc', 'sorting_desc', 'sorting_disabled', 'dataTable', 'no-footer', 'table', 'table-bordered', 'table-hover', 'table-data-grid', 'inline-edit', 'action-column', 'notes-editable', 'collapsed', 'dtr-inline', 'checked']);
+const STYLE_WORDS = new Set(['width', 'min-width', 'max-width', 'height', 'display', 'visibility', 'padding-right', 'padding-left', 'box-sizing', 'position', 'opacity']);
+const styleMap = node => new Map(String(node.getAttribute('style') || '').split(';').map(part => part.split(':')).filter(pair => pair[0]?.trim()).map(([name, ...rest]) => [name.trim().toLowerCase(), rest.join(':').trim()]));
+function headDifferences(old, now, limit = 3) {
+  const found = [];
+  let total = 0;
+  const note = item => { total += 1; if (found.length < limit) found.push(item); };
+  const placeOf = (node, parentPlace) => {
+    const tag = node.tagName.toLowerCase(), name = PLACE_TAGS.has(tag) ? tag : 'other';
+    const same = node.parentElement ? [...node.parentElement.children].filter(other => other.tagName === node.tagName) : [node];
+    return [...parentPlace, same.length > 1 ? `${name} ${same.indexOf(node) + 1}` : name].slice(-3);
+  };
+  const walk = (a, b, place) => {
+    const where = place.join(' ');
+    if (a.nodeType !== b.nodeType || a.nodeType === 1 && a.tagName !== b.tagName) { note({ where, kinds: ['node'] }); return; }
+    if (a.nodeType === 3) { if (a.nodeValue !== b.nodeValue) note({ where, kinds: ['text'] }); return; }
+    if (a.nodeType !== 1) return;
+    const names = [...new Set([...a.getAttributeNames(), ...b.getAttributeNames()])].filter(name => a.getAttribute(name) !== b.getAttribute(name));
+    const was = classes(a), is = classes(b), oldStyle = styleMap(a), newStyle = styleMap(b);
+    const item = {
+      where, kinds: a.childNodes.length !== b.childNodes.length ? ['children'] : [],
+      attributes: [...new Set(names.filter(name => name !== 'class' && name !== 'style').map(name => word(name, HEAD_ATTRIBUTE_WORDS)))],
+      style: names.includes('style') ? [...new Set([...oldStyle.keys(), ...newStyle.keys()].filter(name => oldStyle.get(name) !== newStyle.get(name)).map(name => word(name, STYLE_WORDS)))] : [],
+      classFrom: [...new Set([...was].filter(name => !is.has(name)).map(name => word(name, HEAD_CLASS_WORDS)))],
+      classTo: [...new Set([...is].filter(name => !was.has(name)).map(name => word(name, HEAD_CLASS_WORDS)))],
+    };
+    if (names.includes('style') && !item.style.length) item.style = ['order'];
+    if (item.kinds.length || item.attributes.length || item.style.length || item.classFrom.length || item.classTo.length) note(item);
+    const count = Math.min(a.childNodes.length, b.childNodes.length);
+    for (let index = 0; index < count; index += 1) {
+      const child = a.childNodes[index];
+      walk(child, b.childNodes[index], child.nodeType === 1 ? placeOf(child, place) : place);
+    }
+  };
+  walk(old, now, placeOf(old, []));
+  return { list: found, more: Math.max(0, total - found.length) };
+}
+function headControls(old, now) {
+  const controls = node => [...node.querySelectorAll('input, select, textarea')];
+  const was = controls(old), is = controls(now);
+  if (was.length !== is.length) return [`controls ${was.length}→${is.length}`];
+  return was.flatMap((control, index) => {
+    const other = is[index], moved = ['value', 'checked', 'disabled'].filter(key => control[key] !== other[key]);
+    if (control.tagName === 'SELECT' && [...control.options].map(option => option.selected).join() !== [...other.options].map(option => option.selected).join()) moved.push('options');
+    return moved.length ? [`${control.tagName.toLowerCase()} ${index + 1} ${moved.join('/')}`] : [];
+  }).slice(0, 3);
+}
 const unstriped = node => { const clone = node.cloneNode(true); clone.classList.remove('odd', 'even'); if (!clone.classList.length) clone.removeAttribute('class'); return clone; };
 function removalCloseUp(edit, { bin, of, when, targetId, removed = new Set(), originalRows = null, originalShell = null, originalShellValues = null, shell = null, values = null }) {
   try {
@@ -6261,6 +6330,8 @@ function removalCloseUp(edit, { bin, of, when, targetId, removed = new Set(), or
     };
     if (!kept) return snap;
     snap.shell = !table || !originalShell || !shell ? 'unread' : !shell(table).isEqualNode(originalShell) ? 'differs' : values && values(shell(table)) !== originalShellValues ? 'values' : 'same';
+    if (snap.shell === 'differs') snap.head = headDifferences(originalShell, shell(table));
+    if (snap.shell === 'values') snap.headControls = headControls(originalShell, shell(table));
     const ids = rows.map(node => node.getAttribute('data-id')), wanted = new Set(kept);
     snap.ids = ids.length === kept.length && new Set(ids).size === ids.length && ids.every(id => wanted.has(id)) ? 'same' : 'differ';
     snap.missing = kept.filter(id => !ids.includes(id)).length;
@@ -6275,6 +6346,7 @@ function removalCloseUp(edit, { bin, of, when, targetId, removed = new Set(), or
     return snap;
   } catch { return { unreadable: true }; }
 }
+__exports.headDifferences = headDifferences;
 __exports.removalCloseUp = removalCloseUp;
 },
 "mysource/note-stage.js": function (__require, __exports, document, window) {
@@ -16984,5 +17056,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.7");
+__snoozeLoad("screen/panel.js").start("0.15.8");
 })();
