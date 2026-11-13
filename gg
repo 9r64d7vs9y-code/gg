@@ -1,139 +1,158 @@
 (async () => {
-  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const options = window.snoozeCalendarProbeOptions || {};
+  const QUIET = options.quiet ?? 800, POLL = options.poll ?? 100, AGAIN = options.again ?? 2000, LIMIT = options.limit ?? 300000;
+  const sleep = options.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms))), clock = options.now || (() => Date.now());
   const shown = node => { if (!node) return false; const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
   const words = node => (node?.textContent || '').replace(/\s+/g, ' ').trim();
-  const lines = [], report = { probe: 'add-dates 1' };
-  const finish = () => {
-    const text = lines.join('\n');
-    console.log(JSON.stringify(report, null, 1));
-    console.log(text);
-    document.querySelector('[data-snooze-dates-probe]')?.remove();
-    const panel = document.createElement('pre');
-    panel.setAttribute('data-snooze-dates-probe', '');
-    panel.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:900px;white-space:pre-wrap;background:#111;color:#eee;font:12px/1.4 monospace;padding:10px;border:2px solid #6cf;margin:0';
-    panel.textContent = text;
-    document.body.append(panel);
-    try { copy(JSON.stringify(report)); } catch { /* copy() exists only in the DevTools console */ }
+  const started = clock(), at = () => ((clock() - started) / 1000).toFixed(1);
+  const report = { probe: 'calendar save 1', changes: [] }, lines = ['Calendar save probe 1 (reads only; saves nothing)'];
+  document.querySelector('[data-snooze-calendar-probe]')?.remove();
+  const panel = document.createElement('div');
+  panel.setAttribute('data-snooze-calendar-probe', '');
+  panel.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:760px;max-height:60vh;overflow:auto;background:#111;color:#eee;font:12px/1.4 monospace;padding:10px;border:2px solid #6cf';
+  const stop = document.createElement('button');
+  stop.textContent = 'Stop';
+  stop.style.cssText = 'float:right;font:12px sans-serif;margin-left:8px';
+  const text = document.createElement('pre');
+  text.style.cssText = 'margin:0;white-space:pre-wrap';
+  panel.append(stop, text);
+  document.body.append(panel);
+  let stopped = false;
+  stop.addEventListener('click', () => { stopped = true; });
+  const show = () => { text.textContent = lines.join('\n'); };
+  const BUSY = 'div.loading, .blockUI.blockOverlay, .loading-overlay';
+  const covers = () => [...document.querySelectorAll(BUSY)].filter(node => shown(node) && getComputedStyle(node).pointerEvents !== 'none').length;
+  const content = node => {
+    const control = node.closest('[id^="controlCalendar_"]');
+    if (!control) return true;
+    if (!control.querySelector(':scope > .fc-toolbar')) return false;
+    return !node.closest('.fc-view-container, .fc-view');
   };
-  const modal = [...document.querySelectorAll('#addShiftEventModal')].find(shown);
-  if (!modal) { lines.push('Dates probe 1: no open Add Assignment window. Open one with New Assignment first.'); finish(); return; }
-  const form = modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal.querySelector('form') || modal;
-  const labelShown = text => [...form.querySelectorAll('label')].some(node => shown(node) && words(node).replace(/[*?]/g, '').trim() === text);
-  const kind = labelShown('Hours Per Week') ? 'Weekly (Hours Per Week)' : labelShown('Hours Per Day') ? 'Daily (Hours Per Day)' : 'unknown';
-  const range = form.querySelector('.shift-date-picker');
-  const jq = window.jQuery;
-  report.window = kind;
-  lines.push(`Dates probe 1 · ${kind} window`);
-  if (!range) { lines.push('No Dates box (.shift-date-picker) in the window.'); finish(); return; }
-
-  const role = input => /-start$/.test(input.id) ? 'start' : /-end$/.test(input.id) ? 'end' : input.classList.contains('shift-date-picker-dates') ? 'dates' : 'other';
-  const dataOf = input => { try { return typeof jq === 'function' ? jq(input).data() || {} : {}; } catch { return {}; } };
-  const eventsOf = input => { try { const e = jq?._data?.(input, 'events') || {}; return Object.fromEntries(Object.entries(e).map(([name, list]) => [name, list.length])); } catch { return {}; } };
-  const inputs = [...range.querySelectorAll('input')];
-  report.boxes = inputs.map(input => ({ role: role(input), type: input.type, shown: shown(input), readOnly: input.readOnly, disabled: input.disabled,
-    classes: [...input.classList].join(' '), data: Object.keys(dataOf(input)), events: eventsOf(input) }));
-  lines.push('Boxes: ' + report.boxes.map(b => `${b.role} ${b.shown ? 'shown' : 'hidden'}${b.readOnly ? ' read-only' : ''}${b.data.length ? ' [' + b.data.join(',') + ']' : ''}`).join(' · '));
-  const shownBox = range.querySelector('input.shift-date-picker-dates') || inputs.find(input => role(input) === 'other');
-  const startBox = inputs.find(input => role(input) === 'start'), endBox = inputs.find(input => role(input) === 'end');
-  const pickerBox = [shownBox, startBox, endBox].find(input => input && (dataOf(input).datepicker || dataOf(input).daterangepicker));
-  const picker = pickerBox && (dataOf(pickerBox).datepicker || dataOf(pickerBox).daterangepicker);
-  const pickerKind = !picker ? 'none' : dataOf(pickerBox).datepicker ? 'bootstrap' : 'daterangepicker';
-  const methods = picker ? ['setDates', 'getDates', 'setDate', 'clearDates', 'update', 'show', 'hide', 'setStartDate', 'setEndDate'].filter(name => typeof picker[name] === 'function') : [];
-  const o = picker?.o || {};
-  const limit = value => value === Infinity || value === -Infinity ? String(value) : value instanceof Date ? 'a date' : value == null ? 'none' : typeof value;
-  report.picker = { on: pickerBox ? role(pickerBox) : 'none', kind: pickerKind, multidate: o.multidate ?? null, inputs: picker?.inputs?.length ?? 0, subPickers: picker?.pickers?.length ?? 0,
-    methods, startLimit: limit(o.startDate ?? picker?.minDate), endLimit: limit(o.endDate ?? picker?.maxDate), disabledWeekdays: (o.daysOfWeekDisabled || []).length,
-    disabledDates: (o.datesDisabled || []).length, beforeShowDay: typeof o.beforeShowDay, calendarWeeks: !!o.calendarWeeks, weekStart: o.weekStart ?? null,
-    shownBoxEvents: shownBox ? eventsOf(shownBox) : {}, startEvents: startBox ? eventsOf(startBox) : {} };
-  lines.push(`Picker: ${pickerKind} on the ${report.picker.on} box · multidate ${report.picker.multidate} · inputs ${report.picker.inputs} · sub-pickers ${report.picker.subPickers} · ${methods.join(',') || 'no methods'}`);
-  lines.push(`Limits: start ${report.picker.startLimit} · end ${report.picker.endLimit} · disabled weekdays ${report.picker.disabledWeekdays} · disabled dates ${report.picker.disabledDates} · beforeShowDay ${report.picker.beforeShowDay}`);
-  const ev = obj => Object.entries(obj).map(([k, v]) => `${k} ${v}`).join(', ') || 'none';
-  lines.push(`Handlers: dates box ${ev(report.picker.shownBoxEvents)} · start box ${ev(report.picker.startEvents)}`);
-
-  const us = d => `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}/${d.getFullYear()}`;
-  const heldDays = () => {
-    try {
-      if (pickerKind === 'bootstrap' && picker.pickers?.length === 2 && !(o.multidate >= 2 || o.multidate === true)) return picker.pickers.map(p => p.getDates?.()[0]).filter(Boolean).map(us);
-      if (pickerKind === 'bootstrap') return (picker.getDates?.() || []).map(us);
-      if (pickerKind === 'daterangepicker') return [picker.startDate?.format?.('MM/DD/YYYY'), picker.endDate?.format?.('MM/DD/YYYY')].filter(Boolean);
-    } catch (error) { return ['unreadable: ' + String(error?.message || error).slice(0, 80)]; }
-    return [];
-  };
-  const summary = () => { const text = words(range.closest('.dynamic-form-row, .form-group, .row') || range.parentElement) + ' ' + words(form);
-    const pick = name => (text.match(new RegExp(name + ':\\s*([\\d.]+)')) || [])[1] || '-';
-    return { weeks: pick('Weeks'), days: pick('Days'), total: pick('Total Hours') }; };
-  const state = () => { const held = heldDays(), s = summary();
-    return { start: startBox?.value || '', end: endBox?.value || '', datesBox: shownBox ? shownBox.value.slice(0, 60) : '', picker: held.length ? `${held.length} day(s) ${held[0]}${held.length > 1 ? ' to ' + held.at(-1) : ''}` : 'nothing', ...s }; };
-  const say = st => `boxes ${st.start || 'blank'} to ${st.end || 'blank'} · picker ${st.picker} · Weeks ${st.weeks} · Days ${st.days} · Total ${st.total}`;
-  report.opened = state();
-  lines.push('Opened with: ' + say(report.opened));
-
-  const parsed = (startBox?.value || '').match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (!parsed) { lines.push('Start box is not MM/DD/YYYY: no tries made. Press Cancel.'); finish(); return; }
-  const base = new Date(+parsed[3], +parsed[1] - 1, +parsed[2]);
-  const monday = new Date(base); monday.setDate(base.getDate() - ((base.getDay() + 6) % 7) + 7);
-  const weekFrom = offset => [0, 1, 2, 3, 4].map(n => { const d = new Date(monday); d.setDate(monday.getDate() + offset + n); return d; });
-  const days = weekFrom(0), days2 = weekFrom(7);
-  const wanted = `${us(days[0])} to ${us(days[4])}`, wanted2 = `${us(days2[0])} to ${us(days2[4])}`;
-  const matches = (st, list = days) => st.start === us(list[0]) && st.end === us(list[4]);
-  report.wanted = [wanted, wanted2];
-
-  try {
-    if (pickerKind === 'bootstrap' && (o.multidate === true || o.multidate >= 2)) { picker.clearDates?.(); jq(pickerBox).datepicker('setDates', days); }
-    else if (pickerKind === 'bootstrap' && picker.pickers?.length === 2) { (picker.inputs || []).forEach((input, i) => jq(input).datepicker('setDate', i ? days[4] : days[0])); }
-    else if (pickerKind === 'bootstrap') jq(pickerBox).datepicker('setDate', days[0]);
-    else if (pickerKind === 'daterangepicker') { picker.setStartDate(us(days[0])); picker.setEndDate(us(days[4])); jq(pickerBox).trigger('apply.daterangepicker', [picker]); }
-    await sleep(1500);
-    report.try1 = { ...state(), error: '' };
-  } catch (error) { report.try1 = { ...state(), error: String(error?.message || error).slice(0, 120) }; }
-  try { if (pickerKind === 'bootstrap') jq(pickerBox).datepicker('hide'); } catch { /* closing only */ }
-  lines.push(`Try 1 (Snooze's way), wanted ${wanted}: ${matches(report.try1) ? 'HELD' : 'NOT held'} · ${say(report.try1)}${report.try1.error ? ' · error ' + report.try1.error : ''}`);
-
-  const press = node => { for (const type of ['mousedown', 'mouseup', 'click']) node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })); };
-  const inDropdown = node => !!node?.closest('.datepicker, .daterangepicker') && !modal.querySelector('.modal-footer')?.contains(node);
-  const openPicker = async () => {
-    const box = shown(shownBox) ? shownBox : shown(startBox) ? startBox : null;
-    if (!box) return null;
-    box.focus(); press(box); await sleep(500);
-    return [...document.querySelectorAll('.datepicker-dropdown, .datepicker.dropdown-menu, .daterangepicker')].find(shown) || null;
-  };
-  const steps = [];
-  try {
-    let drop = await openPicker();
-    steps.push(drop ? 'picker opened' : 'picker did not open');
-    if (drop) {
-      const clear = [...drop.querySelectorAll('.clear, th.clear, button.cancelBtn')].find(shown);
-      if (clear && inDropdown(clear)) { press(clear); steps.push('Clear pressed'); await sleep(500); } else steps.push('no Clear');
-      drop = [...document.querySelectorAll('.datepicker-dropdown, .datepicker.dropdown-menu, .daterangepicker')].find(shown) || await openPicker();
-      const pickDay = async (day, name) => {
-        const view = () => { drop = [...document.querySelectorAll('.datepicker-dropdown, .datepicker.dropdown-menu, .daterangepicker')].find(shown) || drop;
-          return [...(drop?.querySelectorAll('.datepicker-days') || [])].find(shown) || drop; };
-        const target = `${['January','February','March','April','May','June','July','August','September','October','November','December'][day.getMonth()]} ${day.getFullYear()}`;
-        for (let i = 0; i < 36 && drop; i++) {
-          const title = words(view().querySelector('.datepicker-switch, .month'));
-          if (title === target) break;
-          const [m, y] = [title.split(' ')[0], +title.split(' ')[1]];
-          const at = y * 12 + ['January','February','March','April','May','June','July','August','September','October','November','December'].indexOf(m);
-          const arrow = view().querySelector(at < day.getFullYear() * 12 + day.getMonth() ? '.next' : '.prev');
-          if (!arrow || !inDropdown(arrow)) break;
-          press(arrow); await sleep(250);
-        }
-        const cells = [...view().querySelectorAll('td.day, td.available')].filter(cell => shown(cell) && !cell.matches('.old, .new, .off') && words(cell).replace(/\D.*$/, '') === String(day.getDate()));
-        if (cells.length !== 1 || !inDropdown(cells[0])) { steps.push(`${name} day not found (${cells.length})`); return false; }
-        press(cells[0]); steps.push(`${name} clicked`); await sleep(500);
-        return true;
-      };
-      if (drop && await pickDay(days2[0], 'start')) {
-        drop = [...document.querySelectorAll('.datepicker-dropdown, .datepicker.dropdown-menu, .daterangepicker')].find(shown) || await openPicker();
-        if (!drop) steps.push('picker closed after start');
-        else await pickDay(days2[4], 'end');
+  const styled = node => !node || node === document.body || !node.hidden && getComputedStyle(node).display !== 'none' && getComputedStyle(node).visibility !== 'hidden'
+    && (!node.classList.contains('tab-pane') || node.classList.contains('active')) && styled(node.parentElement);
+  const laidOut = () => document.body.getBoundingClientRect().width > 0;
+  const datedCell = cell => { if (!styled(cell)) return false; if (!laidOut()) return true; const box = cell.getBoundingClientRect(); return box.width > 0 && box.height > 0; };
+  const views = () => [...document.querySelectorAll('.fc-view')].filter(view => content(view) && styled(view) && [...view.querySelectorAll('td.fc-day[data-date]')].some(datedCell));
+  const gridColumn = target => {
+    const table = target.closest('table');
+    if (!table) return null;
+    const rows = [...table.querySelectorAll(':scope > tbody > tr, :scope > tr')], taken = [];
+    for (let r = 0; r < rows.length; r++) {
+      let col = 0;
+      for (const cell of rows[r].children) {
+        while (taken[r]?.[col]) col++;
+        if (cell === target) return cell.colSpan === 1 ? col : null;
+        for (let dr = 0; dr < Math.min(cell.rowSpan, rows.length - r); dr++) for (let dc = 0; dc < cell.colSpan; dc++) (taken[r + dr] ||= [])[col + dc] = true;
+        col += cell.colSpan;
       }
     }
-    await sleep(1500);
-    report.try2 = { ...state(), steps, error: '' };
-  } catch (error) { report.try2 = { ...state(), steps, error: String(error?.message || error).slice(0, 120) }; }
-  try { if (pickerKind === 'bootstrap') jq(pickerBox).datepicker('hide'); } catch { /* closing only */ }
-  lines.push(`Try 2 (click way), wanted ${wanted2}: ${steps.join(', ')} · ${matches(report.try2, days2) ? 'HELD' : 'NOT held'} · ${say(report.try2)}${report.try2.error ? ' · error ' + report.try2.error : ''}`);
-  lines.push('Done. Nothing was saved. Press Cancel on the Add Assignment window, then take a photo of this box.');
-  finish();
+    return null;
+  };
+  const isoOf = value => {
+    if (typeof value?.format === 'function') return value.format('YYYY-MM-DD');
+    if (Object.prototype.toString.call(value) === '[object Date]') return value.toISOString().slice(0, 10);
+    return typeof value === 'string' ? value.slice(0, 10) : null;
+  };
+  const nextIso = iso => { const d = new Date(`${iso}T12:00:00Z`); d.setUTCDate(d.getUTCDate() + 1); return d.toISOString().slice(0, 10); };
+  const kind = client => /^leave of absence/i.test(client) ? 'LOA' : /^do not schedule/i.test(client) ? 'DNS' : /holiday/i.test(client) ? 'Holiday' : client ? 'other client' : 'no name';
+  const readTile = (tile, view) => {
+    const fields = [...tile.querySelectorAll('.field')], labelled = fields.some(field => field.querySelector('.field-label'));
+    const value = label => { const found = fields.filter(field => words(field.querySelector('.field-label')).replace(/:$/, '').toLowerCase() === label.toLowerCase()); return found.length === 1 ? words(found[0].querySelector('.field-value')) : ''; };
+    const client = labelled ? value('Name') : [...tile.childNodes].filter(node => node.nodeType === 3).map(node => node.textContent).join(' ').trim();
+    const hours = (labelled ? value('Hours') : words(tile.querySelector('.field-value'))).match(/^(\d+(?:\.\d+)?)h$/);
+    const note = !!tile.querySelector('i.fa-note-sticky, i.fa-sticky-note, [class*="note"]');
+    const row = { kind: kind(client), hours: hours ? Number(hours[1]) : null, note, day: null, how: '' };
+    const skeleton = tile.closest('.fc-content-skeleton');
+    if (!skeleton) {
+      const cell = tile.closest('td.fc-day[data-date]');
+      row.day = tile.getAttribute('data-date') || cell?.getAttribute('data-date') || null; row.how = 'dated tile'; return row;
+    }
+    const week = tile.closest('.fc-row.fc-week'), cell = tile.closest('td.fc-event-container');
+    if (tile.closest('.fc-view') !== view) { row.how = 'other view'; return row; }
+    if (!week || !cell || cell.closest('.fc-content-skeleton') !== skeleton) { row.how = 'no week row'; return row; }
+    const dates = [...week.querySelectorAll('.fc-bg td.fc-day')].filter(node => node.closest('.fc-row') === week);
+    const col = gridColumn(cell);
+    if (col === null || col >= dates.length) { row.how = 'no column'; return row; }
+    const day = dates[col].getAttribute('data-date');
+    try {
+      const data = window.jQuery?.(tile), seg = data?.data('fcSeg'), event = data?.data('event');
+      if (!seg || seg.leftCol !== col || seg.rightCol !== col) { row.how = 'segment disagrees'; return row; }
+      if (event && (event.start != null && isoOf(event.start) !== day || event.end != null && isoOf(event.end) !== nextIso(day))) { row.how = 'event dates disagree'; return row; }
+    } catch { row.how = 'segment unreadable'; return row; }
+    row.day = day; row.how = 'week row'; return row;
+  };
+  const read = () => {
+    const found = views();
+    if (found.length !== 1) return { error: `${found.length} calendar views shown` };
+    const view = found[0];
+    const days = [...view.querySelectorAll('td.fc-day[data-date]')].map(node => node.getAttribute('data-date')).sort();
+    const tiles = [...document.querySelectorAll('.fc-event')].filter(tile => content(tile) && shown(tile) && !panel.contains(tile)).map(tile => readTile(tile, view));
+    const keys = tiles.filter(row => row.day).map(row => `${row.day} ${row.kind} ${row.hours ?? '?'}h${row.note ? ' note' : ''}`).sort();
+    return { from: days[0], to: days[days.length - 1], tiles: tiles.length, unread: tiles.filter(row => !row.day).map(row => row.how), keys };
+  };
+  const counted = list => { const map = new Map(); for (const key of list) map.set(key, (map.get(key) || 0) + 1); return map; };
+  const difference = (before, after) => {
+    const a = counted(before), b = counted(after), added = [], removed = [];
+    for (const [key, n] of b) for (let i = a.get(key) || 0; i < n; i++) added.push(key);
+    for (const [key, n] of a) for (let i = b.get(key) || 0; i < n; i++) removed.push(key);
+    return { added, removed };
+  };
+  const brief = list => list.length > 12 ? [...list.slice(0, 12), `… ${list.length - 12} more`] : list;
+  let saveAt = null, saveWord = '';
+  const SAVES = /^(add|apply & add more|submit|save|ok|yes|delete|delete all|confirm)$/i;
+  const onClick = event => {
+    const button = event.target.closest?.('button, a.btn, input[type="submit"], input[type="button"]');
+    if (!button || panel.contains(button)) return;
+    const word = words(button) || button.value || '';
+    if (SAVES.test(word.trim())) { saveAt = clock(); saveWord = word.trim(); }
+  };
+  document.addEventListener('click', onClick, true);
+  let last = read();
+  if (last.error) lines.push(`Start: ${last.error}. Open the test person's calendar first.`);
+  else {
+    lines.push(`Start at ${at()} s: calendar ${last.from} to ${last.to}; ${last.tiles} entries shown, ${last.keys.length} read${last.unread.length ? `, ${last.unread.length} not read (${[...new Set(last.unread)].join(', ')})` : ''}.`);
+    lines.push('Now save a change by hand on this test person; wait for "Change n" after each. Press Stop when done.');
+  }
+  report.start = last; show();
+  let coverSeen = false, coverFrom = null, coverSeconds = 0, clearSince = null, changedDom = false;
+  const watch = new MutationObserver(records => { if (records.some(record => !panel.contains(record.target))) changedDom = true; });
+  watch.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+  while (!stopped && clock() - started < LIMIT && !last.error) {
+    await sleep(POLL);
+    const now = clock();
+    if (covers()) { if (!coverSeen) coverFrom = now; coverSeen = true; clearSince = null; continue; }
+    if (coverFrom !== null) { coverSeconds += (now - coverFrom) / 1000; coverFrom = null; }
+    clearSince ??= now;
+    if (!changedDom || now - clearSince < QUIET) continue;
+    const windowOpen = [...document.querySelectorAll('.modal')].some(node => shown(node) && !panel.contains(node));
+    if (windowOpen) continue;
+    changedDom = false;
+    const readAt = clock(), next = read();
+    if (next.error) { lines.push(`At ${at()} s: ${next.error}.`); show(); continue; }
+    const diff = difference(last.keys, next.keys);
+    if (!diff.added.length && !diff.removed.length && next.unread.length === last.unread.length && next.from === last.from && next.to === last.to) { coverSeen = false; coverSeconds = 0; continue; }
+    await sleep(AGAIN);
+    const again = read(), steady = !again.error && difference(next.keys, again.keys).added.length === 0 && difference(next.keys, again.keys).removed.length === 0;
+    const change = {
+      n: report.changes.length + 1, after: saveAt ? saveWord : 'no save press seen',
+      readSecondsAfterSave: saveAt ? Number(((readAt - saveAt) / 1000).toFixed(1)) : null,
+      coverSeen, coverSeconds: Number(coverSeconds.toFixed(1)), shown: `${next.from} to ${next.to}`,
+      added: diff.added, removed: diff.removed, unread: next.unread, sameAgain: steady
+    };
+    report.changes.push(change);
+    lines.push('', `Change ${change.n} (after "${change.after}"): read ${change.readSecondsAfterSave ?? '?'} s after the press; loading cover ${coverSeen ? `${change.coverSeconds} s` : 'not seen'}; calendar ${change.shown}.`);
+    if (next.from !== last.from || next.to !== last.to) lines.push(`  The calendar moved: was ${last.from} to ${last.to}.`);
+    lines.push(`  Added: ${diff.added.length ? brief(diff.added).join('; ') : 'none'}`, `  Removed: ${diff.removed.length ? brief(diff.removed).join('; ') : 'none'}`);
+    if (next.unread.length) lines.push(`  Not read: ${next.unread.length} (${[...new Set(next.unread)].join(', ')})`);
+    lines.push(`  Same ${AGAIN / 1000} s later: ${steady ? 'yes' : 'NO'}`);
+    show();
+    last = steady ? next : again; saveAt = null; coverSeen = false; coverSeconds = 0;
+  }
+  watch.disconnect();
+  document.removeEventListener('click', onClick, true);
+  report.end = last;
+  lines.push('', `Stopped at ${at()} s: ${report.changes.length} change${report.changes.length === 1 ? '' : 's'} seen. Send a photo of this panel.`);
+  stop.remove(); show();
+  console.log(JSON.stringify(report, null, 1));
+  try { copy(JSON.stringify(report)); } catch {   }
 })();
