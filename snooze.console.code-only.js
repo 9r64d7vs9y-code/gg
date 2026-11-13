@@ -1,4 +1,4 @@
-// v0.15.4
+// v0.15.5
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -3020,6 +3020,83 @@ __exports.earlyPullLine = earlyPullLine;
 __exports.reportNotReadyLine = reportNotReadyLine;
 __exports.PAST_DATES_WORDS = PAST_DATES_WORDS;
 __exports.reasonLine = reasonLine;
+},
+"core/close-up.js": function (__require, __exports, document, window) {
+'use strict';
+const count = value => Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 999) : null;
+const pick = (value, allowed) => allowed.includes(value) ? value : null;
+const yes = value => typeof value === 'boolean' ? value : null;
+const CLASS_WORDS = ['odd', 'even', 'selected', 'shown', 'parent', 'child', 'active', 'highlight', 'hover', 'dt-hasChild', 'dtr-expanded',
+  'danger', 'warning', 'success', 'info', 'deleted', 'removed', 'strike', 'hidden', 'disabled', 'other'];
+const ATTRIBUTE_WORDS = ['style', 'data-id', 'role', 'id', 'hidden', 'aria-hidden', 'aria-selected', 'tabindex', 'data-dt-row', 'other'];
+const words = (list, allowed) => [...new Set((Array.isArray(list) ? list : []).filter(item => allowed.includes(item)))].slice(0, 4);
+function cleanCloseUp(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  if (raw.unreadable === true) return { unreadable: true };
+  const safe = { bin: count(raw.bin), of: count(raw.of), when: pick(raw.when, ['before', 'wait', 'after']),
+    rows: { before: count(raw.rows?.before), expected: count(raw.rows?.expected), now: count(raw.rows?.now) },
+    target: pick(raw.target, ['gone', 'shown', 'hidden']), copies: count(raw.copies),
+    display: pick(raw.display, ['none', 'table-row', 'block', 'other']), visibility: pick(raw.visibility, ['visible', 'hidden', 'other']),
+    marked: yes(raw.marked), struck: yes(raw.struck),
+    tables: { here: count(raw.tables?.here), page: count(raw.tables?.page), shown: count(raw.tables?.shown) },
+    window: pick(raw.window, ['shown', 'hidden', 'gone']), editsShown: count(raw.editsShown), viewNotes: yes(raw.viewNotes),
+    shell: pick(raw.shell, ['same', 'differs', 'values', 'unread']), ids: pick(raw.ids, ['same', 'differ']),
+    missing: count(raw.missing), extra: count(raw.extra), changed: count(raw.changed), first: null };
+  const first = raw.first;
+  if (first && typeof first === 'object') safe.first = { classOnly: yes(first.classOnly), classFrom: words(first.classFrom, CLASS_WORDS), classTo: words(first.classTo, CLASS_WORDS),
+    attributes: words(first.attributes, ATTRIBUTE_WORDS), cells: yes(first.cells), text: yes(first.text), values: yes(first.values) };
+  return safe;
+}
+function closeUpWords(raw) {
+  const c = cleanCloseUp(raw);
+  if (!c) return null;
+  if (c.unreadable) return 'could not be read';
+  const n = value => value ?? '?', yn = value => value === true ? 'yes' : value === false ? 'no' : '?';
+  const parts = [`${{ before: 'before', wait: 'waiting on', after: 'after' }[c.when] || 'at'} bin ${n(c.bin)} of ${n(c.of)}`];
+  parts.push(`rows ${c.rows.before == null ? '' : `${c.rows.before} before, `}${c.rows.expected == null ? '' : `${c.rows.expected} expected, `}${n(c.rows.now)} now`);
+  if (c.target === 'gone') parts.push('binned row gone');
+  else if (c.target) parts.push(`binned row still in, ${c.target}${c.copies > 1 ? ` (${c.copies} copies)` : ''}: display ${c.display || '?'}, marked ${yn(c.marked)}, struck ${yn(c.struck)}`);
+  parts.push(`tables ${n(c.tables.here)} in window, ${n(c.tables.page)} on page, ${n(c.tables.shown)} shown`);
+  parts.push(`window ${c.window || '?'}`, `Edit shown ${n(c.editsShown)}`, `View Notes ${c.viewNotes === true ? 'open' : c.viewNotes === false ? 'closed' : '?'}`);
+  if (c.shell) parts.push(`head ${c.shell === 'values' ? 'values differ' : c.shell}`);
+  if (c.ids) parts.push(`ids ${c.ids}${c.missing ? `, ${c.missing} missing` : ''}${c.extra ? `, ${c.extra} extra` : ''}`);
+  if (c.changed != null) {
+    const f = c.first;
+    let changed = `kept rows changed ${c.changed}`;
+    if (c.changed && f) {
+      const list = l => l.length ? l.join('/') : 'none';
+      changed += f.classOnly ? `, first: class only (${list(f.classFrom)}→${list(f.classTo)})`
+        : `, first: ${[f.classFrom.length || f.classTo.length ? `class ${list(f.classFrom)}→${list(f.classTo)}` : null,
+          f.attributes.length ? `attributes ${f.attributes.join('/')}` : null, f.cells ? `cells differ (text ${f.text ? 'differs' : 'same'})` : null,
+          f.values ? 'values differ' : null].filter(Boolean).join(', ') || 'unclear'}`;
+    }
+    parts.push(changed);
+  }
+  return parts.join(' · ');
+}
+const SAFE_VALUES = new Set(['leave of absence (loa)', 'do not schedule (dns)', 'holiday', 'billable', 'non-billable', 'yes', 'no', 'loa', 'dns']);
+const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function redactMessage(message, words = {}) {
+  if (typeof message !== 'string' || !message.trim()) return null;
+  let text = message.replace(/\s+/g, ' ').trim();
+  const list = [];
+  for (const [tag, values] of [['<person>', words.person], ['<client>', words.client]]) {
+    for (const value of Array.isArray(values) ? values : []) {
+      const plain = String(value ?? '').replace(/\s+/g, ' ').trim();
+      if (plain.length < 3 || SAFE_VALUES.has(plain.toLowerCase())) continue;
+      list.push([plain, /@/.test(plain) ? '<email>' : tag, 'gi']);
+      if (tag === '<person>' && !/@/.test(plain)) for (const part of plain.split(/[\s,()]+/)) if (part.length >= 3) list.push([part, tag, 'g']);
+    }
+  }
+  list.sort((a, b) => b[0].length - a[0].length);
+  for (const [value, tag, flags] of list) text = text.replace(new RegExp(`(?<![\\p{L}\\d])${escape(value)}(?![\\p{L}\\d])`, flags + 'u'), tag);
+  text = text.replace(/[^\s<>"'(),;:]+@[^\s<>"'(),;:]+/g, '<email>')
+    .replace(/\b[A-Za-z]*\d{5,}[A-Za-z0-9]*\b/g, '<id>');
+  return text.length > 190 ? `${text.slice(0, 189)}…` : text;
+}
+__exports.cleanCloseUp = cleanCloseUp;
+__exports.closeUpWords = closeUpWords;
+__exports.redactMessage = redactMessage;
 },
 "mysource/dom.js": function (__require, __exports, document, window) {
 'use strict';
@@ -6134,6 +6211,73 @@ __exports.setAssignmentHours = setAssignmentHours;
 __exports.refreshNotes = refreshNotes;
 __exports.saveStagedNotes = saveStagedNotes;
 },
+"mysource/close-up.js": function (__require, __exports, document, window) {
+'use strict';
+const { shown, text } = __require("./dom.js");
+const MARK = /delet|remov|strike|hidden|disabled/i;
+const CLASS_WORDS = new Set(['odd', 'even', 'selected', 'shown', 'parent', 'child', 'active', 'highlight', 'hover', 'dt-hasChild', 'dtr-expanded',
+  'danger', 'warning', 'success', 'info', 'deleted', 'removed', 'strike', 'hidden', 'disabled']);
+const ATTRIBUTE_WORDS = new Set(['class', 'style', 'data-id', 'role', 'id', 'hidden', 'aria-hidden', 'aria-selected', 'tabindex', 'data-dt-row']);
+const word = (value, allowed) => allowed.has(value) ? value : 'other';
+const classes = node => new Set(String(node.getAttribute('class') || '').split(/\s+/).filter(Boolean));
+const titleOf = node => text(node.querySelector('.modal-title, .bootbox-title, h4, [role=heading]'));
+function rowDifference(old, now, sameValues) {
+  const names = new Set([...old.getAttributeNames(), ...now.getAttributeNames()]);
+  const attributes = [...names].filter(name => old.getAttribute(name) !== now.getAttribute(name));
+  const plain = node => { const copy = node.cloneNode(true); copy.removeAttribute('class'); return copy; };
+  const cells = old.children.length !== now.children.length || [...old.children].some((cell, index) => !cell.isEqualNode(now.children[index]));
+  const was = classes(old), is = classes(now);
+  return {
+    classOnly: attributes.length === 1 && attributes[0] === 'class' && plain(old).isEqualNode(plain(now)) && sameValues,
+    classFrom: [...new Set([...was].filter(name => !is.has(name)).map(name => word(name, CLASS_WORDS)))],
+    classTo: [...new Set([...is].filter(name => !was.has(name)).map(name => word(name, CLASS_WORDS)))],
+    attributes: [...new Set(attributes.filter(name => name !== 'class').map(name => word(name, ATTRIBUTE_WORDS)))],
+    cells, text: text(old) !== text(now), values: !sameValues,
+  };
+}
+const unstriped = node => { const clone = node.cloneNode(true); clone.classList.remove('odd', 'even'); if (!clone.classList.length) clone.removeAttribute('class'); return clone; };
+function removalCloseUp(edit, { bin, of, when, targetId, removed = new Set(), originalRows = null, originalShell = null, originalShellValues = null, shell = null, values = null }) {
+  try {
+    const doc = edit.ownerDocument, style = node => doc.defaultView.getComputedStyle(node);
+    const here = [...edit.querySelectorAll('table#editGrid')], page = [...doc.querySelectorAll('table#editGrid')];
+    const table = here.length === 1 ? here[0] : null;
+    const rows = [...(table || edit).querySelectorAll('tbody tr[data-id]')];
+    const gone = new Set([...removed, ...(when === 'before' ? [] : [targetId])]);
+    const kept = originalRows ? [...originalRows.keys()].filter(id => !gone.has(id)) : null;
+    const targets = [...edit.querySelectorAll('tbody tr[data-id]')].filter(node => node.getAttribute('data-id') === targetId);
+    const target = targets[0];
+    const struck = node => [node, ...node.children].some(at => /line-through/.test(style(at).textDecorationLine || style(at).textDecoration || ''));
+    const display = target ? style(target).display : null, visibility = target ? style(target).visibility : null;
+    const modals = [...doc.querySelectorAll('.modal, [role=dialog]')].filter(shown);
+    const snap = {
+      bin, of, when,
+      rows: { before: originalRows ? originalRows.size : null, expected: kept ? kept.length : null, now: rows.length },
+      target: !target ? 'gone' : shown(target) ? 'shown' : 'hidden', copies: targets.length,
+      ...(target ? { display: ['none', 'table-row', 'block'].includes(display) ? display : 'other', visibility: ['visible', 'hidden'].includes(visibility) ? visibility : 'other',
+        marked: MARK.test(String(target.getAttribute('class') || '')), struck: struck(target) } : {}),
+      tables: { here: here.length, page: page.length, shown: page.filter(shown).length },
+      window: !edit.isConnected ? 'gone' : shown(edit) ? 'shown' : 'hidden',
+      editsShown: modals.filter(node => node.matches('#editEventGridModal') || titleOf(node) === 'Edit Assignment').length,
+      viewNotes: modals.some(node => titleOf(node) === 'View Notes' || node.matches('.bootbox') && [...node.querySelectorAll('textarea')].some(shown)),
+    };
+    if (!kept) return snap;
+    snap.shell = !table || !originalShell || !shell ? 'unread' : !shell(table).isEqualNode(originalShell) ? 'differs' : values && values(shell(table)) !== originalShellValues ? 'values' : 'same';
+    const ids = rows.map(node => node.getAttribute('data-id')), wanted = new Set(kept);
+    snap.ids = ids.length === kept.length && new Set(ids).size === ids.length && ids.every(id => wanted.has(id)) ? 'same' : 'differ';
+    snap.missing = kept.filter(id => !ids.includes(id)).length;
+    snap.extra = ids.filter(id => !wanted.has(id)).length;
+    const changed = rows.filter(node => wanted.has(node.getAttribute('data-id'))).map(node => {
+      const old = originalRows.get(node.getAttribute('data-id'));
+      const sameValues = !values || values(node) === old.values;
+      return unstriped(node).isEqualNode(unstriped(old.node)) && sameValues ? null : rowDifference(old.node, node, sameValues);
+    }).filter(Boolean);
+    snap.changed = changed.length;
+    snap.first = changed[0] || null;
+    return snap;
+  } catch { return { unreadable: true }; }
+}
+__exports.removalCloseUp = removalCloseUp;
+},
 "mysource/note-stage.js": function (__require, __exports, document, window) {
 'use strict';
 const { usDate } = __require("../rules/dates.js");
@@ -6141,6 +6285,7 @@ const { valueKey } = __require("../rules/prepare.js");
 const { compareCopies, dayOf, ENTRY_FIELDS } = __require("./copy.js");
 const { PageError, cleanupAfter, WAIT, click, closeWindow, fieldByLabel, settled, shown, text, typeInto, waitFor, recognizeBulkWindow, observeWindowTitle } = __require("./dom.js");
 const { findAssignments, readEditTable, closeEdit } = __require("./schedule.js");
+const { removalCloseUp } = __require("./close-up.js");
 const NOTE_FIELDS = [['Professional', 'professional'], ['Client', 'client'], ['WBS', 'wbs'], ['Billable', 'billable'],
   ['Utilization Generating', 'utilization'], ['Pricing ID', 'pricingId'], ['Job Code', 'jobCode'],
   ['Assign Code', 'assignCode'], ['Assign Code 2', 'assignCode2'], ['Hours', 'hours']];
@@ -6187,10 +6332,19 @@ function sameAssignmentRows(expected, actual) {
     && expected.days.every(old => old.id && byId.has(old.id) && old.notes === byId.get(old.id).notes
       && compareCopies({ days: [old] }, { days: [byId.get(old.id)] }).same);
 }
+function attachCloseUp(error, make) {
+  try { if (error && typeof error === 'object' && Object.isExtensible(error) && !error.leaveSnapshot) error.leaveSnapshot = make(); } catch {   }
+}
 async function stageRemoval(edit, expected, remove) {
   const snapshot = async () => ({ days: (await readEditTable(edit)).map(row => ({ ...row, day: dayOf(row.date) })) });
   const values = root => JSON.stringify([...root.querySelectorAll('input, select, textarea')].map(node => [node.value, node.checked, node.disabled,
     node.tagName === 'SELECT' ? [...node.options].map(option => option.selected) : null]));
+  const unstriped = node => {
+    const clone = node.cloneNode(true);
+    clone.classList.remove('odd', 'even');
+    if (!clone.classList.length) clone.removeAttribute('class');
+    return clone;
+  };
   const shell = table => {
     const clone = table.cloneNode(true);
     for (const body of clone.querySelectorAll('tbody')) body.replaceChildren();
@@ -6206,10 +6360,10 @@ async function stageRemoval(edit, expected, remove) {
     if (rows.length !== retained.size || new Set(rows.map(row => row.getAttribute('data-id'))).size !== rows.length) return false;
     return rows.every(row => {
       const old = retained.get(row.getAttribute('data-id'));
-      return old && row.isEqualNode(old.node) && values(row) === old.values;
+      return old && unstriped(row).isEqualNode(unstriped(old.node)) && values(row) === old.values;
     });
   };
-  let prepared = false, pressed = false, primary = null;
+  let prepared = false, pressed = false, primary = null, phase = null;
   const trashFor = id => {
     const rows = [...edit.querySelectorAll('tbody tr[data-id]')].filter(node => node.getAttribute('data-id') === id);
     const buttons = rows.length === 1 ? [...rows[0].querySelectorAll('td.action-column button.btn-xs.btn-danger')].filter(shown) : [];
@@ -6228,20 +6382,28 @@ async function stageRemoval(edit, expected, remove) {
       || remove.some(row => !expected.days.some(old => old.id === row.id))) throw new PageError('The removal table changed. Nothing was saved.');
     for (const row of remove) trashFor(row.id);
     const removed = new Set();
-    for (const row of remove) {
+    for (const [index, row] of remove.entries()) {
+      phase = { bin: index + 1, of: remove.length, when: 'before', targetId: row.id, removed };
       if (!stagedMatches(removed)) throw new PageError('The staged row removal could not be proved. Nothing was saved.');
       pressed = true;
       await click(trashFor(row.id));
+      phase.when = 'wait';
       await waitFor(() => ![...edit.querySelectorAll('tbody tr[data-id]')].some(node => node.getAttribute('data-id') === row.id), 'the staged row removal', WAIT.window);
       await settled(edit);
       removed.add(row.id);
+      phase.when = 'after';
       if (!stagedMatches(removed)) throw new PageError('The staged row removal could not be proved. Nothing was saved.');
     }
+    phase = null;
     const submits = [...edit.querySelectorAll('button')].filter(node => shown(node) && text(node) === 'Submit');
     if (submits.length !== 1 || submits[0].disabled || submits[0].getAttribute('aria-disabled') === 'true') throw new PageError(NOTE_STAGE_EXITS.submitMissing);
     prepared = true;
     return { edit, saveSubmit: submits[0] };
-  } catch (error) { primary = error; if (pressed) error.noReplay = true; throw error; }
+  } catch (error) {
+    primary = error; if (pressed) error.noReplay = true;
+    if (phase) attachCloseUp(error, () => removalCloseUp(edit, { ...phase, removed: new Set(phase.removed), originalRows, originalShell, originalShellValues, shell, values }));
+    throw error;
+  }
   finally {
     if (!prepared) {
       if (primary) await cleanupAfter(primary, () => closeEdit(edit));
@@ -6342,7 +6504,7 @@ async function stageNotes(query, expected, notes, { remove = [], onStage = () =>
   if (remove.length && (removedIds.size !== remove.length || remove.some(row => !row.id) || new Set(remove.map(row => usDate(row.day))).size !== remove.length)) return refuse('removeListRefused');
   if (!noteRowsEligible(retained.days)) return refuse('rowsNotEligible');
   const edit = await findAssignments(query);
-  let bulk = null, prepared = false, stagedPressed = false;
+  let bulk = null, prepared = false, stagedPressed = false, phase = null;
   const optionalField = label => { try { return fieldByLabel(bulk, label); } catch (error) { if (/form has|No box found/.test(error.message)) return null; throw error; } };
   const snapshot = async () => ({ days: (await readEditTable(edit)).map(row => ({ ...row, day: dayOf(row.date) })) });
   let primaryError = null;
@@ -6360,19 +6522,23 @@ async function stageNotes(query, expected, notes, { remove = [], onStage = () =>
       trash.push(buttons[0]);
     }
     for (let index = 0; index < trash.length; index++) {
+      phase = { bin: index + 1, of: trash.length, when: 'before', targetId: remove[index].id, removed: new Set(remove.slice(0, index).map(row => row.id)) };
       stagedPressed = true;
       onStage('trash');
       await click(trash[index]);
+      phase.when = 'wait';
       await waitFor(() => !trash[index].isConnected, 'the staged LOA row removal', WAIT.window);
       await settled(edit);
       const ids = new Set(remove.slice(0, index + 1).map(row => row.id));
       const expectedStep = { days: before.days.filter(row => !ids.has(row.id)) };
+      phase.when = 'after';
       const actual = await snapshot();
       if (!sameAssignmentRows(expectedStep, actual)) {
         throw new PageError('The prepared LOA row removal could not be proved. Nothing was saved.');
       }
       onStage('proof', {rows:actual.days.length, days:actual.days.map(row=>usDate(row.day)), totalHours:actual.days.reduce((sum,row)=>sum+row.hours,0)});
     }
+    phase = null;
     await click(bulkActions);
     const item = edit.querySelector('.js-assignment-edit-edit-all');
     if (!item || !shown(item)) return refuse('editAllMissing');
@@ -6459,6 +6625,7 @@ async function stageNotes(query, expected, notes, { remove = [], onStage = () =>
   } catch (error) {
     primaryError = error;
     if (stagedPressed) error.noReplay = true;
+    if (phase) attachCloseUp(error, () => removalCloseUp(edit, phase));
     throw error;
   } finally {
     if (bulk) observeWindowTitle(bulk, { caller: 'Bulk Edit Assignments', purpose: 'opening' });
@@ -8626,6 +8793,10 @@ const { valueKey } = __require("../rules/prepare.js");
 const { capturePerson, needsPersonPicture, saveBatch, batchExcelName } = __require("../files/batch-outputs.js");
 const { setRunRecorder, timedRun, reasonCode, stopSentence, afterWriteSentence, CALM_PURPOSES } = __require("../core/run-records.js");
 const { safePageInfo } = __require("../mysource/pageinfo.js");
+const { cleanCloseUp } = __require("../core/close-up.js");
+function keepCloseUp(row, error) {
+  try { if (row?.diagnostic && error?.leaveSnapshot && !row.diagnostic.closeUp) row.diagnostic.closeUp = cleanCloseUp(error.leaveSnapshot); } catch {   }
+}
 const { combinedReportText } = __require("../files/run-report.js");
 const { estimateBatch, TIME_LIMIT_WORDS } = __require("./time-limit.js");
 const { personName, stageWords } = __require("../screen/compact.js");
@@ -9114,6 +9285,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
               delete row.diagnostic.reason; delete row.diagnostic.failedStage;
               row.one.run = { state: 'done', prepared: row.prepared, result: row.result, batch: true };
             } catch (error) {
+              keepCloseUp(row, error);
               row.message = wrote ? afterWriteSentence(error.message) : error.message;
               if (wrote) {
                 if (error.identityChanged || error.schedulePage || error.batchWide || error.connectionLost) {
@@ -9130,6 +9302,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
         }
         if (batch.phase === 'run') await picture(row);
         } catch (error) {
+          keepCloseUp(row, error);
           if (error.connectionLost) throw error;
           if (row.pictureToTakeByHand && ['done', 'nothing'].includes(row.state) && stopFlagged(error)) throw error;
           if (error.schedulePage) throw error;
@@ -9213,6 +9386,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       } else {
         batch.state = 'failed';
         const row = batch.rows[batch.index];
+        keepCloseUp(row, error);
         if (row) { row.state = 'failed'; row.message = error.message; row.diagnostic.reason = reasonCode(error); row.diagnostic.failedStage ||= row.diagnostic.currentStage || 'prepare'; if (batch.phase === 'run') await picture(row); }
         tell(error.message);
       }
@@ -12712,6 +12886,14 @@ async function cancelLiveWindows() {
     await pageReady('live test cleanup', WAIT.person, { purpose: 'liveCleanup' });
   } catch (error) { error.pageBlocked = true; throw error; }
 }
+const ROW_WORDS = ['client', 'wbs', 'pricingId', 'jobCode', 'assignCode', 'assignCode2', 'noteText', 'engagement', 'engagementName'];
+function liveWords(people, copies) {
+  const rows = copies.flatMap(copy => Array.isArray(copy?.days) ? copy.days : []);
+  const text = value => typeof value === 'string' && value.trim();
+  const person = [...people, ...rows.map(row => row?.professional)].filter(text);
+  const client = rows.flatMap(row => ROW_WORDS.map(key => row?.[key])).filter(text);
+  return { person: [...new Set(person)], client: [...new Set(client)] };
+}
 function liveTestPage(options = {}) {
   const page = createLiveTestPage(options);
   for (const [name, action] of Object.entries(page)) {
@@ -12777,6 +12959,7 @@ function createLiveTestPage({ today = todayOf(), mode = 'consulting', small = fa
     ...createLiveGroups(context),
     diagnosticState: liveDiagnosticState,
     observe: liveControlState,
+    privateWords: () => liveWords([openedEmail, identity?.name], []),
     finishStep: finishSave,
     setStep(id) { owningStep = id; },
     async begin(events) {
@@ -13032,6 +13215,7 @@ function taxLivePage(today, small = false) {
   return {
     diagnosticState: liveDiagnosticState,
     observe: liveControlState,
+    privateWords: () => liveWords([email, identity?.name], [known]),
     async taxStart(typedEmail, window) {
       if (scope || !String(typedEmail || '').trim() || addressCount(typedEmail) > 1) throw new PageError('Enter one test professional.');
       if (readSite() !== 'tax') throw new PageError('Tax live test requires Tax MySource.');
@@ -13376,6 +13560,8 @@ function auditLivePage(today, small = false) {
   return {
     diagnosticState: liveDiagnosticState,
     observe: liveControlState,
+    privateWords: () => liveWords([email, identity?.name, one?.record?.email, one?.record?.name, one?.record?.person?.professional],
+      [known, checkpoint, { days: [].concat(kept || []) }, weeklyCheckpoint, applied?.after, prepared?.backup, ...chain.map(entry => entry.after)]),
     begin(events) {
       release = setBatchGuard(check);
       const stop = setRunRecorder(event => {
@@ -14881,9 +15067,10 @@ __exports.errorReason = errorReason;
 "run/live-diagnostics.js": function (__require, __exports, document, window) {
 'use strict';
 const { SMALL_LIVE_STEPS, SMALL_TAX_STEPS, WEEKLY_LIVE_STEPS, LIVE_ABILITIES, LIVE_ABILITY_PARTS } = __require("./live-proof.js");
-const { observeRun, recordRun, STAGES, WINDOWS, FIELDS, WAIT_NAMES, REASON_CODES, reasonCode } = __require("../core/run-records.js");
+const { observeRun, recordRun, STAGES, WINDOWS, FIELDS, WAIT_NAMES, REASON_CODES, reasonCode, stopSentence } = __require("../core/run-records.js");
 const { REASON_NAMES, errorReason } = __require("../core/reason-names.js");
 const { dayFromParts, mondayOf, weekday, usDate } = __require("../rules/dates.js");
+const { cleanCloseUp, closeUpWords, redactMessage } = __require("../core/close-up.js");
 const steps = new Set('featureExact featureReplace featureNotes featurePicture featureBins weeklyHours weeklyPicture smallExit weeklySetup weeklyTable weeklyExit weeklyUndo smallOpen smallAdd smallChange smallDelete smallPicture smallUndo aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
 const word = (value, allowed, fallback = 'unknown') => allowed.has(value) ? value : fallback;
 const count = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
@@ -14931,6 +15118,7 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
   if (runDay) data.taxMonday = usDate(mondayOf(runDay));
   let stage = 'unknown', seenPeriods = null, boxType = 'unknown', lastAction = 'unknown', forcedStep = null, writes = 0, stageStep = null;
   const snapshot = () => { try { return pageState(page.diagnosticState?.() || page.observe?.(), seenPeriods); } catch { return { unavailable:true }; } };
+  const privateWords = () => { try { return page.privateWords?.() || {}; } catch { return {}; } };
   const pending = [];
   const receive = event => {
     const nowStep = stepName(event.step || forcedStep || result.steps.find(s => s.state === 'running')?.id || result.steps.at(-1)?.id);
@@ -14944,7 +15132,7 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
       result: word(event.result, results, typeof event.ok === 'boolean' ? event.ok ? 'passed' : 'failed' : 'unconfirmed'),
       code: word(event.code, REASON_CODES, 'none'), reasonName: word(event.reasonName, REASON_NAMES, 'none'), boxType,
       assignPeriod: data.assignPeriod };
-    if (event.type === 'error') { safe.page = snapshot(); safe.lastAction = lastAction; event.liveStop = {step:safe.step,stage,lastAction,page:safe.page}; }
+    if (event.type === 'error') { safe.page = snapshot(); safe.lastAction = lastAction; event.liveStop = {step:safe.step,stage,lastAction,page:safe.page,at:data.events.length}; }
     for (const key of ['rows','selected','count','back','latest']) if (Number.isSafeInteger(event[key]) && event[key] >= 0) safe[key] = event[key];
     if (event.type === 'writeAttempt') {
       lastAction = word(event.action, actions); safe.action = lastAction; safe.write = ++writes;
@@ -14972,7 +15160,9 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
       pending.length = 0;
       const failure = { step: stepName(step), code: error?.identityChanged ? 'identityChanged' : error?.session ? 'sessionExpired' : word(error?.reasonCode, REASON_CODES, reasonCode(error?.message)), reasonName:errorReason(error) };
       const source = error?.liveStop || data.events.findLast(e => e.type === 'error' && e.reasonName === failure.reasonName && e.step === failure.step);
-      const stopped = { ...failure, time: elapsed(), lastAction:source?.lastAction || (stageStep === failure.step ? lastAction : 'unknown'), stage: source?.stage || word(error?.stage, stages, stageStep === failure.step ? stage : 'unknown'), page: source?.page || snapshot(), held: heldDates(error?.dateDiagnostics || error?.pickerDateDiagnostics) };
+      const stopped = { ...failure, time: elapsed(), lastAction:source?.lastAction || (stageStep === failure.step ? lastAction : 'unknown'), stage: source?.stage || word(error?.stage, stages, stageStep === failure.step ? stage : 'unknown'), page: source?.page || snapshot(), held: heldDates(error?.dateDiagnostics || error?.pickerDateDiagnostics),
+        at: Number.isSafeInteger(source?.at) ? source.at : source ? data.events.lastIndexOf(source) : -1, closeUp: cleanCloseUp(error?.leaveSnapshot),
+        message: error?.name === 'PageError' ? stopSentence(error.message) || redactMessage(error.message, privateWords()) : null };
       data.stop ||= stopped;
       Object.assign(result.steps.find(s => s.id === step) || {}, { code:failure.code, reasonName:failure.reasonName });
       recordRun({ type:'stop', ...failure, result:'failed' });
@@ -15005,7 +15195,9 @@ function cleanEvent(event) {
 function liveReportSummary(result, includeMonday = true) {
   const data = result.diagnostic || {}, raw = data.stop;
   const stop = raw ? {step:stepName(raw.step),code:word(raw.code,REASON_CODES,'unknownFailure'),reasonName:word(raw.reasonName,REASON_NAMES,'unknownFailure'),
-    lastAction:word(raw.lastAction,new Set([...stages,...actions])),stage:word(raw.stage,stages),time:Number.isFinite(raw.time) && raw.time>=0 ? raw.time : null,page:cleanPage(raw.page),held:typeof raw.held === 'string' && /^[\w\/ ·,-]{1,100}$/.test(raw.held) ? raw.held : null} : null;
+    lastAction:word(raw.lastAction,new Set([...stages,...actions])),stage:word(raw.stage,stages),time:Number.isFinite(raw.time) && raw.time>=0 ? raw.time : null,page:cleanPage(raw.page),held:typeof raw.held === 'string' && /^[\w\/ ·,-]{1,100}$/.test(raw.held) ? raw.held : null,
+    at:Number.isSafeInteger(raw.at) && raw.at>=0 ? raw.at : null,closeUp:cleanCloseUp(raw.closeUp),
+    message:redactMessage(raw.message)} : null;
   const taxMonday = includeMonday && result.mode === 'tax' && result.steps?.some(s=>s.id==='taxPast' && s.state==='failed')
     && data.events?.some(e=>e.type==='writeAttempt' && e.step==='taxPast') ? mondayDate(data.taxMonday) : null;
   const outstanding = result.cleanup === 'unconfirmed' ? [...new Set([...(result.ledger?.outstanding || []).map(r=>r.date), ...(result.outstanding || []).map(r=>r.date), ...(taxMonday ? [taxMonday] : [])])].filter(d=>date(d,result.week) || taxMonday && d===taxMonday) : [];
@@ -15048,6 +15240,60 @@ function findSummary(events) {
   const finds = events.filter(e=>e.type==='findBoxes').map(cleanEvent), counts = {};
   for (const find of finds) counts[find.boxType]=(counts[find.boxType] || 0)+1;
   return {counts,first:finds[0]?.step || 'none',last:finds.at(-1)?.step || 'none'};
+}
+const waitWords = { deleteSave: 'the delete', addSave: 'Add to save', editSave: 'Edit to save', findClose: 'Find to close',
+  rowRemoval: 'the binned row to leave', periodsClose: 'No. of Periods to close', 'Schedule window': 'a window', unknown: 'the page' };
+const typeWords = { miss: 'missing', loading: 'loading cover', waiting: 'still waiting on', window: 'window', field: 'field',
+  restoreRead: 'restore read', diagnosticRead: 'diagnostic read', identity: 'identity check', schedulePage: 'Schedule page check',
+  visibility: 'tab visibility', dialog: 'unknown window title', personLoaded: 'person loaded', searchStart: 'person search', periods: 'No. of Periods',
+  delay: 'delay', assignPeriod: 'Assign Period read', observation: 'other event' };
+function lastSteps(result, max = 8) {
+  const raw = result.diagnostic?.stop, all = result.diagnostic?.events || [];
+  if (!raw || !(max >= 1)) return [];
+  const step = stepName(raw.step);
+  let end = Number.isSafeInteger(raw.at) && all[raw.at]?.type === 'error' ? raw.at : -1;
+  if (end < 0) end = all.findLastIndex(e => e.type === 'error' && stepName(e.step) === step && word(e.reasonName, REASON_NAMES, 'none') === raw.reasonName);
+  if (end < 0) end = all.length - 1;
+  const events = all.slice(0, end + 1).map(cleanEvent).filter(e => e.step === step && !['stop', 'cleanup', 'finish', 'crossCheck'].includes(e.type));
+  const items = [];
+  const round = n => Math.round(n * 10) / 10;
+  events.forEach((e, index) => {
+    if (e.type === 'waitBegin' && index !== events.length - 1) return;
+    const last = items.at(-1);
+    if (last && ['wait', 'calmWait'].includes(e.type) && last.type === e.type && last.wait === e.wait && last.result === e.result) {
+      last.times++; last.seconds += e.seconds || 0; return;
+    }
+    items.push({ ...e, times: 1, seconds: e.seconds || 0 });
+  });
+  const what = e => waitWords[e.wait] || e.wait;
+  const words = e => {
+    const outcome = e.result === 'passed' ? '' : ` (${e.result})`;
+    switch (e.type) {
+      case 'begin': return `began ${e.stage}`;
+      case 'step': return `${e.stage} ${e.result === 'passed' ? 'done' : e.result} in ${round(e.seconds)} s`;
+      case 'wait': return `waited for ${what(e)}${e.times > 1 ? ` ${e.times} times,` : ''} ${round(e.seconds)} s${outcome}`;
+      case 'waitBegin': return `waiting for ${what(e)}`;
+      case 'calmWait': return `calm wait${e.times > 1 ? ` ×${e.times}` : ''}`;
+      case 'error': return `stopped: ${e.reasonName}${e.code !== 'none' ? ` (${e.code})` : ''}`;
+      case 'writeAttempt': return `write ${e.write ?? '?'} attempted (${e.action || 'write'}), ${e.proof === 'passed' ? 'proved' : 'not proved'}`;
+      case 'writeProof': return `write${(e.writes || []).length ? ` ${e.writes.join(', ')}` : ''} proved`;
+      case 'restoreComparison': return `comparison${outcome || ' passed'}`;
+      case 'findBoxes': return `Find opened (${e.boxType} boxes)`;
+      case 'findStep': return `Find ${e.wait} ${round(e.seconds)} s`;
+      case 'slow': return `slow: ${what(e)} ${round(e.seconds)} s`;
+      default: return `${typeWords[e.type] || e.type}${['miss', 'waiting', 'window', 'field'].includes(e.type) ? ` ${what(e)}` : ''}`;
+    }
+  };
+  const lines = [];
+  items.forEach((e, index) => {
+    const next = items[index + 1];
+    if (e.type === 'begin' && next?.type === 'step' && next.stage === e.stage) return;
+    const text = `${e.stage !== 'unknown' && !['begin', 'step'].includes(e.type) ? `${e.stage} · ` : ''}${words(e)}${e.rows != null ? `, rows ${e.rows}` : ''}`;
+    const last = lines.at(-1);
+    if (last && last.text === text) { last.times++; return; }
+    lines.push({ time: e.time, text, times: 1 });
+  });
+  return lines.slice(-max).map(e => `Last steps: ${e.time == null ? '?' : e.time.toFixed(1)} s · ${e.text}${e.times > 1 ? ` (×${e.times})` : ''}`.slice(0, 100));
 }
 function packFacts(input) {
   const facts=new Map(), lines=[];
@@ -15123,6 +15369,8 @@ function shortLiveReport(result) {
     line('Failed step', `${stop.step}${stop.time==null?'':` at ${stop.time} s`}${where ? ` · in ${where}` : ''}`);
     line('Reason', `${stop.reasonName}${known(stop.code) ? ` (${stop.code})` : ''}`);
     if (stop.held) line('Held', stop.held);
+    if (stop.message) line('Message', stop.message);
+    if (stop.closeUp) line('Close-up', closeUpWords(stop.closeUp));
   } else if (report.verdict === 'FAIL') line('Failed step', 'unknown');
   if (known(report.assignPeriod)) line('Assign Period', report.assignPeriod);
   const finds = Object.entries(report.finds.counts).map(([kind,n])=>`${kind} ${n}`).join(', ');
@@ -15135,6 +15383,8 @@ function shortLiveReport(result) {
   }
   const cleanupWords = { empty: 'span left empty', notNeeded: 'nothing to clear', unconfirmed: 'CLEANUP UNCONFIRMED' }[report.cleanup] || report.cleanup;
   line('Writes',`${report.writes.attempted} attempted / ${report.writes.proved} proved · ${cleanupWords}`);
+  const unproved = (result.diagnostic?.events || []).filter(e=>e.type==='writeAttempt' && e.proof!=='passed').map(cleanEvent);
+  if (unproved.length) line('Not proved', [...unproved.slice(0,4).map(e => `write ${e.write ?? '?'} ${e.action || 'write'} in ${e.step}${e.step === 'recovery' && report.cleanup === 'empty' ? ' (span read empty after)' : ''}`), ...(unproved.length>4 ? [`and ${unproved.length-4} more`] : [])]);
   let rangeStart=lines.length;
   if (report.unconfirmed.length || report.unconfirmedSpan) line('Unconfirmed',report.unconfirmed.length ? report.unconfirmed : `${report.unconfirmedSpan.start}-${report.unconfirmedSpan.end}`);
   const rangeEnd=lines.length;
@@ -15185,6 +15435,12 @@ function shortLiveReport(result) {
   if (lines.length>30) {
     return packFacts(lines).join('\n');
   }
+  const trail = stop ? lastSteps(result, Math.min(8, 30-lines.length)) : [];
+  if (trail.length) {
+    const closeUp = lines.findIndex(text => text.startsWith('Close-up: '));
+    const after = lines.findLastIndex(text => /^(Reason|Held|Message): /.test(text));
+    lines.splice(closeUp >= 0 ? closeUp : after >= 0 ? after+1 : lines.length, 0, ...trail);
+  }
   return lines.join('\n');
 }
 function liveEventLog(result) {
@@ -15205,6 +15461,7 @@ function liveEventLog(result) {
 }
 __exports.beginLiveDiagnostics = beginLiveDiagnostics;
 __exports.liveReportSummary = liveReportSummary;
+__exports.lastSteps = lastSteps;
 __exports.shortLiveReport = shortLiveReport;
 __exports.liveEventLog = liveEventLog;
 },
@@ -15214,6 +15471,7 @@ const { pastReportWarning } = __require("../run/backup.js");
 const { compareDays, usDate, todayOf } = __require("../rules/dates.js");
 const { failedRow, undoPastWords } = __require("../screen/compact.js");
 const { chooseMail } = __require("../rules/mails.js");
+const { closeUpWords } = __require("../core/close-up.js");
 const { RULE_CODES, REASON_CODES, STAGES, WINDOWS, FIELDS, STRUCTURES, PAGE_LIBRARIES, PAGE_SELECTORS, MENU_ITEMS, CALENDAR_CHECK_PARTS, CALM_PURPOSES, stopSentence } = __require("../core/run-records.js");
 const number = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 const amount = value => number(value) === null ? 'not recorded' : String(Math.round(value * 1000) / 1000);
@@ -15295,6 +15553,8 @@ function runReportText(batch, version, now = Date.now()) {
     if (pastDays.length) lines.push(undoPastWords(pastDays));
     for (const step of data.steps || []) lines.push(`Step: ${stage(step.stage)} ${amount(step.seconds)} s; ${step.ok === true ? 'ok' : 'failed'}${step.retry === true ? '; retry' : ''}`);
     if (data.reason || row.state === 'skipped' || failedRow(row)) lines.push(`Reason: ${code(data.reason || one.personStop?.code)}${sentence ? '; ' + sentence : ''}; failed stage: ${stage(data.failedStage)}`);
+    const closeUp = (data.reason || failedRow(row)) && closeUpWords(data.closeUp);
+    if (closeUp) lines.push(`Close-up: ${closeUp}`);
     if (data.deletedDates?.length) lines.push(`Deleted days to check by hand: ${data.deletedDates.join(', ')}`);
     for (const menu of data.findMenus || []) {
       const items = (menu.items || []).filter(item => MENU_ITEMS.has(item));
@@ -16717,5 +16977,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.4");
+__snoozeLoad("screen/panel.js").start("0.15.5");
 })();
