@@ -1,283 +1,98 @@
-(async () => {
-  const options = window.snoozeClickPathsProbeOptions || {};
-  const sleep = options.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
-  const now = options.now || (() => Date.now());
-  const TIMEOUT = options.timeout ?? 6000, QUIET = options.quiet ?? 800, POLL = options.poll ?? 100;
+(() => {
   const words = node => (node?.textContent || '').replace(/\s+/g, ' ').trim();
-  const shown = node => !!node && node.isConnected && styled(node) && node.getClientRects().length > 0;
-  const content = node => {
-    const control = node.closest('[id^="controlCalendar_"]');
-    if (!control) return true;
-    if (!control.querySelector(':scope > .fc-toolbar')) return false;
-    return !node.closest('.fc-view-container, .fc-view');
-  };
-  // A dated cell proves a view only when it and every parent are shown (and,
-  // on a laid-out page, it has a size): the page keeps hidden calendar copies.
-  const styled = node => !node || node === document.body || !node.hidden && getComputedStyle(node).display !== 'none' && getComputedStyle(node).visibility !== 'hidden'
-    && (!node.classList.contains('tab-pane') || node.classList.contains('active')) && styled(node.parentElement);
-  const laidOut = () => document.body.getBoundingClientRect().width > 0;
-  const datedCell = cell => { if (!styled(cell)) return false; if (!laidOut()) return true; const box = cell.getBoundingClientRect(); return box.width > 0 && box.height > 0; };
-  const views = () => [...document.querySelectorAll('.fc-view')].filter(view => content(view) && styled(view) && [...view.querySelectorAll('td.fc-day[data-date]')].some(datedCell));
-  const gridColumn = target => {
-    const table = target.closest('table');
-    if (!table) return null;
-    const rows = [...table.querySelectorAll(':scope > tbody > tr, :scope > tr')], taken = [];
-    for (let r = 0; r < rows.length; r++) {
-      let col = 0;
-      for (const cell of rows[r].children) {
-        while (taken[r]?.[col]) col++;
-        if (cell === target) return cell.colSpan === 1 ? col : null;
-        for (let dr = 0; dr < Math.min(cell.rowSpan, rows.length - r); dr++) for (let dc = 0; dc < cell.colSpan; dc++) (taken[r + dr] ||= [])[col + dc] = true;
-        col += cell.colSpan;
-      }
+  const shown = node => {
+    for (let n = node; n && n.nodeType === 1; n = n.parentElement) {
+      const s = getComputedStyle(n);
+      if (s.display === 'none' || s.visibility === 'hidden' || n.getAttribute('aria-hidden') === 'true') return false;
     }
-    return null;
+    return node.getClientRects().length > 0;
   };
-  const isoOf = value => {
-    if (typeof value?.format === 'function') return value.format('YYYY-MM-DD');
-    if (Object.prototype.toString.call(value) === '[object Date]') return value.toISOString().slice(0, 10);
-    return typeof value === 'string' ? value.slice(0, 10) : null;
-  };
-  const nextIso = iso => { const d = new Date(`${iso}T12:00:00Z`); d.setUTCDate(d.getUTCDate() + 1); return d.toISOString().slice(0, 10); };
-  const kind = client => /^leave of absence/i.test(client) ? 'LOA' : /^do not schedule/i.test(client) ? 'DNS' : /holiday/i.test(client) ? 'Holiday' : client ? 'other client' : 'no name';
-  const readTile = (tile, view) => {
-    const fields = [...tile.querySelectorAll('.field')], labelled = fields.some(field => field.querySelector('.field-label'));
-    const value = label => { const found = fields.filter(field => words(field.querySelector('.field-label')).replace(/:$/, '').toLowerCase() === label.toLowerCase()); return found.length === 1 ? words(found[0].querySelector('.field-value')) : ''; };
-    const client = labelled ? value('Name') : [...tile.childNodes].filter(node => node.nodeType === 3).map(node => node.textContent).join(' ').trim();
-    const hours = (labelled ? value('Hours') : words(tile.querySelector('.field-value'))).match(/^(\d+(?:\.\d+)?)h$/);
-    const note = !!tile.querySelector('i.fa-note-sticky, i.fa-sticky-note, [class*="note"]');
-    const row = { kind: kind(client), hours: hours ? Number(hours[1]) : null, note, day: null, how: '' };
-    const skeleton = tile.closest('.fc-content-skeleton');
-    if (!skeleton) {
-      const cell = tile.closest('td.fc-day[data-date]');
-      row.day = tile.getAttribute('data-date') || cell?.getAttribute('data-date') || null; row.how = 'dated tile'; return row;
-    }
-    const week = tile.closest('.fc-row.fc-week'), cell = tile.closest('td.fc-event-container');
-    if (tile.closest('.fc-view') !== view) { row.how = 'other view'; return row; }
-    if (!week || !cell || cell.closest('.fc-content-skeleton') !== skeleton) { row.how = 'no week row'; return row; }
-    const dates = [...week.querySelectorAll('.fc-bg td.fc-day')].filter(node => node.closest('.fc-row') === week);
-    const col = gridColumn(cell);
-    if (col === null || col >= dates.length) { row.how = 'no column'; return row; }
-    const day = dates[col].getAttribute('data-date');
-    try {
-      const data = window.jQuery?.(tile), seg = data?.data('fcSeg'), event = data?.data('event');
-      if (!seg || seg.leftCol !== col || seg.rightCol !== col) { row.how = 'segment disagrees'; return row; }
-      if (event && (event.start != null && isoOf(event.start) !== day || event.end != null && isoOf(event.end) !== nextIso(day))) { row.how = 'event dates disagree'; return row; }
-    } catch { row.how = 'segment unreadable'; return row; }
-    row.day = day; row.how = 'week row'; return row;
-  };
-  const report = { probe: 'click paths 2', steps: [] };
-  const windows = () => [...document.querySelectorAll('.modal, [role="dialog"]')].filter(shown).filter(n => !n.parentElement?.closest('.modal, [role="dialog"]'));
-  const menus = () => [...document.querySelectorAll('.context-menu-root')].filter(shown);
-  const busy = () => [...document.querySelectorAll('div.loading, .blockUI.blockOverlay, .loading-overlay, .dataTables_processing, .dt-processing')].some(shown);
-  const escape = () => (document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
-  const wait = async predicate => {
-    const start = now(); let calm = null;
-    while (now() - start < TIMEOUT) {
-      if (!busy() && predicate()) { calm ??= now(); if (now() - calm >= QUIET) return true; }
-      else calm = null;
-      await sleep(POLL);
-    }
-    return false;
-  };
-  const disabled = node => !!node.closest('.disabled, .context-menu-disabled, [aria-disabled="true"], [disabled]');
-  // Getter calls only. Never stringify page objects or callback functions.
-  const calendarSettings = view => {
-    const step = { n: 0, title: 'calendar settings', options: {}, view: {}, callbacks: {}, buttons: [] };
-    const fc = view?.closest('.fc');
-    const read = action => { try { return action(); } catch { return undefined; } };
-    const jq = read(() => window.jQuery(fc));
-    const option = name => read(() => fc ? jq.fullCalendar('option', name) : undefined);
-    const scalar = value => typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value)
-      || typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(value) ? value : 'unreadable';
-    for (const name of ['selectable', 'selectHelper', 'unselectAuto', 'editable', 'eventStartEditable', 'eventDurationEditable', 'defaultView', 'firstDay', 'weekends']) step.options[name] = scalar(option(name));
-    const current = read(() => fc ? jq.fullCalendar('getView') : undefined);
-    step.view.name = scalar(current?.name); step.view.type = scalar(current?.type);
-    const duration = value => {
-      if (!value || typeof value !== 'object') return 'unreadable';
-      if (typeof value.asDays === 'function') {
-        const days = read(() => value.asDays());
-        return typeof days === 'number' && Number.isFinite(days) ? { weeks: 0, days } : 'unreadable';
-      }
-      const keys = Object.keys(value);
-      if (!keys.length || keys.some(key => !['weeks', 'days'].includes(key))
-        || keys.some(key => typeof value[key] !== 'number' || !Number.isFinite(value[key]))) return 'unreadable';
-      return { weeks: value.weeks ?? 0, days: value.days ?? 0 };
-    };
-    step.view.dateIncrement = duration(current?.dateProfile?.dateIncrement ?? current?.dateIncrement ?? read(() => current?.opt('dateIncrement')) ?? option('dateIncrement'));
-    step.view.duration = duration(current?.viewSpec?.duration ?? current?.intervalDuration ?? current?.duration ?? read(() => current?.opt('duration')) ?? option('duration'));
-    const names = new Set(['select', 'dayClick', 'eventClick', 'eventRightclick', 'eventDrop', 'eventResize']);
-    const instance = read(() => jq.data('fullCalendar'));
-    const findNames = object => {
-      if (!object || typeof object !== 'object') return;
-      for (const name of Object.keys(object)) if (/contextmenu|rightclick/i.test(name) && /^[A-Za-z][A-Za-z0-9_]{0,47}$/.test(name)) names.add(name);
-    };
-    for (const object of [instance?.options, instance?.optionsManager?.computed, current?.options]) findNames(object);
-    const configuredViews = option('views');
-    if (configuredViews && typeof configuredViews === 'object') for (const config of Object.values(configuredViews)) findNames(config);
-    for (const name of names) {
-      // A successful getter returning undefined means the callback is unset.
-      try { step.callbacks[name] = fc && typeof jq?.fullCalendar === 'function' ? typeof jq.fullCalendar('option', name) === 'function' : 'unreadable'; }
-      catch { step.callbacks[name] = 'unreadable'; }
-    }
-    const headerRoot = fc?.closest('.js-calendar-wrapper, .staff-calendar-wrapper') || fc;
-    for (const button of headerRoot?.querySelectorAll('.fc-toolbar button, .fc-toolbar a, .fc-toolbar input[type="button"], .fc-header button, .calendar-title button, .calendar-title a, button[class*="fc-"], a[class*="fc-"]') || []) {
-      if (!shown(button)) continue;
-      const classes = [...button.classList].filter(name => /^fc-[A-Za-z0-9_-]+-button$/.test(name));
-      if (classes.length) for (const name of classes) step.buttons.push({ class: name, disabled: disabled(button) });
-      else {
-        const word = words(button) || button.value || '';
-        if (/^[A-Za-z]{1,16}(?: [A-Za-z]{1,16}){0,2}$/.test(word)) step.buttons.push({ word, disabled: disabled(button) });
-      }
-    }
-    return step;
-  };
-  const press = (node, extra = {}) => {
-    for (const type of ['mousedown', 'mouseup', 'click']) node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, ...extra }));
-  };
-  const close = async modal => {
-    const cancel = [...modal.querySelectorAll('button, a, input[type="button"]')].find(n => shown(n) && !disabled(n) && /^(cancel|close)$/i.test(words(n) || n.value || ''));
-    const cross = [...modal.querySelectorAll('button.close, button.btn-close, [data-dismiss="modal"], [data-bs-dismiss="modal"]')]
-      .find(n => shown(n) && !disabled(n) && /^(close|×|x)?$/i.test(words(n) || n.value || '')
-        && /^(close)?$/i.test(n.getAttribute('aria-label') || ''));
-    if (cancel || cross) press(cancel || cross);
-    if (await wait(() => !shown(modal))) return true;
-    escape();
-    return wait(() => !shown(modal));
-  };
-  // Only dates may leave a date field. Other page values are never printed.
-  const datesOnly = value => (String(value || '').match(/\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})\b/g) || []).join(', ');
-  const rangeOf = modal => {
-    const result = {};
-    for (const label of modal.querySelectorAll('label')) {
-      const word = words(label).replace(/[*?]/g, '').trim();
-      if (!/^(Start|End) (Date|Week)$/i.test(word)) continue;
-      const id = label.getAttribute('for');
-      const input = id ? document.getElementById(id) : label.parentElement?.querySelector('input');
-      result[word] = input ? datesOnly(input.value) || 'blank or unreadable' : 'missing';
-    }
-    return result;
-  };
-  const addDates = modal => {
-    const range = modal.querySelector('.shift-date-picker'), inputs = [...(range?.querySelectorAll('input') || [])];
-    const data = node => { try { return window.jQuery?.(node)?.data() || {}; } catch { return {}; } };
-    const pickerInput = inputs.find(n => data(n).datepicker || data(n).daterangepicker);
-    const stored = pickerInput ? data(pickerInput) : {};
-    const picker = stored.datepicker || stored.daterangepicker;
-    const summary = words(modal), number = name => summary.match(new RegExp(name + ':\\s*([\\d.]+)', 'i'))?.[1] || 'not shown';
-    return { start: datesOnly(inputs.find(n => /-start$/.test(n.id))?.value) || 'blank or missing',
-      end: datesOnly(inputs.find(n => /-end$/.test(n.id))?.value) || 'blank or missing',
-      datesBox: datesOnly(inputs.find(n => n.classList.contains('shift-date-picker-dates'))?.value),
-      boxes: inputs.length, picker: stored.datepicker ? 'bootstrap' : stored.daterangepicker ? 'daterangepicker' : 'none',
-      multidate: typeof picker?.o?.multidate === 'boolean' || typeof picker?.o?.multidate === 'number' ? picker.o.multidate : null,
-      pickerInputs: picker?.inputs?.length ?? 0, subPickers: picker?.pickers?.length ?? 0,
-      days: number('Days'), weeks: number('Weeks') };
-  };
-  const observeWindow = async (step, action) => {
-    action();
-    const opened = await wait(() => windows().length > 0);
-    const found = windows();
-    if (!found.length) { step.opened = opened ? 'window disappeared before read' : 'nothing opened'; return !busy(); }
-    step.opened = opened ? 'window opened' : 'window not settled';
-    const modal = found[0];
-    step.title = words(modal.querySelector('.modal-title, h4, h5, .modal-header h3')) || 'untitled';
-    if (step.n === 1) {
-      const table = modal.querySelector('table#editGrid');
-      step.table = !!table;
-      step.rows = table ? [...table.querySelectorAll('tbody tr')].filter(n => !n.querySelector('.dataTables_empty')).length : 0;
-      step.dates = [...(table?.querySelectorAll('tbody td.column-start') || [])].map(n => datesOnly(words(n)) || 'unreadable');
-      step.range = rangeOf(modal);
-      step.hoursCells = table?.querySelectorAll('tbody td.column-hours').length || 0;
-      step.bins = table?.querySelectorAll('tbody .js-assignment-edit-delete, tbody .action-column button.btn-danger, tbody .action-column .fa-trash, tbody .action-column .fa-trash-can').length || 0;
-      step.submit = [...modal.querySelectorAll('button, input[type="submit"]')].some(n => shown(n) && /^submit$/i.test(words(n) || n.value || ''));
-    } else if (/^Add Assignment$/i.test(step.title) || modal.id === 'addShiftEventModal') step.dates = addDates(modal);
-    step.closed = true;
-    for (const node of found.reverse()) if (!await close(node)) step.closed = false;
-    return step.closed && !windows().length && !busy();
-  };
-  let safe = false;
-  const original = new Set(windows());
-  const tilesIn = view => [...document.querySelectorAll('.fc-event')].filter(n => content(n) && shown(n)).map(node => ({ node, ...readTile(node, view) }));
-  try {
-    const found = views();
-    report.steps.push(calendarSettings(found.length === 1 ? found[0] : null));
-    safe = original.size === 0 && menus().length === 0 && found.length === 1 && await wait(() => !busy());
-    const view = found.length === 1 ? found[0] : null;
-    const first = { n: 1, opened: 'not attempted: page not ready' }; report.steps.push(first);
-    if (safe) {
-      const tile = tilesIn(view).find(n => n.day && n.hours !== null);
-      if (tile) { first.kind = tile.kind; first.day = tile.day; safe = await observeWindow(first, () => press(tile.node)); }
-      else first.opened = 'no readable entry';
-    }
-    const second = { n: 2, opened: 'not attempted: page not ready' }; report.steps.push(second);
-    if (safe) {
-      const tiles = tilesIn(view), occupied = new Set(tiles.map(n => n.day));
-      const today = new Date();
-      const todayIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-      let spot = null;
-      // Hit-test the white area. Never dispatch a day click through a tile or
-      // an unrelated layer. Unknown tile dates prevent claiming an empty day.
-      if (tiles.every(n => n.day)) for (const cell of view.querySelectorAll('td.fc-day[data-date]')) {
-        const day = cell.getAttribute('data-date');
-        if (!shown(cell) || !/^\d{4}-\d{2}-\d{2}$/.test(day) || day < todayIso || occupied.has(day)
-          || !cell.matches('.fc-today, .fc-future') || cell.closest('.fc-past, .disabled, .greyed, .grayed, [aria-disabled="true"]')) continue;
-        const box = cell.getBoundingClientRect();
-        for (const fraction of [0.8, 0.5, 0.2]) {
-          const x = box.left + box.width / 2, y = box.top + box.height * fraction;
-          const hit = document.elementFromPoint?.(x, y);
-          if (hit && (hit === cell || cell.contains(hit)) && !hit.closest('.fc-event, button, a, input')) { spot = { hit, day, x, y }; break; }
-        }
-        if (spot) break;
-      }
-      if (spot) { second.day = spot.day; safe = await observeWindow(second, () => press(spot.hit, { clientX: spot.x, clientY: spot.y })); }
-      else second.opened = 'no proved editable empty day';
-    }
-    const third = { n: 3, opened: 'not attempted: page not ready' }; report.steps.push(third);
-    if (safe) {
-      const tiles = tilesIn(view).filter(n => n.day).slice(0, 2), before = tiles.map(n => n.node.className);
-      third.tiles = [];
-      for (const tile of tiles) {
-        press(tile.node, { ctrlKey: true });
-        await sleep(QUIET);
-        if (windows().length || busy()) { safe = false; break; }
-      }
-      third.tiles = tiles.map((n, i) => ({ kind: n.kind, day: n.day, before: before[i], after: n.node.className }));
-      third.selected = third.tiles.some(n => n.before !== n.after) ? 'selection classes changed' : 'no selection';
-      third.menu = [];
-      const menuItems = () => menus().flatMap(n => [...n.querySelectorAll('.context-menu-item')]).filter(shown);
-      const openMenu = async () => {
-        tiles[0].node.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, view: window, button: 2, buttons: 2 }));
-        return wait(() => menus().length > 0);
+  let before = null;
+  const readTable = () => {
+    const tables = [...document.querySelectorAll('table#editGrid')].filter(shown);
+    if (!tables.length) return { problem: 'no Edit Assignment table is open. Open Find Assignments first.' };
+    if (tables.length > 1) return { problem: 'more than one Edit Assignment table is shown.' };
+    const table = tables[0];
+    const holder = table.closest('.modal') || table.parentElement;
+    const info = words(holder.querySelector('.dataTables_info')).match(/(\d+)\s+to\s+(\d+)\s+of\s+(\d+)/i);
+    const trs = [...table.querySelectorAll('tbody tr')];
+    if (trs.length === 1 && trs[0].querySelector('td.dataTables_empty')) return { problem: 'the table shows no rows (or is still loading).' };
+    if (!trs.length) return { problem: 'the table has no rows yet (still loading?).' };
+    if (info && Number(info[2]) - Number(info[1]) + 1 !== Number(info[3])) return { problem: `the table shows ${info[2]} of ${info[3]} rows; scroll or widen it so every row is drawn.` };
+    if (info && Number(info[3]) !== trs.length) return { problem: `the table says ${info[3]} rows but draws ${trs.length}.` };
+    const rows = [];
+    for (const [index, tr] of trs.entries()) {
+      const cell = name => tr.querySelector(`td.${name}`);
+      const hoursCell = cell('column-hours');
+      const box = hoursCell ? [...hoursCell.querySelectorAll('input')].filter(shown)[0] : null;
+      const row = {
+        id: tr.getAttribute('data-id') || '',
+        date: words(cell('column-start')),
+        hours: box ? String(box.value).trim() : words(hoursCell),
+        client: words(cell('column-clientname')),
+        notes: (words(cell('column-notesnumber')).match(/\((\d+)\)/) || [])[1] ?? '?',
       };
-      if (safe && tiles.length) {
-        third.opened = await openMenu() ? 'menu opened' : 'nothing opened';
-        third.menu = menuItems().map(n => ({ word: words(n), state: disabled(n) ? 'greyed' : 'enabled' }));
-        const clearOffered = menuItems().some(n => /^(clear selection|deselect all|unselect all)$/i.test(words(n)) && !disabled(n));
-        escape(); third.menuClosed = await wait(() => !menus().length);
-        if (third.menuClosed && clearOffered && third.selected !== 'no selection') {
-          await openMenu();
-          const clear = menuItems().find(n => /^(clear selection|deselect all|unselect all)$/i.test(words(n)) && !disabled(n));
-          if (clear) press(clear);
-          escape(); await wait(() => !menus().length);
-        }
-        third.cleared = third.selected === 'no selection' ? 'no selection' : tiles.every((n, i) => n.node.className === before[i]) ? 'selection cleared' : 'selection stays';
-        third.menuClosed = !menus().length;
-      } else third.opened = safe ? 'no readable entry' : 'Control click opened a window or busy cover; stopped';
+      if (!row.date || !row.hours || !hoursCell) return { problem: `row ${index + 1} has no readable date or hours.` };
+      rows.push(row);
     }
-  } catch {
-    report.error = 'page action or reading failed; stopped';
-  } finally {
-    for (const modal of windows().filter(n => !original.has(n)).reverse()) {
-      if (!await close(modal)) report.cleanup = 'window still open; close by hand';
+    return { rows };
+  };
+  const rowLine = r => `${r.date} · ${r.hours} h · ${r.client || '(no client)'} · notes ${r.notes} · ID ${r.id || '(none)'}`;
+  const key = r => `${r.date}|${r.client}`;
+  const compare = (old, now) => {
+    if (old.some(r => !r.id) || now.some(r => !r.id)) return { verdict: 'Could not tell: some rows have no row ID.', lines: [] };
+    const oldById = new Map(old.map(r => [r.id, r]));
+    const lines = [], counts = { kept: 0, changed: 0, unmatched: 0 };
+    const usedOld = new Set();
+    for (const r of now) {
+      const same = oldById.get(r.id);
+      if (same) { counts.kept++; usedOld.add(same); lines.push(`same ID     ${rowLine(r)}${same.hours !== r.hours ? ` (hours were ${same.hours})` : ''}`); continue; }
+      const likely = old.filter(o => key(o) === key(r) && !now.some(n => n.id === o.id));
+      const twins = now.filter(n => key(n) === key(r));
+      if (likely.length === 1 && twins.length === 1) { counts.changed++; usedOld.add(likely[0]); lines.push(`CHANGED ID  ${rowLine(r)} (was ${likely[0].id}${likely[0].hours !== r.hours ? `, hours were ${likely[0].hours}` : ''})`); }
+      else { counts.unmatched++; lines.push(`not matched ${rowLine(r)}${likely.length > 1 || twins.length > 1 ? ' (more than one row has this date and client)' : ''}`); }
     }
-    if (menus().length) { escape(); if (!await wait(() => !menus().length)) report.menuCleanup = 'menu still open; close by hand'; }
-    report.windowsClosed = windows().every(n => original.has(n));
-    document.querySelector('[data-snooze-click-paths-probe]')?.remove();
-    const panel = document.createElement('pre'); panel.setAttribute('data-snooze-click-paths-probe', '');
-    panel.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:900px;max-height:65vh;overflow:auto;white-space:pre-wrap;background:#111;color:#eee;font:12px/1.4 monospace;padding:10px;border:2px solid #6cf;margin:0';
-    const result = JSON.stringify(report, null, 1);
-    panel.textContent = 'Click paths probe 2 (saves nothing)\n' + result; document.body.append(panel);
-    console.log(result);
-    try { copy(result); } catch { /* DevTools provides copy(). */ }
-  }
+    for (const o of old) if (!usedOld.has(o)) lines.push(`gone        ${rowLine(o)}`);
+    const m = now.length;
+    let verdict;
+    if (!m) verdict = 'Could not tell: no rows to compare.';
+    else if (counts.unmatched) verdict = `Could not tell: ${counts.unmatched} of ${m} rows could not be matched to a row read before.`;
+    else if (counts.changed) verdict = `Row numbers changed for ${counts.changed} of ${m} rows`;
+    else verdict = 'Row numbers kept';
+    return { verdict, lines, counts };
+  };
+  document.querySelector('[data-snooze-row-ids-probe]')?.remove();
+  const panel = document.createElement('div');
+  panel.setAttribute('data-snooze-row-ids-probe', '');
+  panel.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:900px;background:#111;color:#eee;font:12px/1.4 monospace;padding:10px;border:2px solid #6cf';
+  const out = document.createElement('pre');
+  out.style.cssText = 'white-space:pre-wrap;margin:0 0 8px 0;max-height:50vh;overflow:auto';
+  const makeButton = (label, action) => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = label;
+    b.setAttribute('data-snooze-row-ids-probe-button', label);
+    b.style.cssText = 'margin-right:8px;font:12px monospace;padding:3px 8px';
+    b.addEventListener('click', event => { event.stopPropagation(); action(); });
+    return b;
+  };
+  const show = lines => { out.textContent = lines.join('\n'); console.log(lines.join('\n')); };
+  const readBefore = () => {
+    const read = readTable();
+    if (read.problem) { before = null; show(['Row IDs probe 1 · before', `Could not read: ${read.problem}`]); return; }
+    before = read.rows;
+    show(['Row IDs probe 1 · before', `${before.length} rows read and kept in memory:`, ...before.map(rowLine),
+      '', 'Now, by hand: press one row\'s bin (or change one row\'s Hours) and Submit,',
+      'open Find Assignments again over the same period, then press "Read after".']);
+  };
+  const readAfter = () => {
+    if (!before) { show(['Row IDs probe 1 · after', 'Could not tell: press "Read before" first.']); return; }
+    const read = readTable();
+    if (read.problem) { show(['Row IDs probe 1 · after', `Could not tell: ${read.problem}`]); return; }
+    const result = compare(before, read.rows);
+    const note = read.rows.length === before.length ? 'Same number of rows as before (an hours change, or nothing was saved?).' : '';
+    show(['Row IDs probe 1 · after', `Before: ${before.length} rows. After: ${read.rows.length} rows.`, ...result.lines, ...(note ? [note] : []), '', `Verdict: ${result.verdict}`]);
+  };
+  panel.append(out, makeButton('Read before', readBefore), makeButton('Read after', readAfter), makeButton('Close', () => panel.remove()));
+  document.body.append(panel);
+  show(['Row IDs probe 1', 'Open Find Assignments over a short test period (3 or more entries), then press "Read before".']);
 })();
