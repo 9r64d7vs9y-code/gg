@@ -1,4 +1,4 @@
-// v0.14.9
+// v0.15.4
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -3136,7 +3136,7 @@ async function cleanupAfter(original, cleanup) {
     return null;
   }
 }
-const WAIT = { schedule: 2000, proof: 2000, step: 50, timeout: 60000, quiet: 800, person: 60000, window: 60000, loadingNotice: 15000 };
+const WAIT = { schedule: 2000, proof: 2000, step: 50, timeout: 60000, quiet: 800, person: 60000, window: 60000, loadingNotice: 15000, calendar: 10000 };
 const openingWindows = new WeakMap();
 const windowCallers = new WeakMap(), settledWindows = new WeakSet(), supportedBulkWindows = new WeakSet();
 const modalCaller = modal => modal.matches('#FindAssignmentsModal') ? 'Find Assignments'
@@ -3561,14 +3561,15 @@ async function taxRestorePlan(backup, { after = null, today = todayOf(), verifyB
   const window = backup.watchedWindow || backup.window;
   const before = await copyWindow(window, { noteRows: after?.days.filter(row => typeof row.noteText === 'string') || [] });
   await verifyBefore?.(before);
-  const candidates = [...new Map([...backup.days, ...before.days.filter(row => within(row.day, backup.window))].map(row => [usDate(row.day), row.day])).values()].sort(compareDays);
-  const changedDays = [], steps = [], skippedLater = [], skippedLocked = [], skippedUnconfirmed = [];
-  let skippedPast = 0;
+  const candidates = [...new Map([...backup.days, ...[...before.days, ...after?.days || []].filter(row => within(row.day, backup.window))].map(row => [usDate(row.day), row.day])).values()].sort(compareDays);
+  const batchChanged = day => !!after?.window && within(day, after.window)
+    && (!equal(on(backup, day), on(after, day)) || (backup.noteChangedDays || []).some(old => sameDay(old, day)));
+  const changedDays = [], steps = [], skippedLater = [], skippedLocked = [], skippedUnconfirmed = [], skippedPastDays = [];
   for (const day of candidates) {
     const wanted = on(backup, day), actual = on(before, day);
     const noteChanged = (backup.noteChangedDays || []).some(old => sameDay(old, day)) && actual.days.some(row => row.notes > 0);
+    if (compareDays(day, mondayOf(today)) < 0) { if (batchChanged(day)) skippedPastDays.push(day); continue; }
     if (equal(wanted, actual) && !noteChanged) continue;
-    if (compareDays(day, mondayOf(today)) < 0) { skippedPast++; continue; }
     if (after && !sameTaxLive(on(after, day), actual)) { skippedLater.push({ day, clients: actual.days.map(row => row.client) }); continue; }
     const step = daySteps(day, wanted.days, actual.days, today);
     if (!step) { skippedUnconfirmed.push(day); continue; }
@@ -3576,7 +3577,7 @@ async function taxRestorePlan(backup, { after = null, today = todayOf(), verifyB
     if (!await canAddAssignment(day, { dayOnly: true })) { skippedLocked.push(day); continue; }
     changedDays.push(day); steps.push(step);
   }
-  return { window, before, changedDays, steps, skippedPast, skippedLater, skippedLocked, skippedUnconfirmed, nothing: changedDays.length ? '' : 'Nothing left to undo.' };
+  return { window, before, changedDays, steps, skippedPast: skippedPastDays.length, skippedPastDays, skippedLater, skippedLocked, skippedUnconfirmed, nothing: changedDays.length ? '' : 'Nothing left to undo.' };
 }
 __exports.sameTaxLive = sameTaxLive;
 __exports.taxRestorePlan = taxRestorePlan;
@@ -3585,40 +3586,77 @@ __exports.taxRestorePlan = taxRestorePlan;
 'use strict';
 const { addDays, compareDays, mondayOf, todayOf, usDate, workingDays } = __require("../rules/dates.js");
 const { within } = __require("../rules/leaves.js");
-const { PageError, stopFlagged } = __require("./dom.js");
+const { PageError, WAIT, stopFlagged } = __require("./dom.js");
 const { cancelBatchWindows } = __require("./batch.js");
 const { pageReady } = __require("./schedule.js");
-const { copyWindow, compareCopies } = __require("./copy.js");
+const { copyWindow, compareCopies, knownAssignmentRows, retainAssignmentEvidence } = __require("./copy.js");
+const { calendarBefore, calendarShowsChange, calendarShowsDelete } = __require("./calendar-check.js");
 const { deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
+const { recordRun } = __require("../core/run-records.js");
+const { memoryCopy } = __require("./restore.js");
 const sameRow = (a, b) => compareCopies({ days: [a] }, { days: [b] }).same;
+const previewChanged = message => Object.assign(new PageError(message), { previewChanged: true });
 const sameBut = (old, row) => sameRow({ ...old, hours: row.hours }, row);
-async function weeklyRestorePlan(backup, { after = null, today = todayOf(), verifyBefore } = {}) {
+const hasNote = row => (row.notes || 0) > 0;
+const byDate = days => [...new Map(days.map(day => [usDate(day), day])).values()].sort(compareDays);
+function matchBackupRows(olds, lives) {
+  const pairs = new Map(), taken = new Set(), unclear = [];
+  const pair = (old, row) => { pairs.set(old, row); taken.add(row); };
+  for (const old of olds) {
+    const row = old.id && lives.find(live => live.id === old.id);
+    if (row && !taken.has(row)) pair(old, row);
+  }
+  for (const old of olds.filter(one => !pairs.has(one))) {
+    if (unclear.includes(old)) continue;
+    const free = lives.filter(live => !taken.has(live) && sameRow(old, live));
+    const twins = olds.filter(one => !pairs.has(one) && !unclear.includes(one) && sameRow(old, one));
+    if (free.length > twins.length && new Set(free.map(hasNote)).size > 1) { unclear.push(...twins); for (const live of free) taken.add(live); }
+    else if (free.length) pair(old, free[0]);
+  }
+  const rest = olds.filter(one => !pairs.has(one) && !unclear.includes(one));
+  const fits = (old, live) => !taken.has(live) && live.hours < old.hours && sameBut(old, live);
+  const options = new Map(rest.map(old => [old, lives.filter(live => fits(old, live))]));
+  for (const [old, rows] of options) {
+    if (!rows.length) continue;
+    const rivals = rest.filter(other => options.get(other).some(live => rows.includes(live)));
+    if (rows.length === 1 && rivals.length === 1) pair(old, rows[0]);
+    else { unclear.push(old); for (const live of rows) taken.add(live); }
+  }
+  return { pairs, taken, unclear };
+}
+async function weeklyRestorePlan(backup, { after = null, today = todayOf(), verifyBefore, memory = false } = {}) {
   const window = backup.watchedWindow || backup.window;
-  const before = await copyWindow(window, { future: true });
+  if (memory && verifyBefore) return null;
+  const before = memory ? memoryCopy(after, window, { future: true }) : await copyWindow(window, { future: true });
+  if (memory && !before) return null;
   await verifyBefore?.(before);
   const inside = row => within(row.day, backup.window);
   const live = before.days.filter(inside);
-  const raise = [], add = [], used = new Set(), unconfirmed = [];
+  const raise = [], add = [], unconfirmed = [], retained = [];
+  const { pairs, taken, unclear } = matchBackupRows(backup.days, live);
   for (const old of backup.days) {
-    const row = old.id && live.find(row => row.id === old.id);
+    if (unclear.includes(old)) { unconfirmed.push(old.day); continue; }
+    const row = pairs.get(old);
     if (!row) { add.push(old); continue; }
-    used.add(row.id);
-    if (row.hours === old.hours && sameRow(old, row)) continue;
+    if (row.hours === old.hours && sameRow(old, row)) { retained.push({ old, row }); continue; }
     if (!sameBut(old, row) || row.hours > old.hours) unconfirmed.push(old.day); else raise.push({ old, row });
   }
-  const remove = live.filter(row => !used.has(row.id));
+  const remove = live.filter(row => !taken.has(row));
   const thisMonday = mondayOf(today);
   const past = { raise: item => compareDays(item.old.day, thisMonday) < 0, add: row => compareDays(row.day, today) < 0, remove: row => compareDays(row.day, today) < 0 };
   const laterChanged = after && !compareCopies({ days: after.days.filter(inside) }, { days: live }).same;
   const skipped = { raise: raise.filter(past.raise), add: add.filter(past.add), remove: remove.filter(past.remove) };
-  const skippedPast = skipped.raise.length + skipped.add.length + skipped.remove.length;
+  const on = (rows, day) => ({ days: rows.filter(row => compareDays(row.day, day) === 0) });
+  const batchChanged = day => !after?.window || within(day, after.window) && !compareCopies(on(backup.days, day), on(after.days, day)).same;
+  const skippedPastDays = byDate([...skipped.raise.map(item => item.old), ...skipped.add, ...skipped.remove].map(row => row.day)).filter(batchChanged);
   const steps = laterChanged ? { raise: [], add: [], remove: [] } : { raise: raise.filter(item => !past.raise(item)), add: add.filter(row => !past.add(row)), remove: remove.filter(row => !past.remove(row)) };
   const changes = [...raise.map(item => item.old), ...add, ...remove];
   const skippedLater = laterChanged ? changes.map(row => ({ day: row.day, clients: [row.client] })) : [];
-  const changedDays = [...new Map([...steps.raise.map(item => item.old), ...steps.add, ...steps.remove].map(row => [usDate(row.day), row.day])).values()].sort(compareDays);
+  const changedDays = byDate([...steps.raise.map(item => item.old), ...steps.add, ...steps.remove].map(row => row.day));
   const keptOld = new Set([...skipped.raise.map(item => item.old), ...skipped.add]);
   const expected = [...backup.days.filter(row => !keptOld.has(row)), ...skipped.raise.map(item => item.row), ...skipped.remove];
-  return { window, before, changedDays, steps, expected, skippedPast, skippedPastDays: [...skipped.raise.map(item => item.old), ...skipped.add, ...skipped.remove].map(row => row.day),
+  const noted = [...retained, ...steps.raise].map(({ old, row }) => ({ ...old, notes: row.notes || 0 }));
+  return { window, before, changedDays, steps, expected, noted, skippedPast: skippedPastDays.length, skippedPastDays,
     skippedLater, skippedLocked: [], skippedUnconfirmed: unconfirmed, nothing: changedDays.length ? '' : 'Nothing left to undo.' };
 }
 function sameDayClient(rows) {
@@ -3635,64 +3673,111 @@ function weeklyPutBack(old) {
   return { start: old.day, end: left[count - 1], hoursPerDay: old.hours / count };
 }
 async function restoreWeeklyWindow(backup, options = {}) {
-  const { today = todayOf(), onWrite = () => {}, automaticRecovery = false, previewBefore, previewDays } = options;
+  const { today = todayOf(), onWrite = () => {}, automaticRecovery = false, previewBefore, previewDays, calendarCheck = false } = options;
   const startedOn = todayOf();
   const currentDay = () => { const day = todayOf(); return compareDays(day, startedOn) === 0 ? today : day; };
   const notPast = (day, weekly = false) => () => {
     const now = currentDay();
     if (weekly ? compareDays(mondayOf(day), mondayOf(now)) < 0 : compareDays(day, now) < 0) throw new PageError(`${usDate(day)} became a past date during the Undo; it was not changed.`);
   };
-  const writeFor = (day, weekly) => async () => { notPast(day, weekly)(); await onWrite(); notPast(day, weekly)(); };
+  let readAfterWrite = null;
+  const writeFor = (day, weekly) => async () => { readAfterWrite = null; notPast(day, weekly)(); await onWrite(); notPast(day, weekly)(); };
   const plan = await weeklyRestorePlan(backup, options);
-  if (previewBefore && !compareCopies(previewBefore, plan.before).same) throw new PageError('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
-  if (previewDays && plan.changedDays.some(day => !previewDays.some(old => compareDays(old, day) === 0))) throw new PageError('The restore dates changed since the preview. Nothing was changed; preview again.');
+  if (previewBefore && !compareCopies(previewBefore, plan.before).same) throw previewChanged('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
+  if (previewDays && plan.changedDays.some(day => !previewDays.some(old => compareDays(old, day) === 0))) throw previewChanged('The restore dates changed since the preview. Nothing was changed; preview again.');
   const addDates = plan.steps.add.flatMap(old => { const run = weeklyPutBack(old); return workingDays(run.start, run.end); });
   const trial = plan.steps.add.map(old => ({ ...weeklyPutBack(old), label: old.client }));
   if (addDates.length) await preflightDates(addDates, { anchor: addDates[0], trial });
   let current = plan.before, added = 0, runs = 0;
   const failures = [];
   const read = () => copyWindow(plan.window, { future: true });
-  const prove = async expected => {
-    const after = await read();
+  const prove = async (expected, fresh = null) => {
+    const after = fresh || await read();
     if (!compareCopies({ days: expected }, after).same) throw new PageError('The Weekly restore step could not be proved.');
-    current = after;
+    current = after; readAfterWrite = after.calendarChecked ? null : after;
+    recordRun({ type: 'writeProof', ok: true });
+  };
+  const kinds = [...sameDayClient(plan.steps.remove).map(() => 'remove'), ...plan.steps.raise.map(() => 'raise'), ...plan.steps.add.map(() => 'add')];
+  let writeIndex = 0;
+  const shotFor = () => { const next = kinds[++writeIndex]; return next && next !== 'remove' && calendarCheck && !automaticRecovery ? calendarBefore(today) : null; };
+  const alike = (a, b) => sameRow(a, b) && hasNote(a) === hasNote(b);
+  const findAgain = rows => {
+    const found = rows.map(row => (row.id && current.days.find(live => live.id === row.id)) || null);
+    const used = new Set(found.filter(Boolean));
+    for (const [index, row] of rows.entries()) {
+      if (found[index]) continue;
+      const free = current.days.filter(live => !used.has(live) && alike(row, live));
+      const wanted = rows.filter((other, at) => !found[at] && alike(row, other)).length;
+      if (!free.length || free.length !== wanted) return null;
+      found[index] = free[0]; used.add(free[0]);
+    }
+    return found;
+  };
+  const proveOrCalendar = async (expected, shot, changes) => {
+    if (shot && await calendarShowsChange(shot, changes, current.days, today)) await prove(expected, { ...current, days: expected, calendarChecked: true });
+    else await prove(expected);
   };
   const attempt = async (day, fn) => {
     try { await fn(); runs++; }
     catch (error) {
       if (!automaticRecovery || stopFlagged(error)) throw error;
       failures.push({ day, message: error.message });
-      await cancelBatchWindows(); await pageReady('between Weekly recovery steps');
+      readAfterWrite = null;
+      await cancelBatchWindows(); await pageReady('between Weekly recovery steps', WAIT.person, { purpose: 'weeklyRecovery' });
       current = await read();
     }
   };
-  const kept = current.days.filter(row => !plan.steps.remove.includes(row));
-  for (const rows of sameDayClient(plan.steps.remove)) await attempt(rows[0].day, async () => {
-    const row = rows[0];
-    await deleteRange({ start: row.day, end: row.day, clients: [row.client], weekEndFriday: true }, current, { onWrite: writeFor(row.day), protectedRows: kept, read,
-      validate: async actual => { if (actual.days.some(live => live.client === row.client && !plan.steps.remove.some(old => old.id === live.id))) throw new PageError('The Weekly restore table changed. Nothing was deleted.'); } });
-    await prove(current.days.filter(live => !rows.some(old => old.id === live.id)));
+  for (const planned of sameDayClient(plan.steps.remove)) await attempt(planned[0].day, async () => {
+    const rows = findAgain(planned);
+    if (!rows) throw new PageError('The Weekly restore table changed. Nothing was deleted.');
+    const row = rows[0], kept = current.days.filter(live => !rows.includes(live));
+    let deleteRead = null;
+    const shot = shotFor();
+    const readOnce = async targets => {
+      if (shot && targets?.length && targets.every(one => one.id) && await calendarShowsDelete(shot, targets, current.days, today)) {
+        const ids = new Set(targets.map(one => one.id)), known = knownAssignmentRows(current);
+        deleteRead = { ...current, days: current.days.filter(live => !ids.has(live.id)), calendarChecked: true };
+        retainAssignmentEvidence(deleteRead, { window: known.range, days: known.rows.filter(live => !ids.has(live.id)) });
+        return deleteRead;
+      }
+      return (deleteRead = await read());
+    };
+    const afterDelete = await deleteRange({ start: row.day, end: row.day, clients: [row.client], weekEndFriday: true }, current, { onWrite: writeFor(row.day), protectedRows: kept, read: readOnce,
+      validate: async actual => { if (actual.days.some(live => live.client === row.client && !rows.some(old => old.id === live.id))) throw new PageError('The Weekly restore table changed. Nothing was deleted.'); } });
+    await prove(current.days.filter(live => !rows.some(old => old.id === live.id)), deleteRead && afterDelete === deleteRead ? deleteRead : null);
   });
-  for (const { old } of plan.steps.raise) await attempt(old.day, async () => {
-    const target = current.days.find(row => row.id === old.id);
+  for (const { old, row: planned } of plan.steps.raise) await attempt(old.day, async () => {
+    const [target] = findAgain([planned]) || [];
+    if (!target) throw new PageError('The Weekly restore table changed. Nothing was saved.');
     const monday = mondayOf(target.day);
+    const shot = shotFor();
     await setAssignmentHours({ start: monday, end: addDays(monday, 4), weekEndFriday: true }, { days: current.days.filter(row => compareDays(mondayOf(row.day), monday) === 0) },
-      target, old.hours, { onWrite: writeFor(old.day, true), restoring: true, weekly: true });
-    await prove(current.days.map(row => row.id === target.id ? { ...row, hours: old.hours } : row));
+      target, old.hours, { onWrite: writeFor(old.day, true), restoring: true, weekly: true, findAgain: true });
+    await proveOrCalendar(current.days.map(row => row.id === target.id ? { ...row, hours: old.hours } : row), shot, [{ day: target.day, client: target.client, hours: old.hours - target.hours }]);
   });
   for (const old of plan.steps.add) await attempt(old.day, async () => {
     const run = weeklyPutBack(old);
+    const shot = shotFor();
     await addAssignment({ client: old.client, wbs: old.wbs, jobCode: old.jobCode, assignCode: old.assignCode, assignCode2: old.assignCode2, billable: old.billable,
       utilization: old.utilization, pricingId: old.pricingId, start: run.start, end: run.end, hoursPerDay: run.hoursPerDay, notes: '' }, 'Normal', { onWrite: writeFor(run.start), weekly: true });
-    await prove([...current.days, { ...old, id: '', notes: 0 }]); added++;
+    await proveOrCalendar([...current.days, { ...old, id: '', notes: 0 }], shot, workingDays(run.start, run.end).map(day => ({ day, client: old.client, hours: run.hoursPerDay }))); added++;
   });
-  const after = await read();
+  const after = readAfterWrite || await read();
   const inside = row => within(row.day, backup.window);
-  const same = compareCopies({ days: plan.expected }, { days: after.days.filter(inside) }).same && !plan.skippedUnconfirmed.length && !plan.skippedLater.length;
-  const unrestoredDates = [...new Set([...plan.skippedUnconfirmed.map(usDate), ...failures.map(row => usDate(row.day)), ...(same ? [] : plan.changedDays.map(usDate))])];
-  return { ...plan, same: same && !failures.length, after, added, runs, unrestoredDates,
+  const page = after.days.filter(inside);
+  const taken = new Set();
+  const notesBack = plan.noted.every(old => {
+    const live = page.find(one => !taken.has(one) && alike(old, one));
+    if (live) taken.add(live);
+    return !!live;
+  });
+  const same = compareCopies({ days: plan.expected }, { days: page }).same && notesBack && !plan.skippedUnconfirmed.length && !plan.skippedLater.length;
+  const unrestoredDates = [...new Set([...plan.skippedUnconfirmed.map(usDate), ...plan.skippedPastDays.map(usDate), ...failures.map(row => usDate(row.day)), ...(same ? [] : plan.changedDays.map(usDate))])];
+  return { ...plan, same: same && !failures.length && !plan.skippedPastDays.length, after, added, runs, unrestoredDates,
     differences: unrestoredDates.map(date => ({ date, message: `${date}: Weekly restore unconfirmed.` })), missing: [], extra: [], recoveryFailures: failures };
 }
+__exports.previewChanged = previewChanged;
+__exports.matchBackupRows = matchBackupRows;
 __exports.weeklyRestorePlan = weeklyRestorePlan;
 __exports.sameDayClient = sameDayClient;
 __exports.weeklyPutBack = weeklyPutBack;
@@ -3700,6 +3785,8 @@ __exports.restoreWeeklyWindow = restoreWeeklyWindow;
 },
 "mysource/preflight-form.js": function (__require, __exports, document, window) {
 'use strict';
+const { compareDays } = __require("../rules/dates.js");
+const { termDayOf } = __require("../rules/shared.js");
 const forms = new WeakMap();
 let pending = null;
 function retirePreflightForm() { pending?.stop(); pending = null; }
@@ -3737,10 +3824,86 @@ function takePreflightForm(modal) {
   return { valid: proof?.take() === true, required: proof?.required };
 }
 const preflightFormIdentity = modal => forms.get(modal)?.identity;
+let batchTrial = null;
+const createBatchDateTrials = () => ({ types: new Map(), pending: new WeakMap() });
+async function withBatchDateTrials(memory, scope, run) {
+  const previous = batchTrial;
+  batchTrial = { memory, scope };
+  try { return await run(); }
+  finally { batchTrial = previous; }
+}
+function trialState() {
+  if (!batchTrial || !['Time', 'Weekly'].includes(batchTrial.scope.type)) return null;
+  const { memory, scope } = batchTrial;
+  let state = memory.types.get(scope.type);
+  if (!state) { state = { failed: false, capability: null, shape: null }; memory.types.set(scope.type, state); }
+  return { memory, scope, state };
+}
+function pickerShape(form) {
+  const range = form.querySelector('.shift-date-picker');
+  const box = range?.querySelector('input.shift-date-picker-dates')
+    || range?.querySelector('input:not([type=hidden]):not([id$="-start"]):not([id$="-end"])');
+  const jq = form.ownerDocument.defaultView.jQuery;
+  if (!box || typeof jq !== 'function') return null;
+  const wrapped = jq(box);
+  const bootstrap = wrapped?.data?.('datepicker');
+  if (bootstrap) {
+    if (Array.from(bootstrap.inputs || []).length === 2 || bootstrap.pickers?.length === 2) return 'bootstrap-range';
+    if (bootstrap.o?.multidate === true || typeof bootstrap.o?.multidate === 'number' && bootstrap.o.multidate >= 2) return 'bootstrap-one-box';
+    return 'bootstrap-single';
+  }
+  return wrapped?.data?.('daterangepicker') ? 'date-range' : null;
+}
+function reuseBatchDateTrial(required, { keepOpen = false, forceTrial = false, ...request } = {}) {
+  const context = trialState();
+  if (!context) return null;
+  const { memory, scope, state } = context;
+  memory.pending.delete(scope.person);
+  const termText = String(scope.termDate ?? '').trim(), term = termText ? termDayOf(termText) : null;
+  if (keepOpen || forceTrial || state.failed || !state.capability || !state.shape || !scope.reportEnd
+      || termText && !term || term && scope.plannedEnd && compareDays(scope.plannedEnd, term) >= 0
+      || required.some(day => compareDays(day, scope.today) < 0
+        || compareDays(day, scope.reportEnd) > 0 || term && compareDays(day, term) >= 0)) return null;
+  memory.pending.set(scope.person, { ...request, required: required.map(day => ({ ...day })), shape: state.shape });
+  return { ...state.capability };
+}
+function rememberBatchDateTrial(form, capability, request) {
+  const context = trialState();
+  if (!context) return;
+  const { memory, scope, state } = context;
+  memory.pending.delete(scope.person);
+  if ((capability.week ? 'Weekly' : 'Time') !== scope.type) { state.failed = true; return; }
+  if (state.failed) return;
+  state.capability = { exact: capability.exact, ...(capability.week ? { week: true } : {}),
+    ...(capability.grouped !== undefined ? { grouped: capability.grouped } : {}) };
+  state.shape = pickerShape(form);
+  memory.pending.set(scope.person, { ...request, required: request.required.map(day => ({ ...day })), shape: state.shape });
+}
+function failBatchDateTrial() {
+  const context = trialState();
+  if (!context) return;
+  context.state.failed = true;
+  context.memory.pending.delete(context.scope.person);
+}
+function changedBatchDateTrial(form) {
+  const context = trialState();
+  if (!context) return null;
+  const { memory, scope, state } = context;
+  const pending = memory.pending.get(scope.person);
+  if (!pending || pickerShape(form) === pending.shape) return null;
+  state.capability = null; state.shape = null;
+  return pending;
+}
 __exports.retirePreflightForm = retirePreflightForm;
 __exports.rememberPreflightForm = rememberPreflightForm;
 __exports.takePreflightForm = takePreflightForm;
 __exports.preflightFormIdentity = preflightFormIdentity;
+__exports.createBatchDateTrials = createBatchDateTrials;
+__exports.withBatchDateTrials = withBatchDateTrials;
+__exports.reuseBatchDateTrial = reuseBatchDateTrial;
+__exports.rememberBatchDateTrial = rememberBatchDateTrial;
+__exports.failBatchDateTrial = failBatchDateTrial;
+__exports.changedBatchDateTrial = changedBatchDateTrial;
 },
 "mysource/schedule.js": function (__require, __exports, document, window) {
 'use strict';
@@ -3754,7 +3917,7 @@ const { usDate, readIsoDay, compareDays, sameDay, todayOf, mondayOf, addDays } =
 const { termDayOf } = __require("../rules/shared.js");
 const { emailKey, emailFormKey } = __require("../rules/prepare.js");
 const { findByEmail } = __require("../family/email.js");
-const { recordRun } = __require("../core/run-records.js");
+const { recordRun, CALM_PURPOSES } = __require("../core/run-records.js");
 const { PageError, WAIT, beginRefusalTurn, scheduleWriteAttempted, activeGuardProbe, probeStyleReader, chooseInSelect2, click, closeWindow, describe, fieldByLabel, guardReady, guarded, keepFlags, cleanupAfter, rightClick, sameText, setChecked, settled, shown, shownUsing, stopFlagged, text, typeInto, waitFor, withPersonGuard } = __require("./dom.js");
 const SEARCH_SELECT = 'select[id^="ScheduleAddForm_Staff_Form_field_"]';
 const CALENDAR_VIEW = '.fc-view';
@@ -3879,28 +4042,46 @@ const ownChange = record => {
   return !!node?.closest?.('#snooze-panel-host');
 };
 const stillQuiet = () => !!quietProof && quietProof.document === document && !quietProof.touched && !quietProof.watch.takeRecords().some(record => !ownChange(record)) && !busyCovers().length;
-async function pageReady(what, timeout = WAIT.person, { reuseQuiet = false } = {}) {
-  if (reuseQuiet && stillQuiet()) { pageReady.waited = 0; return; }
-  quietProof?.watch.disconnect();
-  quietProof = null;
+function calmWatch() {
   const started = Date.now();
-  let clearSince = null;
-  let back = 0, latest = 0;
-  await waitFor(() => {
-    if (busyCovers().length) {
-      if (clearSince !== null) { back++; latest = Math.max(latest, Date.now() - clearSince); }
-      clearSince = null;
-    } else clearSince ??= Date.now();
-    return clearSince !== null && Date.now() - clearSince >= WAIT.quiet;
-  }, `the page to finish loading (${what})`, timeout).catch(error => {
-    if (error.identityChanged) throw error;
-    const cover = busyCovers()[0];
-    const box = cover?.getBoundingClientRect();
-    const style = cover && cover.ownerDocument.defaultView.getComputedStyle(cover);
-    throw keepFlags(error, new PageError(`${error.message} The loading cover ${describe(cover)} is still there${box ? ` (${Math.round(box.width)}×${Math.round(box.height)} px, opacity ${style.opacity}, z-index ${style.zIndex}, position ${style.position})` : ''}.`));
-  });
+  let clearSince = null, back = 0, latest = 0, cover = false, changed = false;
+  const watch = new document.defaultView.MutationObserver(records => { if (records.some(record => !ownChange(record))) changed = true; });
+  watch.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+  return {
+    look() {
+      if (busyCovers().length) {
+        cover = true;
+        if (clearSince !== null) { back++; latest = Math.max(latest, Date.now() - clearSince); }
+        clearSince = null;
+      } else clearSince ??= Date.now();
+      return clearSince === null ? null : Date.now() - clearSince;
+    },
+    stop() { watch.disconnect(); },
+    done(purpose) {
+      if (watch.takeRecords().some(record => !ownChange(record))) changed = true;
+      watch.disconnect();
+      recordRun({ type: 'calmWait', purpose: Object.hasOwn(CALM_PURPOSES, purpose) ? purpose : 'other', back, latest, cover, changed, ms: Date.now() - started });
+    },
+  };
+}
+function coverRefusal(error) {
+  if (error.identityChanged) return error;
+  const cover = busyCovers()[0];
+  const box = cover?.getBoundingClientRect();
+  const style = cover && cover.ownerDocument.defaultView.getComputedStyle(cover);
+  return keepFlags(error, new PageError(`${error.message} The loading cover ${describe(cover)} is still there${box ? ` (${Math.round(box.width)}×${Math.round(box.height)} px, opacity ${style.opacity}, z-index ${style.zIndex}, position ${style.position})` : ''}.`));
+}
+const forgetQuietProof = () => { quietProof?.watch.disconnect(); quietProof = null; };
+async function pageReady(what, timeout = WAIT.person, { reuseQuiet = false, purpose = 'other' } = {}) {
+  if (reuseQuiet && stillQuiet()) { pageReady.waited = 0; return; }
+  forgetQuietProof();
+  const started = Date.now();
+  const calm = calmWatch();
+  try {
+    await waitFor(() => (calm.look() ?? -1) >= WAIT.quiet, `the page to finish loading (${what})`, timeout);
+  } catch (error) { calm.stop(); throw coverRefusal(error); }
   pageReady.waited = Date.now() - started - WAIT.quiet;
-  recordRun({ type: 'calmWait', back, latest });
+  calm.done(purpose);
   const proof = { touched: false, document };
   proof.watch = new document.defaultView.MutationObserver(records => { if (records.some(record => !ownChange(record))) proof.touched = true; });
   proof.watch.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
@@ -4001,6 +4182,15 @@ function requirePersonIdentity(before, operation = 'identity check') {
   try { return checkPersonIdentity(before, operation); }
   catch (error) { throw error.identityPending ? error.refuse() : error; }
 }
+function waitForCalendarSettled() {
+  const settled = () => {
+    const { facts, names, view, calendarCover } = identityObservation(null);
+    const wrapper = view?.closest('.staff-calendar-wrapper');
+    if (!calendarCover && !facts.loadingCover && facts.nameCount === 0 && !view) return true;
+    return facts.nameCount === 1 && facts.namePresent && !!view && (!wrapper || wrapper.contains(names[0])) && !calendarCover;
+  };
+  return settled() ? true : waitFor(settled, 'the person on the calendar to settle', WAIT.person);
+}
 function waitForPersonIdentity(before, operation = 'identity check') {
   try { return checkPersonIdentity(before, operation); }
   catch (error) {
@@ -4052,7 +4242,7 @@ const pageCalm = () => shownNames(document).length === 0 && busyCovers().length 
 async function searchPageReady() {
   try {
     currentPerson();
-    await pageReady('before a new search');
+    await pageReady('before a new search', WAIT.person, { reuseQuiet: !shownNames(document).length, purpose: 'search' });
     currentPerson();
     const name = shownNames(document)[0];
     if (name) {
@@ -4069,7 +4259,7 @@ async function searchPageReady() {
           currentPerson();
           return pageCalm();
         }, 'the current schedule to close and the page to finish loading', WAIT.person);
-        await pageReady('after closing the current person', Math.max(0, WAIT.person - (Date.now() - started)));
+        await pageReady('after closing the current person', Math.max(0, WAIT.person - (Date.now() - started)), { purpose: 'afterClose' });
       });
     }
     if (!pageCalm()) throw new PageError('The page still has an open schedule or is loading. Close the schedule and wait before Resume.');
@@ -4078,7 +4268,7 @@ async function searchPageReady() {
 async function resumePageReady({ empty = false } = {}) {
   currentPerson();
   if (empty && shownNames(document).length) throw new PageError('The previous schedule is still open. Close it with the ✕ and wait before Resume.');
-  await pageReady('before Resume');
+  await pageReady('before Resume', WAIT.person, { purpose: 'resume' });
   currentPerson();
   if (empty && !pageCalm()) throw new PageError('The previous schedule is still open or loading. Close it and wait before Resume.');
 }
@@ -4146,6 +4336,7 @@ function resultEmails(option) {
   return emails;
 }
 async function professionalResults() {
+  forgetQuietProof();
   const dropdown = await waitFor(() => {
     const container = document.querySelector('.select2-container--open .select2-results__options')?.closest('.select2-container--open');
     return container && shown(container) ? container : null;
@@ -4154,8 +4345,10 @@ async function professionalResults() {
   const observer = new dropdown.ownerDocument.defaultView.MutationObserver(() => { changedAt = Date.now(); });
   observer.observe(dropdown, { childList: true, subtree: true, characterData: true, attributes: true,
     attributeFilter: ['class', 'aria-busy', 'aria-disabled', 'role', 'hidden', 'style'] });
+  const calm = calmWatch();
   try {
-    return await waitFor(() => {
+    const read = await waitFor(() => {
+      const clear = calm.look();
       if (!shown(dropdown)) throw Object.assign(new PageError('The professional search closed before its results could be read.'), { reasonCode: 'pageUnreadable' });
       const rows = [...dropdown.querySelectorAll('.select2-results__option')].filter(shown);
       const unfinished = dropdown.matches('[aria-busy="true"]')
@@ -4169,13 +4362,17 @@ async function professionalResults() {
       const read = options.map(option => ({ option, emails: resultEmails(option), text: text(option) }));
       const next = JSON.stringify({ rows: rows.map(row => [row.className, text(row)]), emails: read.map(row => row.emails) });
       if (signature !== next) { signature = next; changedAt = Date.now(); return null; }
-      if (Date.now() - changedAt < WAIT.quiet) return null;
+      if (Date.now() - changedAt < WAIT.quiet || (clear ?? -1) < WAIT.quiet) return null;
       if (messages.some(row => !/^no results(?: found)?[.!]?$/i.test(text(row))) || (messages.length && options.length)) {
         throw Object.assign(new PageError('The professional search results could not be read.'), { reasonCode: 'pageUnreadable' });
       }
       return options.length || messages.length ? read : null;
     }, 'settled professional search results', WAIT.person);
-  } finally { observer.disconnect(); }
+    calm.done('searchResults');
+    return read;
+  } catch (error) {
+    throw error.timeout && busyCovers().length ? coverRefusal(error) : error;
+  } finally { observer.disconnect(); calm.stop(); }
 }
 async function openPersonRecorded(email, expectedName = '', record = null, { fresh = false, today = todayOf(), termDate = record?.person?.termDate } = {}) {
   openPerson.last = { emailShown: false, waitedMs: 0, idShown: false, idMatchesLink: null };
@@ -4188,7 +4385,7 @@ async function openPersonRecorded(email, expectedName = '', record = null, { fre
     && personEntityId() === remembered.entityId && personIdCheck().matches === true && calendarView()) {
     const name = text(names[0]);
     try {
-      await pageReady('before reusing the current person');
+      await pageReady('before reusing the current person', WAIT.person, { purpose: 'reusePerson' });
       await setupView();
       const after = shownNames(document);
       if (after.length !== 1 || after[0].textContent !== remembered.nameText
@@ -4221,7 +4418,6 @@ async function openPersonRecorded(email, expectedName = '', record = null, { fre
   await click(box);
   const search = await waitFor(() => [...document.querySelectorAll('.select2-container--open .select2-search__field')].find(shown), 'the Search for a Professional box', WAIT.window);
   await typeInto(search, plain, () => recordRun({ type: 'searchStart' }));
-  await pageReady('before choosing the professional');
   const results = await professionalResults();
   const readable = results.filter(row => row.emails.length === 1);
   const pick = findByEmail(email, readable, row => row.emails[0]);
@@ -4266,7 +4462,7 @@ async function openPersonRecorded(email, expectedName = '', record = null, { fre
       if (before && name && sameText(nameOf(name), nameOf(before)) && !reloaded) { error.message = `The searched schedule did not reload. ${error.message}`; throw error; }
       throw error;
     });
-    await pageReady('after choosing the professional', Math.max(0, WAIT.person - (Date.now() - started)));
+    await pageReady('after choosing the professional', Math.max(0, WAIT.person - (Date.now() - started)), { purpose: 'personLoaded' });
     const loadedName = currentPerson();
     if (!loadedName || !calendarView()) throw new PageError('The searched schedule was not shown after loading.');
     if (expectedName && !sameText(nameOf(loadedName), expectedName)) throw new PageError(`The schedule shown is "${loadedName}", not ${expectedName}.`);
@@ -4339,16 +4535,16 @@ async function setupView() {
       if (signature !== previous) { previous = signature; stillSince = Date.now(); }
       return Date.now() - stillSince >= Math.min(1000, WAIT.window / 4);
     }, 'the Custom view and its dated range to settle', WAIT.window);
-    await pageReady('after the Custom view change');
+    await pageReady('after the Custom view change', WAIT.person, { purpose: 'customView' });
   }
   if (!configuredPeriods.has(document)) {
     await setPeriods();
-    await pageReady('after the view change');
+    await pageReady('after the view change', WAIT.person, { purpose: 'viewChange' });
   }
   configuredPeriods.add(document);
 }
-async function openPeriods() {
-  await pageReady('before opening No. of Periods');
+async function openPeriods({ reuseQuiet = false } = {}) {
+  await pageReady('before opening No. of Periods', WAIT.person, { reuseQuiet, purpose: 'beforePeriods' });
   const settings = [...document.querySelectorAll('button.fc-settings-button')].find(shown);
   if (!settings) throw new PageError('The ⋮ settings button was not found.');
   await click(settings);
@@ -4400,10 +4596,10 @@ async function waitPeriodsCalendar(value) {
     if (signature !== previous) { previous = signature; stillSince = Date.now(); }
     return Date.now() - stillSince >= Math.min(1000, WAIT.window / 4);
   }, 'the calendar to show the No. of Periods span', WAIT.window);
-  await pageReady('after No. of Periods change');
+  await pageReady('after No. of Periods change', WAIT.person, { purpose: 'afterPeriods' });
 }
 async function setPeriods() {
-  const { dialog, select, input, current } = await openPeriods();
+  const { dialog, select, input, current } = await openPeriods({ reuseQuiet: true });
   const buttonNamed = name => [...dialog.querySelectorAll('button')].find(b => shown(b) && sameText(text(b), name));
   if (current === PERIODS) {
     await closeWindow(dialog, 'No. of Periods');
@@ -4424,7 +4620,7 @@ async function setPeriods() {
   if (current === PERIODS) return;
   let spanError;
   await waitPeriodsCalendar(PERIODS).catch(error => { if (stopFlagged(error)) throw error; spanError = error; });
-  const check = await openPeriods();
+  const check = await openPeriods({ reuseQuiet: !spanError });
   await closeWindow(check.dialog, 'No. of Periods');
   await waitPeriodsClosed(check.dialog);
   if (check.current !== PERIODS) throw new PageError(`No. of Periods did not change to 14 (it reads ${check.current || 'blank'}). Nothing was changed.`);
@@ -4472,7 +4668,7 @@ function entryPointIn(entry) {
   return null;
 }
 async function menuItem(spots, label, again = true, inspect = false, optional = false) {
-  await pageReady(`before right-clicking for ${label}`, WAIT.person, { reuseQuiet: true });
+  await pageReady(`before right-clicking for ${label}`, WAIT.person, { reuseQuiet: true, purpose: 'rightClick' });
   const tried = [];
   let clicks = 0;
   for (const spot of spots) {
@@ -4511,7 +4707,7 @@ async function menuItem(spots, label, again = true, inspect = false, optional = 
     return tried;
   }
   if (again && !tried.length && busyCovers().length) {
-    await pageReady(`a loading cover over the calendar, before ${label}`);
+    await pageReady(`a loading cover over the calendar, before ${label}`, WAIT.person, { purpose: 'coverRightClick' });
     return menuItem(spots, label, false, inspect, optional);
   }
   const first = spots[0]?.cell;
@@ -4703,7 +4899,7 @@ async function findAssignmentsRecorded({ start, end, future, clients, weekEndFri
   const endBox = findDateBox(form, 'End');
   if (!future) await typeInto(endBox, end ? usDate(end) : '');
   measured('filters');
-  await pageReady('after setting Find Assignments filters');
+  await pageReady('after setting Find Assignments filters', WAIT.person, { purpose: 'findSettle' });
   measured('settle');
   const from = termDayOf(startBox.value.trim()), to = termDayOf(endBox.value.trim());
   const startKept = greyed ? from && (sameDay(from, start) || greyedWeekStart && weekBoxes && sameDay(from, mondayOf(today)) && sameDay(mondayOf(start), mondayOf(today))) : future ? startBox.value.trim() === usDate(start) || weekBoxes && from && sameDay(from, mondayOf(start))
@@ -4972,6 +5168,7 @@ __exports.currentPerson = currentPerson;
 __exports.personIdentity = personIdentity;
 __exports.checkPersonIdentity = checkPersonIdentity;
 __exports.requirePersonIdentity = requirePersonIdentity;
+__exports.waitForCalendarSettled = waitForCalendarSettled;
 __exports.waitForPersonIdentity = waitForPersonIdentity;
 __exports.weeklyRowsShown = weeklyRowsShown;
 __exports.allowWeeklyRows = allowWeeklyRows;
@@ -5419,7 +5616,7 @@ const { proveDates, setDates, proveAllowedDates, proveDateSet, setDateSet } = __
 const { waitForDates, waitForDateSet, readDates } = __require("./dates-box.js");
 const { buttonIn, emptySpots, menuItem, findAssignments, findAssignmentsRange, readEditTable, closeEdit, personIdentity, waitForPersonIdentity } = __require("./schedule.js");
 const { calendarHolds, showDate } = __require("./calendar.js");
-const { rememberPreflightForm, takePreflightForm, preflightFormIdentity } = __require("./preflight-form.js");
+const { rememberPreflightForm, takePreflightForm, preflightFormIdentity, reuseBatchDateTrial, rememberBatchDateTrial, failBatchDateTrial, changedBatchDateTrial } = __require("./preflight-form.js");
 function deleteClickState(confirm) {
   const jq = confirm.ownerDocument.defaultView.jQuery;
   const count = node => {
@@ -5520,28 +5717,32 @@ async function deleteAllObserved(edit, { onWrite = () => {} }, opening) {
   } finally { view.removeEventListener('error', observeError); }
 }
 async function addAssignmentRecorded(entry, mode, { onWrite = () => {}, move = showDate, onProgress = () => {}, formModal = null, preflightForm = null, weekly = false } = {}) {
-  if (isTaxPage() && compareDays(entry.start, todayOf()) < 0) throw new PageError('Tax Add/Replace cannot start before today.');
-  let retained = null;
-  if (preflightForm) {
-    const identity = preflightFormIdentity(preflightForm);
-    if (identity) await waitForPersonIdentity(identity);
-    retained = takePreflightForm(preflightForm);
-    if (retained.valid && shown(preflightForm)) formModal = preflightForm;
-    else {
-      const open = [...document.querySelectorAll('#addShiftEventModal')].filter(shown);
-      if (open.length > 1) throw Object.assign(new PageError('More than one Add Assignment window is open. Nothing was changed.'), { pageBlocked: true });
-      const stale = open[0] || (preflightForm.isConnected && shown(preflightForm) ? preflightForm : null);
-      if (stale) await closeWindow(stale, 'Add Assignment');
-    }
-  }
-  const modal = formModal || await openAddForm(entry.start, move, onProgress);
-  if (!modal.isConnected || !shown(modal)) throw new PageError('The preflight Add Assignment window closed before the change. Nothing was changed.');
+  let retained = null, modal = null;
   try {
+    if (isTaxPage() && compareDays(entry.start, todayOf()) < 0) throw new PageError('Tax Add/Replace cannot start before today.');
+    if (preflightForm) {
+      const identity = preflightFormIdentity(preflightForm);
+      if (identity) await waitForPersonIdentity(identity);
+      retained = takePreflightForm(preflightForm);
+      if (retained.valid && shown(preflightForm)) formModal = preflightForm;
+      else {
+        const open = [...document.querySelectorAll('#addShiftEventModal')].filter(shown);
+        if (open.length > 1) throw Object.assign(new PageError('More than one Add Assignment window is open. Nothing was changed.'), { pageBlocked: true });
+        const stale = open[0] || (preflightForm.isConnected && shown(preflightForm) ? preflightForm : null);
+        if (stale) await closeWindow(stale, 'Add Assignment');
+      }
+    }
+    modal = formModal || await openAddForm(entry.start, move, onProgress);
+    if (!modal.isConnected || !shown(modal)) throw new PageError('The preflight Add Assignment window closed before the change. Nothing was changed.');
+    const form = modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal;
+    const skipped = changedBatchDateTrial(form);
+    if (skipped) rememberBatchDateTrial(form, await proveDateTrial(form, skipped.required, skipped), skipped);
     if (retained?.required) proveAllowedDates(modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal, retained.required);
     weekFormRuns(modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal, entry, weekly);
     await fillAndAdd(modal, entry, mode, onWrite, onProgress);
   } catch (error) {
-    if (modal.isConnected && shown(modal) && !error.addPressed) {
+    failBatchDateTrial();
+    if (modal?.isConnected && shown(modal) && !error.addPressed) {
       const how = await cleanupAfter(error, () => closeWindow(modal, 'Add Assignment'));
       error.message += how ? ' Add Assignment was closed with Cancel; nothing was added.' : ' Close Add Assignment with Cancel by hand; nothing was added.';
     }
@@ -5613,6 +5814,7 @@ async function tryRun(form, { start, end, hoursPerDay, label }) {
       let trying = null;
       try { for (const run of grouped) { trying = run; await tryWeek(run); } }
       catch (error) {
+        failBatchDateTrial();
         if (stopFlagged(error) || !(error instanceof PageError) || weekCount(trying.start, trying.end) === 1) throw error;
         for (const run of weekRuns(start, end)) await tryWeek(run);
         return { grouped: false };
@@ -5624,6 +5826,7 @@ async function tryRun(form, { start, end, hoursPerDay, label }) {
       await waitForDates(form, start, end, Number(hoursPerDay));
     }
   } catch (error) {
+    failBatchDateTrial();
     if (stopFlagged(error) || !(error instanceof PageError)) throw error;
     if (error.weekShown) throw Object.assign(new PageError(error.message.replace('Nothing was added.', 'Nothing was changed; By hand.')), { trialDates: true, dateDiagnostics: error.dateDiagnostics });
     const held = readDates(form, Number(hoursPerDay));
@@ -5634,29 +5837,43 @@ async function tryRun(form, { start, end, hoursPerDay, label }) {
       dateDiagnostics: { expected: { start, end }, picker: held.picker, shown: held.shown, boxes: held.boxes, days: held.days, weeks: held.weeks } });
   }
 }
-async function preflightDates(required, { move = showDate, entries = [], keepOpen = false, anchor = required[0], onBounds = () => {}, trial = null } = {}) {
+async function proveDateTrial(form, required, { entries = [], onBounds = () => {}, trial = null } = {}) {
+  const capability = proveAllowedDates(form, required, onBounds);
+  let exact = capability.exact;
+  let grouped;
+  for (const run of [].concat(trial || [])) grouped = (await tryRun(form, run))?.grouped ?? grouped;
+  for (const entry of entries.filter(entry => entry.dates)) {
+    if (!exact) break;
+    await typeInto(fieldByLabel(form, 'Hours Per Day'), entry.hoursPerDay);
+    try { await setDateSet(form, entry.dates, Number(entry.hoursPerDay)); }
+    catch (error) { failBatchDateTrial(); if (stopFlagged(error)) throw error; exact = false; }
+  }
+  return { exact, ...(isWeekForm(form) ? { week: true } : {}), ...(grouped !== undefined ? { grouped } : {}) };
+}
+async function preflightDates(required, { move = showDate, entries = [], keepOpen = false, anchor = required[0], onBounds = () => {}, trial = null, forceTrial = false } = {}) {
   if (!required.length) return { exact: false };
-  const modal = await openAddForm(anchor, move);
-  let proved = false;
+  const request = { required, entries, keepOpen, anchor, onBounds, trial, forceTrial };
+  const reused = reuseBatchDateTrial(required, request);
+  if (reused) return reused;
+  let proved = false, modal = null;
   try {
+    modal = await openAddForm(anchor, move);
     const form = modal.querySelector('#CreateWeeklyAssignmentShift_Form') || modal;
-    const capability = proveAllowedDates(form, required, onBounds);
-    let exact = capability.exact;
-    let grouped;
-    for (const run of [].concat(trial || [])) grouped = (await tryRun(form, run))?.grouped ?? grouped;
-    for (const entry of entries.filter(entry => entry.dates)) {
-      if (!exact) break;
-      await typeInto(fieldByLabel(form, 'Hours Per Day'), entry.hoursPerDay);
-      try { await setDateSet(form, entry.dates, Number(entry.hoursPerDay)); }
-      catch (error) { if (stopFlagged(error)) throw error; exact = false; }
-    }
+    const capability = await proveDateTrial(form, required, request);
+    rememberBatchDateTrial(form, capability, request);
     proved = true;
     if (keepOpen) rememberPreflightForm(modal, personIdentity(), required);
-    return { exact, ...(isWeekForm(form) ? { week: true } : {}), ...(grouped !== undefined ? { grouped } : {}), ...(keepOpen ? { modal } : {}) };
+    return { ...capability, ...(keepOpen ? { modal } : {}) };
   } catch (error) {
-    await cleanupAfter(error, () => closeWindow(modal, 'Add Assignment'));
+    failBatchDateTrial();
+    if (modal) await cleanupAfter(error, () => closeWindow(modal, 'Add Assignment'));
     throw error;
-  } finally { if (proved && !keepOpen) await closeWindow(modal, 'Add Assignment'); }
+  } finally {
+    if (proved && !keepOpen) {
+      try { await closeWindow(modal, 'Add Assignment'); }
+      catch (error) { failBatchDateTrial(); throw error; }
+    }
+  }
 }
 async function openAddForm(start, move = showDate, onProgress = () => {}) {
   onProgress('calendar');
@@ -5766,6 +5983,49 @@ function splitDeleteWeeks(query) {
   }
   return parts;
 }
+async function deleteFromTable(edit, query, before, { read, onWrite = () => {}, validate = async () => {}, protectedRows = [], onlyIds = null } = {}) {
+  const inside = (day, range) => day && compareDays(day, range.start) >= 0 && (!range.end || compareDays(day, range.end) <= 0);
+  const clientsMatch = (row, range) => !range.clients?.length || range.clients.some(client => valueKey(client) === valueKey(row.client));
+  const covers = (outer, inner) => outer?.start && inner?.start && compareDays(outer.start, inner.start) <= 0
+    && (!outer.end || inner.end && compareDays(outer.end, inner.end) >= 0)
+    && (!outer.clients?.length || inner.clients?.length && inner.clients.every(client => outer.clients.some(other => valueKey(other) === valueKey(client))));
+  const requested = { ...query, end: query.future ? null : query.end };
+  const known = knownAssignmentRows(before);
+  let targets;
+  try {
+    const range = findAssignmentsRange(edit);
+    if (isTaxPage() || typeof read !== 'function' || !covers(known.range, range) || !covers(range, requested)) throw new PageError('The delete range is not covered by the checked table. Nothing was deleted.');
+    const expected = { days: known.rows.filter(row => inside(row.day, range) && clientsMatch(row, range)) };
+    const actual = { days: (await readEditTable(edit)).map(row => ({ ...row, day: dayOf(row.date) })) };
+    if (actual.days.some(row => !row.day) || !sameAssignmentRows(expected, actual)) throw new PageError('The removal table changed since the checked read. Nothing was deleted.');
+    targets = known.rows.filter(row => inside(row.day, requested) && clientsMatch(row, requested) && (!onlyIds || onlyIds.has(row.id)));
+    if (onlyIds && (!onlyIds.size || targets.length !== onlyIds.size || new Set(targets.map(row => row.id)).size !== onlyIds.size)) throw new PageError('The rows to remove are not all in the checked table. Nothing was deleted.');
+    if (targets.some(row => !expected.days.some(old => old.id === row.id) || protectedRows.some(old => old.id === row.id))) throw new PageError('A required or kept row is outside the proved removal scope. Nothing was deleted.');
+    await validate({ days: targets, window: { start: query.start, end: requested.end } });
+    if (!targets.length) await closeEdit(edit);
+    else if (targets.length === actual.days.length) await deleteAll(edit, { onWrite });
+    else {
+      const bin = row => [...edit.querySelectorAll('tbody tr[data-id]')].filter(node => node.getAttribute('data-id') === row.id)
+        .flatMap(node => [...node.querySelectorAll('td.action-column button.btn-xs.btn-danger')]).filter(button => shown(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true').length === 1;
+      if (!targets.every(bin)) throw Object.assign(new PageError('A row to remove has no bin button. Nothing was deleted.'), { noBins: true });
+      await saveStagedNotes(await stageRemoval(edit, expected, targets), onWrite);
+    }
+  } catch (error) {
+    if (edit.isConnected && shown(edit) && !error.addPressed) await cleanupAfter(error, () => closeEdit(edit));
+    throw error;
+  }
+  const after = await read(targets);
+  const ids = new Set(targets.map(row => row.id));
+  const expected = { days: known.rows.filter(row => !ids.has(row.id)) };
+  if (!covers(knownAssignmentRows(after).range, known.range)) {
+    const checked = await copyWindow({ start: known.range.start, end: known.range.end || before.window.end }, { future: !known.range.end });
+    if (!sameAssignmentRows(expected, { days: knownAssignmentRows(checked).rows })) throw new PageError('The table delete could not be proved. Restore this person before continuing.');
+    retainAssignmentEvidence(after, checked);
+  }
+  if (!sameAssignmentRows(expected, { days: knownAssignmentRows(after).rows })) throw new PageError('The table delete could not be proved. Restore this person before continuing.');
+  if (targets.length) recordRun({ type: 'writeProof', ok: true });
+  return after;
+}
 async function deleteRange(query, before, { edit = null, read, onWrite = () => {}, validate = async () => {}, protectedRows = [] } = {}) {
   const inside = (day, range) => day && compareDays(day, range.start) >= 0 && (!range.end || compareDays(day, range.end) <= 0);
   const clientMatches = row => !query.clients || query.clients.some(client => valueKey(client) === valueKey(row.client));
@@ -5813,7 +6073,7 @@ async function deleteRange(query, before, { edit = null, read, onWrite = () => {
       if (table.isConnected && shown(table) && !error.addPressed) await cleanupAfter(error, () => closeEdit(table));
       throw error;
     }
-    const after = await read();
+    const after = await read(targets);
     const ids = new Set(targets.map(row => row.id));
     const expected = { days: known.rows.filter(row => !ids.has(row.id)) };
     const coverage = knownAssignmentRows(after).range;
@@ -5829,12 +6089,16 @@ async function deleteRange(query, before, { edit = null, read, onWrite = () => {
   return current;
 }
 function addAssignment(...args) { return timedRun("add", () => addAssignmentRecorded(...args)); }
-async function setAssignmentHours(query, expected, target, hours, { onWrite = () => {}, restoring = false, weekly = false, remove = [] } = {}) {
-  const removable = !remove.length || weekly && remove.every(row => row.id && row.id !== target.id && compareDays(row.day, mondayOf(todayOf())) >= 0);
-  const allowed = () => removable && (weekly ? !isTaxPage() : isTaxPage()) && compareDays(target.day, mondayOf(todayOf())) >= 0 && (restoring || hours <= target.hours)
-    && (weekly || compareDays(target.day, todayOf()) >= 0 || !['loa', 'holiday', 'dns'].includes(entryKind(target)) && valueKey(target.client) !== 'loa');
+async function setAssignmentHours(query, expected, target, hours, { onWrite = () => {}, restoring = false, weekly = false, remove = [], findAgain = false } = {}) {
+  const grouped = Array.isArray(target), targets = grouped ? target : [{ target, hours }];
+  const allowed = () => (targets.length > 0 || grouped && weekly && !restoring && remove.length > 0) && (!grouped || weekly && !restoring)
+    && new Set(targets.map(item => item.target.id)).size === targets.length
+    && (!remove.length || weekly && remove.every(row => row.id && !targets.some(item => item.target.id === row.id) && compareDays(row.day, mondayOf(todayOf())) >= 0))
+    && (weekly ? !isTaxPage() : isTaxPage())
+    && targets.every(({ target, hours }) => compareDays(target.day, mondayOf(todayOf())) >= 0 && (restoring || hours <= target.hours)
+      && (weekly || compareDays(target.day, todayOf()) >= 0 || !['loa', 'holiday', 'dns'].includes(entryKind(target)) && valueKey(target.client) !== 'loa'));
   if (!allowed()) throw new PageError('Tax hours edit is outside the allowed change.');
-  const staged = await stageTaxHours(query, expected, target, hours, { remove });
+  const staged = await stageTaxHours(query, expected, target, hours, { remove, findAgain: findAgain && weekly && restoring && !grouped });
   return saveStagedNotes(staged, async () => { await onWrite(); if (!allowed()) throw new PageError('Tax hours edit moved outside the allowed dates.'); });
 }
 async function refreshNotes(query, expected, notes, { onWrite = () => {}, remove = [], onStage = () => {} } = {}) {
@@ -5863,6 +6127,7 @@ __exports.weekRuns = weekRuns;
 __exports.preflightDates = preflightDates;
 __exports.deleteAll = deleteAll;
 __exports.splitDeleteWeeks = splitDeleteWeeks;
+__exports.deleteFromTable = deleteFromTable;
 __exports.deleteRange = deleteRange;
 __exports.addAssignment = addAssignment;
 __exports.setAssignmentHours = setAssignmentHours;
@@ -5924,6 +6189,26 @@ function sameAssignmentRows(expected, actual) {
 }
 async function stageRemoval(edit, expected, remove) {
   const snapshot = async () => ({ days: (await readEditTable(edit)).map(row => ({ ...row, day: dayOf(row.date) })) });
+  const values = root => JSON.stringify([...root.querySelectorAll('input, select, textarea')].map(node => [node.value, node.checked, node.disabled,
+    node.tagName === 'SELECT' ? [...node.options].map(option => option.selected) : null]));
+  const shell = table => {
+    const clone = table.cloneNode(true);
+    for (const body of clone.querySelectorAll('tbody')) body.replaceChildren();
+    return clone;
+  };
+  let originalRows, originalShell, originalShellValues;
+  const stagedMatches = removed => {
+    const tables = [...edit.querySelectorAll('table#editGrid')];
+    if (tables.length !== 1 || !shell(tables[0]).isEqualNode(originalShell) || values(shell(tables[0])) !== originalShellValues) return false;
+    const rows = [...tables[0].querySelectorAll('tbody tr')];
+    const retained = new Map([...originalRows].filter(([id]) => !removed.has(id)));
+    if (!retained.size) return rows.length === 1 && rows[0].children.length === 1 && !!rows[0].querySelector('td.dataTables_empty');
+    if (rows.length !== retained.size || new Set(rows.map(row => row.getAttribute('data-id'))).size !== rows.length) return false;
+    return rows.every(row => {
+      const old = retained.get(row.getAttribute('data-id'));
+      return old && row.isEqualNode(old.node) && values(row) === old.values;
+    });
+  };
   let prepared = false, pressed = false, primary = null;
   const trashFor = id => {
     const rows = [...edit.querySelectorAll('tbody tr[data-id]')].filter(node => node.getAttribute('data-id') === id);
@@ -5932,17 +6217,25 @@ async function stageRemoval(edit, expected, remove) {
     return buttons[0];
   };
   try {
+    const tables = [...edit.querySelectorAll('table#editGrid')];
+    if (tables.length !== 1) throw new PageError('The removal table changed. Nothing was saved.');
+    const rows = [...tables[0].querySelectorAll('tbody tr')];
+    if (rows.some(row => !row.getAttribute('data-id')) || new Set(rows.map(row => row.getAttribute('data-id'))).size !== rows.length) throw new PageError('The removal table changed. Nothing was saved.');
+    originalRows = new Map(rows.map(row => [row.getAttribute('data-id'), { node: row.cloneNode(true), values: values(row) }]));
+    originalShell = shell(tables[0]); originalShellValues = values(originalShell);
     if (!remove.length || new Set(remove.map(row => row.id)).size !== remove.length
-      || !sameAssignmentRows(expected, await snapshot()) || remove.some(row => !expected.days.some(old => old.id === row.id))) throw new PageError('The removal table changed. Nothing was saved.');
+      || !sameAssignmentRows(expected, await snapshot()) || !stagedMatches(new Set())
+      || remove.some(row => !expected.days.some(old => old.id === row.id))) throw new PageError('The removal table changed. Nothing was saved.');
     for (const row of remove) trashFor(row.id);
     const removed = new Set();
     for (const row of remove) {
+      if (!stagedMatches(removed)) throw new PageError('The staged row removal could not be proved. Nothing was saved.');
       pressed = true;
       await click(trashFor(row.id));
       await waitFor(() => ![...edit.querySelectorAll('tbody tr[data-id]')].some(node => node.getAttribute('data-id') === row.id), 'the staged row removal', WAIT.window);
       await settled(edit);
       removed.add(row.id);
-      if (!sameAssignmentRows({ days: expected.days.filter(old => !removed.has(old.id)) }, await snapshot())) throw new PageError('The staged row removal could not be proved. Nothing was saved.');
+      if (!stagedMatches(removed)) throw new PageError('The staged row removal could not be proved. Nothing was saved.');
     }
     const submits = [...edit.querySelectorAll('button')].filter(node => shown(node) && text(node) === 'Submit');
     if (submits.length !== 1 || submits[0].disabled || submits[0].getAttribute('aria-disabled') === 'true') throw new PageError(NOTE_STAGE_EXITS.submitMissing);
@@ -5998,30 +6291,43 @@ function noteRowsEligible(rows) {
     return (first || blankNoteField(field)) && rows.every(row => valueKey(row[field]) === first);
   });
 }
-async function stageTaxHours(query, expected, target, hours, { remove = [] } = {}) {
+async function stageTaxHours(query, expected, target, hours, { remove = [], findAgain = false } = {}) {
   const edit = await findAssignments(query);
   let staged = false;
   try {
     const snapshot = async () => ({ days: (await readEditTable(edit)).map(row => ({ ...row, day: dayOf(row.date) })) });
     const before = await snapshot();
     if (!compareCopies(expected, before).same || before.days.some(row => !row.day || !row.id) || new Set(before.days.map(row => row.id)).size !== before.days.length) throw new PageError('Tax assignments changed before the hours edit. Nothing was saved.');
-    const matching = before.days.filter(row => row.id === target.id);
-    if (matching.length !== 1 || !compareCopies({ days: [target] }, { days: matching }).same) throw new PageError('Tax hours edit has no unique unchanged entry. Nothing was saved.');
-    const rows = [...edit.querySelectorAll('table#editGrid tbody tr')].filter(row => row.getAttribute('data-id') === target.id);
-    const cell = rows.length === 1 && rows[0].querySelector('td.column-hours');
-    if (!cell || !Number.isFinite(hours) || hours < 0) throw new PageError('Tax Hours cell is unreadable. Nothing was saved.');
-    await click(cell);
-    const input = await waitFor(() => {
-      const inputs = [...cell.querySelectorAll('input')].filter(shown);
-      if (inputs.length > 1) throw new PageError('Tax Hours edit is ambiguous. Nothing was saved.');
-      return inputs[0];
-    }, 'the Tax Hours edit box');
-    if ([...cell.querySelectorAll('.editable-submit')].some(shown)) throw new PageError('Tax Hours has an unproved inline save action. Nothing was typed or saved.');
-    await typeInto(input, hours);
-    input.dispatchEvent(new window.Event('blur', { bubbles: true }));
-    const wanted = { days: before.days.map(row => row.id === target.id ? { ...row, hours } : row) };
-    const after = await snapshot();
-    if (!compareCopies(wanted, after).same || after.days.some(row => !before.days.some(old => old.id === row.id && old.notes === row.notes))) throw new PageError('The staged Tax hours edit changed unexpected fields. Nothing was saved.');
+    let targets = Array.isArray(target) ? target : [{ target, hours }];
+    if (findAgain) targets = targets.map(item => {
+      if (before.days.some(row => row.id === item.target.id)) return item;
+      const alike = before.days.filter(row => (row.notes || 0) === (item.target.notes || 0) && compareCopies({ days: [item.target] }, { days: [row] }).same);
+      return alike.length === 1 ? { ...item, target: alike[0] } : item;
+    });
+    if (!targets.length && !remove.length || new Set(targets.map(item => item.target.id)).size !== targets.length) throw new PageError('Tax hours edit has no unique unchanged entry. Nothing was saved.');
+    for (const { target, hours } of targets) {
+      const matching = before.days.filter(row => row.id === target.id);
+      if (matching.length !== 1 || !compareCopies({ days: [target] }, { days: matching }).same) throw new PageError('Tax hours edit has no unique unchanged entry. Nothing was saved.');
+      if (!Number.isFinite(hours) || hours < 0) throw new PageError('Tax Hours cell is unreadable. Nothing was saved.');
+    }
+    let after = before;
+    for (const { target, hours } of targets) {
+      const rows = [...edit.querySelectorAll('table#editGrid tbody tr')].filter(row => row.getAttribute('data-id') === target.id);
+      const cell = rows.length === 1 && rows[0].querySelector('td.column-hours');
+      if (!cell) throw new PageError('Tax Hours cell is unreadable. Nothing was saved.');
+      await click(cell);
+      const input = await waitFor(() => {
+        const inputs = [...cell.querySelectorAll('input')].filter(shown);
+        if (inputs.length > 1) throw new PageError('Tax Hours edit is ambiguous. Nothing was saved.');
+        return inputs[0];
+      }, 'the Tax Hours edit box');
+      if ([...cell.querySelectorAll('.editable-submit')].some(shown)) throw new PageError('Tax Hours has an unproved inline save action. Nothing was typed or saved.');
+      await typeInto(input, hours);
+      input.dispatchEvent(new window.Event('blur', { bubbles: true }));
+      const wanted = { days: after.days.map(row => row.id === target.id ? { ...row, hours } : row) };
+      after = await snapshot();
+      if (!compareCopies(wanted, after).same || after.days.some(row => !before.days.some(old => old.id === row.id && old.notes === row.notes))) throw new PageError('The staged Tax hours edit changed unexpected fields. Nothing was saved.');
+    }
     const submits = [...edit.querySelectorAll('button')].filter(node => shown(node) && text(node) === 'Submit' && !node.disabled);
     if (submits.length !== 1) throw new PageError('Tax Edit Assignment has no unique enabled Submit. Nothing was saved.');
     staged = true;
@@ -6428,21 +6734,83 @@ __exports.DNS_CLIENT = DNS_CLIENT;
 __exports.checkDnsAdded = checkDnsAdded;
 __exports.checkLoaAdded = checkLoaAdded;
 },
+"mysource/calendar-check.js": function (__require, __exports, document, window) {
+'use strict';
+const { recordRun } = __require("../core/run-records.js");
+const { waitFor, WAIT, stopFlagged } = __require("./dom.js");
+const { exitCalendarSnapshot, pageReady } = __require("./schedule.js");
+const { mondayOf, usDate } = __require("../rules/dates.js");
+const week = day => usDate(mondayOf(day));
+const sums = (rows, weeks) => {
+  const result = new Map();
+  for (const row of rows) {
+    if (!weeks.has(week(row.day))) continue;
+    const key = `${week(row.day)}|${row.client.trim().toLowerCase()}`;
+    result.set(key, (result.get(key) || 0) + row.hours);
+  }
+  return result;
+};
+const same = (a, b) => [...new Set([...a.keys(), ...b.keys()])].every(key => Math.abs((a.get(key) || 0) - (b.get(key) || 0)) <= 0.001);
+const readable = shot => !shot.weeks.some(day => !day)
+  && !shot.tiles.some(tile => !tile.day || !tile.client || !Number.isFinite(tile.hours) || tile.hours <= 0);
+const shownWeeks = shot => new Set(shot.weeks.map(week));
+function calendarBefore(today) {
+  try { return exitCalendarSnapshot(today); } catch { return null; }
+}
+function calendarShowsDelete(before, removed, checked, today) {
+  return calendarShowsChange(before, removed.map(row => ({ day: row.day, client: row.client, hours: -row.hours })), checked, today);
+}
+async function calendarShowsChange(before, changes, checked, today) {
+  const weeks = new Set(changes.map(row => week(row.day)));
+  const fail = part => { recordRun({ type: 'calendarCheck', weeks: weeks.size, ok: false, part }); return false; };
+  if (!before || !changes.length || changes.some(row => !row.day || !row.client || !Number.isFinite(row.hours))) return fail('noEvidence');
+  if (!readable(before)) return fail('unreadableBefore');
+  if ([...weeks].some(one => !shownWeeks(before).has(one))) return fail('weekNotShown');
+  const later = new Set([...weeks].filter(one => one !== week(today)));
+  if (!same(sums(before.tiles, later), sums(checked, later))) return fail('differsFromRead');
+  const expected = sums(before.tiles, weeks);
+  for (const [key, hours] of sums(changes, weeks)) expected.set(key, (expected.get(key) || 0) + hours);
+  if ([...expected.values()].some(hours => hours < -0.001)) return fail('belowZero');
+  for (const [key, hours] of expected) if (Math.abs(hours) <= 0.001) expected.delete(key);
+  let part = 'hoursDiffer';
+  const shows = () => {
+    const after = exitCalendarSnapshot(today);
+    if (!readable(after)) { part = 'unreadableAfter'; return false; }
+    if ([...weeks].some(one => !shownWeeks(after).has(one))) { part = 'weekNotShown'; return false; }
+    part = 'hoursDiffer';
+    return same(sums(after.tiles, weeks), expected);
+  };
+  try {
+    await waitFor(shows, 'the calendar to show the change', WAIT.calendar);
+    await pageReady('the calendar after the change', WAIT.calendar, { purpose: 'calendarCheck' });
+    if (!shows()) return fail(part);
+  } catch (error) {
+    if (error.identityChanged || error.identityPending || stopFlagged(error)) throw error;
+    return fail(part);
+  }
+  recordRun({ type: 'calendarCheck', weeks: weeks.size, ok: true });
+  return true;
+}
+__exports.calendarBefore = calendarBefore;
+__exports.calendarShowsDelete = calendarShowsDelete;
+__exports.calendarShowsChange = calendarShowsChange;
+},
 "mysource/restore.js": function (__require, __exports, document, window) {
 'use strict';
 const { taxRestorePlan, sameTaxLive } = __require("./tax-restore.js");
-const { weeklyRestorePlan, restoreWeeklyWindow } = __require("./weekly-restore.js");
+const { weeklyRestorePlan, restoreWeeklyWindow, previewChanged } = __require("./weekly-restore.js");
 const { cancelBatchWindows } = __require("./batch.js");
 const { recordRun } = __require("../core/run-records.js");
-const { PageError, withPersonGuard, cleanupAfter, stopFlagged, keepFlags } = __require("./dom.js");
+const { PageError, WAIT, withPersonGuard, cleanupAfter, stopFlagged, keepFlags, shown } = __require("./dom.js");
 const { addDays, compareDays, sameDay, todayOf, usDate } = __require("../rules/dates.js");
 const { within } = __require("../rules/leaves.js");
 const { termDayOf } = __require("../rules/shared.js");
 const { compareByDay, RESTORE_FIELDS, pastReportWarning } = __require("../run/backup.js");
 const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity, scheduleFacts, pageReady, withWeeklyRows } = __require("./schedule.js");
 const { isEditableDay } = __require("./editability.js");
-const { deleteAll, deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
-const { copyWindow, coverAssignmentRange, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows } = __require("./copy.js");
+const { deleteAll, deleteRange, deleteFromTable, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
+const { copyWindow, coverAssignmentRange, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows, retainAssignmentEvidence } = __require("./copy.js");
+const { calendarBefore, calendarShowsDelete } = __require("./calendar-check.js");
 const { sameAssignmentRows } = __require("./note-stage.js");
 const { valueKey, noteTextKey } = __require("../rules/prepare.js");
 const compare = (backup, after) => {
@@ -6509,11 +6877,36 @@ const sameRetained = (a, b) => {
     && a.days.every(old => old.id && byId.has(old.id)
       && sameLive({ days: [old] }, { days: [byId.get(old.id)] }));
 };
-async function restorePlanRecorded(backup, { after = null, today = todayOf(), fullReport = false, automaticRecovery = false, verifyBefore = null } = {}) {
-  const skippedPast = new Set(backup.days.filter(row => within(row.day, backup.window)
-    && compareDays(row.day, today) < 0).map(row => usDate(row.day))).size;
+function memoryCopy(after, window, { noteRows = [], future = false } = {}) {
+  if (!after?.window || !Array.isArray(after.days) || after.calendarChecked) return null;
+  if (compareDays(after.window.start, window.start) > 0 || compareDays(after.window.end, window.end) < 0) return null;
+  const days = [];
+  for (const row of after.days) {
+    if (!row.day || compareDays(row.day, window.start) < 0 || (!future && compareDays(row.day, window.end) > 0)) continue;
+    const { noteText, noteTextSubmitted, ...rest } = row;
+    if (!noteRows.some(old => sameDay(old.day, row.day) && valueKey(old.client) === valueKey(row.client))) days.push(rest);
+    else if (typeof noteText === 'string') days.push({ ...rest, noteText });
+    else if (!(row.notes > 0)) days.push({ ...rest, noteText: '' });
+    else return null;
+  }
+  return { window: { ...window }, days, fromMemory: true };
+}
+function pastChangedDays(backup, after, today) {
+  if (!after?.window) return [];
+  const noteDays = (backup.noteChangedDays || []).filter(day => within(day, backup.window) && compareDays(day, today) < 0);
+  const days = new Map(noteDays.map(day => [usDate(day), day]));
+  for (const row of [...backup.days, ...after.days]) {
+    if (!row.day || days.has(usDate(row.day)) || !within(row.day, backup.window) || !within(row.day, after.window) || compareDays(row.day, today) >= 0) continue;
+    const day = row.day;
+    if (!compare({ window: { start: day, end: day }, days: backup.days.filter(old => sameDay(old.day, day)) }, after).same) days.set(usDate(day), day);
+  }
+  return [...days.values()].sort(compareDays);
+}
+async function restorePlanRecorded(backup, { after = null, today = todayOf(), fullReport = false, automaticRecovery = false, verifyBefore = null, keepOpen = false, memory = false } = {}) {
+  const skippedPastDays = pastChangedDays(backup, after, today);
+  const skippedPast = skippedPastDays.length;
   if (compareDays(backup.window.end, today) < 0) {
-    return { skippedPast, skippedLater: [], changedDays: [], nothing: 'Nothing to put back: the whole backup window is before today.' };
+    return { skippedPast, skippedPastDays, skippedLater: [], changedDays: [], nothing: 'Nothing to put back: the whole backup window is before today.' };
   }
   const window = { start: compareDays(backup.window.start, today) < 0 ? today : backup.window.start,
     end: backup.window.end };
@@ -6523,7 +6916,11 @@ async function restorePlanRecorded(backup, { after = null, today = todayOf(), fu
   const changedNoteDays = new Set(after ? compare(scoped, after).differences.map(row => row.date) : []);
   for (const day of backup.noteChangedDays || []) changedNoteDays.add(usDate(day));
   const noteRows = after?.days.filter(row => changedNoteDays.has(usDate(row.day)) && typeof row.noteText === 'string') || [];
-  const before = await copyWindow(window, { noteRows });
+  if (memory && (fullReport || automaticRecovery || verifyBefore)) return null;
+  const before = memory ? memoryCopy(after, window, { noteRows }) : await copyWindow(window, { noteRows, keepOpen });
+  if (memory && !before) return null;
+  const edit = memory ? null : knownAssignmentRows(before).edit;
+  try {
   await verifyBefore?.(before);
   const initial = compare(scoped, before);
   for (const day of backup.noteChangedDays || []) {
@@ -6563,20 +6960,47 @@ async function restorePlanRecorded(backup, { after = null, today = todayOf(), fu
     const validation = entriesToAdd({ ...scoped, days: scoped.days.filter(row => changed.has(usDate(row.day))) });
     if (validation.problems.length) throw new PageError(`This backup cannot be put back by Snooze: ${validation.problems.join('; ')}.`);
   }
-  return { window, scoped, before, skippedPast, skippedLater, skippedLocked, protectedDays, differences, changedDays,
+  if (!changedDays.length && edit?.isConnected) await closeEdit(edit);
+  return { window, scoped, before, skippedPast, skippedPastDays, skippedLater, skippedLocked, protectedDays, differences, changedDays,
+    ...(changedDays.length && edit ? { deleteEdit: edit } : {}),
     nothing: changedDays.length ? '' : 'Nothing left to undo.' };
+  } catch (error) {
+    if (edit?.isConnected && !stopFlagged(error)) await cleanupAfter(error, () => closeEdit(edit));
+    throw error;
+  }
 }
-async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () => {}, today = todayOf(), after: provedAfter = null, previewBefore = null, fullReport = false, automaticRecovery = false, previewDays = null, move, verifyBefore = null } = {}) {
-  const plan = await restorePlanRecorded(backup, { after: provedAfter, today, fullReport, automaticRecovery, verifyBefore });
+async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () => {}, today = todayOf(), after: provedAfter = null, previewBefore = null, fullReport = false, automaticRecovery = false, previewDays = null, move, verifyBefore = null, calendarCheck = false } = {}) {
+  let earlyCapability = null, earlyRequired = null;
+  if (!backup.site && !fullReport && !automaticRecovery && !backup.laterBacked && provedAfter
+    && (['dns', 'clearClients'].includes(backup.plan?.action) || backup.plan?.action === 'add' && calendarCheck)
+    && (!backup.reportEnd || compareDays(backup.window.end, backup.reportEnd) <= 0) && compareDays(backup.window.end, today) >= 0) {
+    const window = { start: compareDays(backup.window.start, today) < 0 ? today : backup.window.start, end: backup.window.end };
+    const scoped = { ...backup, window, days: backup.days.filter(row => within(row.day, window)) };
+    const predicted = compare(scoped, provedAfter);
+    const changed = new Set(predicted.differences.map(row => row.date));
+    for (const day of backup.noteChangedDays || []) if (within(day, window)
+      && provedAfter.days.some(row => sameDay(row.day, day) && row.notes > 0)) changed.add(usDate(day));
+    const days = scoped.days.filter(row => changed.has(usDate(row.day)));
+    const added = entriesToAdd({ window, days }, { exact: true });
+    if (added.problems.length) throw new PageError(`This backup cannot be put back by Snooze: ${added.problems.join('; ')}.`);
+    const required = [...days, ...provedAfter.days.filter(row => within(row.day, window) && changed.has(usDate(row.day)))].map(row => row.day);
+    if (required.length) {
+      earlyCapability = await preflightDates(required, { move, entries: added.entries });
+      earlyRequired = new Set(required.map(usDate));
+    }
+  }
+  const plan = await restorePlanRecorded(backup, { after: provedAfter, today, fullReport, automaticRecovery, verifyBefore, keepOpen: !!earlyCapability });
+  let retainedFailure;
+  try {
   const startedOn = todayOf();
   const currentDay = () => { const day = todayOf(); return compareDays(day, startedOn) === 0 ? today : day; };
   const notPast = span => { if (compareDays(span.start, currentDay()) < 0) throw new PageError(`${usDate(span.start)} became a past date during the restore; it was not changed.`); };
   let wrote = false;
   const writeFor = span => async () => { notPast(span); await onWrite(); wrote = true; notPast(span); };
-  const { window, scoped, before, skippedPast, skippedLater, skippedLocked = [], changedDays, protectedDays } = plan;
-  if (previewDays && changedDays.some(day => !previewDays.some(allowed => compareDays(day, allowed) === 0))) throw new PageError('The restore dates changed since the preview. Nothing was changed; preview again.');
-  if (previewBefore && before && !sameLive(previewBefore, before)) throw new PageError('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
-  if (plan.nothing) return { same: !automaticRecovery || !skippedLocked.length, unrestoredDates: skippedLocked.map(usDate), differences: automaticRecovery ? skippedLocked.map(day => ({ date: usDate(day), field: 'restore unconfirmed', message: `${usDate(day)}: restore unconfirmed; the day is locked.` })) : [], missing: [], extra: [], added: 0, runs: 0, skippedPast, skippedLater, skippedLocked, after: before || null,
+  const { window, scoped, before, skippedPast, skippedPastDays = [], skippedLater, skippedLocked = [], changedDays, protectedDays } = plan;
+  if (previewDays && changedDays.some(day => !previewDays.some(allowed => compareDays(day, allowed) === 0))) throw previewChanged('The restore dates changed since the preview. Nothing was changed; preview again.');
+  if (previewBefore && before && !sameLive(previewBefore, before)) throw previewChanged('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
+  if (plan.nothing) return { same: !automaticRecovery || !skippedLocked.length, unrestoredDates: skippedLocked.map(usDate), differences: automaticRecovery ? skippedLocked.map(day => ({ date: usDate(day), field: 'restore unconfirmed', message: `${usDate(day)}: restore unconfirmed; the day is locked.` })) : [], missing: [], extra: [], added: 0, runs: 0, skippedPast, skippedPastDays, skippedLater, skippedLocked, after: before || null,
     nothing: !provedAfter && !previewBefore && before ? 'Nothing to put back.' : plan.nothing };
   const noBridge = automaticRecovery ? new Set([...protectedDays, ...before.days.filter(row => weekend(row.day)).map(row => usDate(row.day))]) : protectedDays;
   const restoreRuns = changedRuns(plan.differences, noBridge);
@@ -6591,7 +7015,13 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
   });
   const required = planned.flatMap(run => [...run.days.map(row => row.day), ...before.days.filter(row => within(row.day, run.window)).map(row => row.day)]);
   const firstAdditionOnly = planned[0].additionOnly;
-  let preflightStarted = false, preflightDone = false;
+  if (earlyCapability && required.some(day => !earlyRequired.has(usDate(day)))) {
+    if (plan.deleteEdit?.isConnected) await closeEdit(plan.deleteEdit);
+    delete plan.deleteEdit;
+    earlyCapability = null;
+  }
+  let preflightStarted = !!earlyCapability, preflightDone = !!earlyCapability;
+  if (earlyCapability && !earlyCapability.exact) for (const run of planned) run.entries = entriesToAdd({ days: run.days }).entries;
   const preflight = async keepOpen => {
     preflightStarted = true;
     const capability = await preflightDates(required, { move, entries: planned.flatMap(run => run.entries), keepOpen });
@@ -6599,7 +7029,7 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
     preflightDone = true;
     return capability.modal;
   };
-  if (!firstAdditionOnly) await preflight(false);
+  if (!firstAdditionOnly && !preflightDone) await preflight(false);
   let total = planned.reduce((sum, run) => sum + run.entries.length, 0);
   const proofIds = new WeakMap(); let proofSequence = 0;
   const recoveryFailures = [];
@@ -6621,8 +7051,18 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
     const lastRun = run === planned[planned.length - 1];
     try {
       onStep({ step: 'clearing', runs, ofRuns: planned.length });
-      let edit = await findAssignments(run.window);
-      let weekBoxes = findAssignmentsRange(edit)?.weekBoxes;
+      const binsOn = edit => [...edit.querySelectorAll('tbody tr[data-id]')].every(row => [...row.querySelectorAll('td.action-column button.btn-xs.btn-danger')]
+        .filter(button => shown(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true').length === 1);
+      if (run === planned[0] && plan.deleteEdit?.isConnected && !binsOn(plan.deleteEdit)) { await closeEdit(plan.deleteEdit); delete plan.deleteEdit; }
+      const retained = run === planned[0] && plan.deleteEdit;
+      delete plan.deleteEdit;
+      const reusePlan = run === planned[0] && run.additionOnly && !retained && !wrote;
+      let weekBoxes;
+      if (reusePlan) {
+        await verifyBefore?.({ days: before.days.filter(row => within(row.day, run.window)), window: run.window });
+      } else {
+      let edit = retained || await findAssignments(run.window);
+      weekBoxes = findAssignmentsRange(edit)?.weekBoxes;
       const range = findAssignmentsRange(edit), covered = weekBefore && knownAssignmentRows(weekBefore).range;
       if (weekBoxes && (!weekBefore || covered?.end && (compareDays(range.start, covered.start) < 0 || compareDays(range.end, covered.end) > 0))) {
         await closeEdit(edit);
@@ -6634,7 +7074,11 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
       let now;
       try {
         now = await readEditTable(edit);
-        if (weekBoxes) {
+        if (retained) {
+          const actual = { days: now.map(row => ({ ...row, day: dayOf(row.date) })) };
+          if (actual.days.some(row => !row.day) || !sameAssignmentRows({ days: knownAssignmentRows(before).rows }, actual)) throw new PageError('The Undo table changed since the plan read. Nothing was deleted.');
+          now = now.filter(row => within(dayOf(row.date), run.window));
+        } else if (weekBoxes) {
           const range = findAssignmentsRange(edit), known = knownAssignmentRows(weekBefore);
           const expected = { days: known.rows.filter(row => within(row.day, range)) };
           const actual = { days: now.map(row => ({ ...row, day: dayOf(row.date) })) };
@@ -6662,13 +7106,28 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
         throw error;
       }
       if (now.length && !run.additionOnly) {
-        if (weekBoxes) weekBefore = await deleteRange(run.window, weekBefore, { edit, onWrite: writeFor(run.window), read: () => copyWindow(window),
+        if (retained) {
+          const weekTotals = run.entries.length && calendarCheck && !automaticRecovery ? calendarBefore(today) : null;
+          const readAfterDelete = async targets => {
+            if (weekTotals && targets?.length && targets.every(row => row.id) && await calendarShowsDelete(weekTotals, targets, knownAssignmentRows(before).rows, today)) {
+              const ids = new Set(targets.map(row => row.id)), known = knownAssignmentRows(before);
+              const checkedCopy = { ...before, days: before.days.filter(row => !ids.has(row.id)), calendarChecked: true };
+              retainAssignmentEvidence(checkedCopy, { window: known.range, days: known.rows.filter(row => !ids.has(row.id)) });
+              return checkedCopy;
+            }
+            return copyWindow(window);
+          };
+          weekBefore = await deleteFromTable(edit, run.window, before, { onWrite: writeFor(run.window), read: readAfterDelete,
+            validate: verifyBefore || (async () => {}) });
+          if (weekBefore.days.some(row => within(row.day, run.window))) throw new PageError('The page still showed entries after the delete.');
+        } else if (weekBoxes) weekBefore = await deleteRange(run.window, weekBefore, { edit, onWrite: writeFor(run.window), read: () => copyWindow(window),
           validate: verifyBefore || (async () => {}) });
         else {
           await deleteAll(edit, { onWrite: writeFor(run.window) });
           if ((await copyWindow(run.window)).days.length) throw new PageError('The page still showed entries after the delete.');
         }
       } else await closeEdit(edit);
+      }
       let dateForm = !preflightDone ? await preflight(true) : null;
       total = planned.reduce((sum, run) => sum + run.entries.length, 0);
       const restoredDays = [...run.preserved];
@@ -6685,13 +7144,14 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
         })();
         for (const day of dates) restoredDays.push({ ...entry, day, hours: entry.hoursPerDay });
         const span = { start: entry.start, end: entry.end };
-        const lastWrite = lastRun && entry === run.entries[run.entries.length - 1];
+        const lastAdd = entry === run.entries[run.entries.length - 1];
+        const lastWrite = lastRun && lastAdd;
         let afterEntry;
         if (lastWrite) {
           afterEntry = part(await readWhole(), span);
           proofIds.set(afterEntry, proofIds.get(wholeRead));
         } else {
-          afterEntry = await copyWindow(span, { noteRows: run.preserved.filter(row => typeof row.noteText === 'string'), reuseAfterAdd: true });
+          afterEntry = await copyWindow(lastAdd ? run.window : span, { noteRows: run.preserved.filter(row => typeof row.noteText === 'string'), reuseAfterAdd: true });
           proofIds.set(afterEntry, ++proofSequence);
         }
         recordRun({ type: 'restoreRead', purpose: 'afterAdd', rows: afterEntry.days.length, selected: dates.length, proof: proofIds.get(afterEntry), result: 'passed', scope: { start: usDate(afterEntry.window.start), end: usDate(afterEntry.window.end) }, reused: false, ...(lastWrite ? { wholeWindow: true } : {}) });
@@ -6736,7 +7196,7 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
       if (!automaticRecovery || stopFlagged(stopped) || preflightStarted && !preflightDone) throw stopped;
       recoveryFailures.push({ window: run.window, message: stopped.message, progress: stopped.restoreProgress });
       const failures = stopped.cleanupErrors?.length || 0;
-      await cleanupAfter(stopped, async () => { await cancelBatchWindows(); await pageReady('between recovery days'); });
+      await cleanupAfter(stopped, async () => { await cancelBatchWindows(); await pageReady('between recovery days', WAIT.person, { purpose: 'recoveryDays' }); });
       if ((stopped.cleanupErrors?.length || 0) > failures) { stopped.pageBlocked = true; throw stopped; }
       if (!preflightDone) await preflight(false);
     }
@@ -6776,7 +7236,20 @@ async function restoreWindowRecorded(backup, { onStep = () => {}, onWrite = () =
       date, field: 'restore unconfirmed', message: `${date}: restore unconfirmed; the backed-up day could not be put back and checked.`,
     });
   }
-  return { ...result, added, runs, skippedPast, skippedLater, skippedLocked, after, unrestoredDates, recoveryFailures };
+  return { ...result, added, runs, skippedPast, skippedPastDays, skippedLater, skippedLocked, after, unrestoredDates, recoveryFailures };
+  } catch (error) { retainedFailure = error; throw error; }
+  finally {
+    if (plan.deleteEdit?.isConnected && !stopFlagged(retainedFailure)) {
+      if (retainedFailure) await cleanupAfter(retainedFailure, () => closeEdit(plan.deleteEdit));
+      else await closeEdit(plan.deleteEdit);
+    }
+  }
+}
+async function memoryRestorePlan(backup, { after = null, today = todayOf() } = {}) {
+  if (!after || backup.site === 'tax') return null;
+  const plan = backup.site === 'weekly' ? await weeklyRestorePlan(backup, { after, today, memory: true })
+    : await restorePlanRecorded(backup, { after, today, memory: true });
+  return plan && { ...plan, fromMemory: true };
 }
 function restorePlan(backup, options = {}) {
   const identity = options.identity || personIdentity();
@@ -6794,8 +7267,8 @@ async function restoreTaxWindow(backup, options = {}) {
   const sameLive = sameTaxLive;
   const { today = todayOf(), onWrite = () => {}, automaticRecovery = false, previewBefore, previewDays } = options;
   const plan = await taxRestorePlan(backup, options);
-  if (previewBefore && !sameLive(previewBefore, plan.before)) throw new PageError('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
-  if (previewDays && plan.changedDays.some(day => !previewDays.some(old => sameDay(old, day)))) throw new PageError('The restore dates changed since the preview. Nothing was changed; preview again.');
+  if (previewBefore && !sameLive(previewBefore, plan.before)) throw previewChanged('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
+  if (previewDays && plan.changedDays.some(day => !previewDays.some(old => sameDay(old, day)))) throw previewChanged('The restore dates changed since the preview. Nothing was changed; preview again.');
   const future = plan.changedDays.filter(day => compareDays(day, today) >= 0);
   if (future.length) await preflightDates(future, { anchor: future[0] });
   let current = plan.before, added = 0, runs = 0;
@@ -6833,7 +7306,7 @@ async function restoreTaxWindow(backup, options = {}) {
     } catch (error) {
       if (!automaticRecovery || stopFlagged(error)) throw error;
       failures.push({ day, message: error.message });
-      await cancelBatchWindows(); await pageReady('between Tax recovery dates');
+      await cancelBatchWindows(); await pageReady('between Tax recovery dates', WAIT.person, { purpose: 'taxRecovery' });
       current = await copyWindow(plan.window);
     }
   }
@@ -6847,6 +7320,8 @@ async function restoreTaxWindow(backup, options = {}) {
     differences: unrestoredDates.map(date => ({ date, message: `${date}: Tax restore unconfirmed.` })), missing: [], extra: [], recoveryFailures: failures };
 }
 __exports.missingAssignments = missingAssignments;
+__exports.memoryCopy = memoryCopy;
+__exports.memoryRestorePlan = memoryRestorePlan;
 __exports.restorePlan = restorePlan;
 __exports.restoreWindow = restoreWindow;
 },
@@ -6912,12 +7387,12 @@ function pictureWeeksHold(start, end) {
   }
   return true;
 }
-function exactPictureRange(day) {
+function pictureView() {
   try {
     const view = calendarView();
     if (!view?.classList.contains('fc-weeklyTimeline-view')) return null;
     const range = shownRange(view);
-    if (!range || !sameDay(range.start, mondayOf(day)) || !rangeHolds(range, day)) return null;
+    if (!range) return null;
     const dates = [...view.querySelectorAll('td.fc-day[data-date]')].filter(onScreen)
       .map(cell => readIsoDay(cell.getAttribute('data-date')));
     if (!dates.length || dates.some(date => !date)) return null;
@@ -6928,6 +7403,18 @@ function exactPictureRange(day) {
       || !sameDay(range.end, addDays(weeks.at(-1), 4))) return null;
     return range;
   } catch { return null; }
+}
+function pictureFits(start, end) {
+  if (!start || !end || compareDays(start, end) > 0) return false;
+  const range = pictureView();
+  try {
+    return Boolean(range) && rangeHolds(range, mondayOf(start)) && rangeHolds(range, mondayOf(end))
+      && pictureWeeksHold(start, end);
+  } catch { return false; }
+}
+function exactPictureRange(day) {
+  const range = pictureView();
+  return range && sameDay(range.start, mondayOf(day)) && rangeHolds(range, day) ? range : null;
 }
 async function showDate(day, { cellProof = true } = {}) {
   const h2 = titleWithIcon();
@@ -6978,7 +7465,7 @@ async function showDate(day, { cellProof = true } = {}) {
     if (now && toNumber(now.start) === toNumber(monday)) return now;
     return movedOrClamped && rangeHolds(now, day) ? now : null;
   }, `the calendar to show ${usDate(day)}`, WAIT.window);
-  await pageReady(`after moving the calendar to ${usDate(day)}`);
+  await pageReady(`after moving the calendar to ${usDate(day)}`, WAIT.person, { purpose: 'calendarMove' });
   return range;
 }
 __exports.titleWithIcon = titleWithIcon;
@@ -6987,6 +7474,7 @@ __exports.rangeHolds = rangeHolds;
 __exports.calendarHolds = calendarHolds;
 __exports.calendarDates = calendarDates;
 __exports.pictureWeeksHold = pictureWeeksHold;
+__exports.pictureFits = pictureFits;
 __exports.exactPictureRange = exactPictureRange;
 __exports.showDate = showDate;
 },
@@ -6997,7 +7485,8 @@ __exports.notePictureInfo = notePictureInfo;
 },
 "mysource/note-picture.js": function (__require, __exports, document, window) {
 'use strict';
-const { tilesOnScreen } = __require("./schedule.js");
+const { tilesOnScreen, calendarView } = __require("./schedule.js");
+const { readScheduleTile } = __require("./tiles.js");
 const { shown, guardReady } = __require("./dom.js");
 const { rangeHolds, shownRange } = __require("./calendar.js");
 const { compareDays, mondayOf, usDate } = __require("../rules/dates.js");
@@ -7011,7 +7500,7 @@ function noteKind(texts, newNote) {
   return notes.length === 1 ? 'alone' : notes.length === 2 ? 'pair' : 'other';
 }
 const hoverNotes = words => String(words || '').split(DATED).filter((part, i) => i % 2 === 0 && i > 0);
-async function hoverNotePicture(client, readBack = [], newNote = '') {
+async function hoverNotePicture(client, readBack = [], newNote = '', firstWrittenDay = null) {
   notePictureInfo.selector = 'not shown';
   notePictureInfo.week = 'first note';
   const range = shownRange();
@@ -7019,6 +7508,15 @@ async function hoverNotePicture(client, readBack = [], newNote = '') {
   const tiles = tilesOnScreen().filter(tile => tile.textContent.includes(client));
   const icons = tiles.map(tile => tile.querySelector('i.fa-note-sticky, i.fa-sticky-note, [class*="note"]')).filter(node => node && shown(node));
   if (!icons.length) throw new Error('No assignment note icon in view.');
+  let order = icons.map((icon, index) => ({ icon, index }));
+  if (firstWrittenDay) {
+    const firstMonday = mondayOf(firstWrittenDay), view = calendarView();
+    order = order.map(item => ({ ...item, day: readScheduleTile(item.icon.closest('.fc-event'), view, firstWrittenDay).day }));
+    const written = order.filter(item => item.day && compareDays(mondayOf(item.day), firstMonday) >= 0)
+      .sort((a, b) => compareDays(a.day, b.day));
+    const prioritized = new Set(written);
+    order = [...written, ...order.filter(item => !prioritized.has(item))];
+  }
   const tooltipSelector = '.tooltip, .popover, [role="tooltip"]';
   const visibleTooltip = node => {
     if (!shown(node) || node.getAttribute('aria-hidden') === 'true') return false;
@@ -7055,15 +7553,15 @@ async function hoverNotePicture(client, readBack = [], newNote = '') {
     return { tooltip, cleanup };
   };
   try {
-    let tooltip = await hover(icons[0]);
+    let tooltip = await hover(order[0].icon);
     if (tooltip) {
       let pair = null;
-      for (const [index, candidate] of icons.entries()) {
-        if (index) tooltip = await hover(candidate);
+      for (const [attempt, { icon: candidate, index }] of order.entries()) {
+        if (attempt) tooltip = await hover(candidate);
         if (!tooltip) continue;
         const kind = noteKind(hoverNotes(tooltip.textContent), newNote);
         if (kind === 'alone') { notePictureInfo.week = 'new note alone'; return found(tooltip); }
-        if (kind === 'pair' && pair === null) pair = index;
+        if (kind === 'pair' && (pair === null || index < pair)) pair = index;
       }
       notePictureInfo.week = pair === null ? 'first note' : 'two notes';
       tooltip = await hover(icons[pair ?? 0]);
@@ -7361,6 +7859,14 @@ function undoChangeWords(days) {
   const ranges = undoRanges(days.map(day => ({ day })));
   return `Puts back the backed-up entries on these dates, replacing this batch's change: ${ranges.map(range=>range.dates).join('; ')}. Original notes cannot be restored.`;
 }
+function undoPastWords(days = []) {
+  return days.length ? `Not undone, the day is past: ${undoRanges(days.map(day => ({ day }))).map(range => range.dates).join('; ')}` : '';
+}
+function undoProblem(result) {
+  const past = undoPastWords(result.skippedPastDays);
+  if (result.same && !past) return '';
+  return [...(result.differences || []).map(one => one.message), past].filter(Boolean).join('; ') || 'Undo could not be proved';
+}
 const failedRow = row => ['failed', 'restored', 'restoreFailed', 'undoFailed'].includes(row.state);
 const orderedRows = rows => [...rows].sort((a, b) => rank(a) - rank(b));
 const rank = row => failedRow(row) ? 2 : row.state === 'skipped' ? 1 : 0;
@@ -7413,6 +7919,8 @@ function runningText(row) {
 __exports.mailFNoAction = mailFNoAction;
 __exports.undoRanges = undoRanges;
 __exports.undoChangeWords = undoChangeWords;
+__exports.undoPastWords = undoPastWords;
+__exports.undoProblem = undoProblem;
 __exports.failedRow = failedRow;
 __exports.orderedRows = orderedRows;
 __exports.personName = personName;
@@ -7433,7 +7941,7 @@ const { recordRun } = __require("../core/run-records.js");
 const { stopFlagged, withPersonGuard } = __require("../mysource/dom.js");
 const { openPerson, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity } = __require("../mysource/schedule.js");
 const { hoverNotePicture } = __require("../mysource/note-picture.js");
-const { showDate, exactPictureRange, pictureWeeksHold } = __require("../mysource/calendar.js");
+const { showDate, exactPictureRange, pictureFits, pictureWeeksHold } = __require("../mysource/calendar.js");
 const { todayOf, usDate, fileStamp } = __require("../rules/dates.js");
 const { chooseMail, mailText, exitDnsDates } = __require("../rules/mails.js");
 const { reportFile } = __require("./casefiles.js");
@@ -7508,7 +8016,7 @@ async function capturePersonRecorded(row, { identity, operation = 'capture' } = 
       if (!needsNotePicture) return takeScreenshot();
       let note;
       try {
-        note = await hoverNotePicture(plan.action === 'dns' ? 'Do Not Schedule (DNS)' : 'Leave of Absence (LOA)', row.after?.days || row.result?.after?.days || row.prepared?.copy?.days || [], plan.notes || '');
+        note = await hoverNotePicture(plan.action === 'dns' ? 'Do Not Schedule (DNS)' : 'Leave of Absence (LOA)', row.after?.days || row.result?.after?.days || row.prepared?.copy?.days || [], plan.notes || '', plan.loaStart || plan.dnsStart);
         const blob = await takeScreenshot({ noteTooltip: note.tooltip });
         if (!lastPicture.notesPainted) warnings.push(noteWarning);
         return blob;
@@ -7522,7 +8030,7 @@ async function capturePersonRecorded(row, { identity, operation = 'capture' } = 
     let pictureStart = start;
     try {
       await requirePersonIdentity(pictureIdentity, operation);
-      exactPictureRange(start) || await showDate(start);
+      exactPictureRange(start) || pictureFits(start, end) || await showDate(start);
       await requirePersonIdentity(pictureIdentity, operation);
     }
     catch (error) {
@@ -7619,6 +8127,7 @@ function rowWarnings(row) {
     one.exit?.dpNotFound && 'RM not applicable.',
     one.outputs?.warnings,
     row.undoWarning,
+    row.state === 'undone' && row.undoPastWarning,
   ].filter(Boolean))]);
   if (!hasPlan) return words;
   const unchanged = ['skipped', 'pending', 'ready'].includes(row.state) || row.state === 'failed' && row.diagnostic?.changeAttempted === false;
@@ -8104,22 +8613,23 @@ __exports.estimateBatch = estimateBatch;
 'use strict';
 const { createSessionClock, PERSON_RESERVE_MS, CONFIRM_RESERVE_MS, SESSION_WORDS } = __require("../screen/session-clock.js");
 const { prepare, apply, restore, recover: recoverBackup } = __require("./work.js");
-const { requireDayReport, loadedReports } = __require("../files/report.js");
+const { requireDayReport, loadedReports, reportAssignPeriod } = __require("../files/report.js");
 const { requireFreshReport } = __require("../files/report-time.js");
 const { PageError, setBatchGuard, stopFlagged, waitFor, WAIT, guardReady } = __require("../mysource/dom.js");
 const { sessionExpired, cancelBatchWindows, closeSkippedPerson, batchCover, unlockPage, watchConnection, connectionPageReady, CONNECTION_WORDS } = __require("../mysource/batch.js");
-const { todayOf, compareDays, workingDays, usDate } = __require("../rules/dates.js");
+const { todayOf, compareDays, workingDays, usDate, reportWindow } = __require("../rules/dates.js");
 const { compareCopies, copyWindow } = __require("../mysource/copy.js");
 const { openPerson, personIdentity, checkPersonIdentity, waitForPersonIdentity, pageCalm, resumePageReady, requireSchedulePage, SCHEDULE_PAGE_WORDS, IDENTITY_PAUSE_WORDS, sameExitCalendar, withWeeklyRows } = __require("../mysource/schedule.js");
 const { reasonLine, notOnReportReason, PAST_DATES_WORDS, reportNotReadyLine } = __require("../screen/wording.js");
 const { checkLoaAdded, checkDnsAdded, DNS_CLIENT } = __require("../mysource/checks.js");
 const { valueKey } = __require("../rules/prepare.js");
 const { capturePerson, needsPersonPicture, saveBatch, batchExcelName } = __require("../files/batch-outputs.js");
-const { setRunRecorder, timedRun, reasonCode, stopSentence, afterWriteSentence } = __require("../core/run-records.js");
+const { setRunRecorder, timedRun, reasonCode, stopSentence, afterWriteSentence, CALM_PURPOSES } = __require("../core/run-records.js");
 const { safePageInfo } = __require("../mysource/pageinfo.js");
 const { combinedReportText } = __require("../files/run-report.js");
 const { estimateBatch, TIME_LIMIT_WORDS } = __require("./time-limit.js");
 const { personName, stageWords } = __require("../screen/compact.js");
+const { createBatchDateTrials, withBatchDateTrials, failBatchDateTrial } = __require("../mysource/preflight-form.js");
 const BATCH = {
   title: 'Run the batch', confirm: 'Confirm batch',
   pause: 'Pause', resume: 'Resume', stop: 'Stop safely',
@@ -8148,9 +8658,21 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
   watchNow = () => Date.now(), scheduleWatch = fn => setInterval(fn, 1000), cancelWatch = id => clearInterval(id), localToday = () => todayOf() } = {}) {
   const createdLocalDay = localToday();
   const approvedDates = new Map();
+  const dateTrials = createBatchDateTrials();
   const currentToday = () => {
     const day = localToday();
     return compareDays(day, createdLocalDay) === 0 ? today : day;
+  };
+  const withDateTrials = (row, run) => {
+    const { record, decision, slice } = row.one;
+    if (record.subcategory?.site === 'tax' || !['dns', 'clearClients'].includes(decision.plan?.action)) return run();
+    const turnToday = currentToday();
+    return withBatchDateTrials(dateTrials, {
+      person: row, type: reportAssignPeriod({ entries: slice?.backupEntries ?? slice?.entries ?? [] }, record.email),
+      reportEnd: slice?.reportEnd || reportWindow(turnToday).end,
+      termDate: row.prepared?.backup?.termDate ?? slice?.person?.termDate ?? record.person.termDate,
+      today: turnToday, plannedEnd: decision.plan.dnsEnd,
+    }, run);
   };
   const changeDays = row => {
     const plan = row.one.decision.plan || {}, prepared = row.prepared;
@@ -8176,7 +8698,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
   };
   const batch = { state: 'idle', message: '', rows: cases.map(one => ({ one, state: 'pending' })), phase: 'check', index: 0,
     confirmed: false, active: false, pauseRequested: false, stopRequested: false, pendingRestore: null };
-  batch.diagnostic = { today, misses: [], slow: [], dialogs: [], unread: [], resumed: 0, noAction, waits: [], visibility: [], schedulePage: [], identity: [], findSteps: [], stalls: [], calm: { waits: 0, back: [] } };
+  batch.diagnostic = { today, misses: [], slow: [], dialogs: [], unread: [], resumed: 0, noAction, waits: [], visibility: [], schedulePage: [], identity: [], findSteps: [], stalls: [], calm: { waits: 0, back: [], purposes: {} } };
   for (const row of batch.rows) row.diagnostic = { steps: [], paint: [] };
   let observedRow = null;
   let retrying = false;
@@ -8302,6 +8824,11 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
     if (event.type === 'calmWait' && run.calm) {
       run.calm.waits++;
       if (event.back > 0) run.calm.back.push({ person: row ? batch.rows.indexOf(row) + 1 : null, times: event.back, latest: event.latest, stage: data?.currentStage });
+      const purpose = Object.hasOwn(CALM_PURPOSES, event.purpose) ? event.purpose : 'other';
+      const ms = Number.isFinite(event.ms) && event.ms >= 0 ? event.ms : 0;
+      const one = (run.calm.purposes ||= {})[purpose] ||= { waits: 0, cover: 0, changed: 0, ms: 0, longest: 0 };
+      one.waits++; if (event.cover === true) one.cover++; if (event.changed === true) one.changed++;
+      one.ms += ms; one.longest = Math.max(one.longest, ms);
     }
     if (event.type === 'schedulePage' || event.type === 'identity') {
       const items = event.type === 'identity' ? run.identity : run.schedulePage;
@@ -8441,7 +8968,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
         batch.pendingRestore = null; batch.connectionRetry = null;
       } else {
         const recoveryToday = currentToday();
-        row.restoreResult = await timedRun('restore', () => recoverBackup(row.prepared.backup, { today: recoveryToday }));
+        row.restoreResult = await withDateTrials(row, () => timedRun('restore', () => recoverBackup(row.prepared.backup, { today: recoveryToday })));
         const past = compareDays(recoveryToday, today) > 0
           ? [...new Set(changeDays(row).filter(day => compareDays(day, recoveryToday) < 0
             && !(row.prepared.tax && row.restoreResult.after && compareCopies(
@@ -8560,7 +9087,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
         if (row.state === 'ready') {
           tell('');
           checkPlannedDates(row);
-          row.prepared = await prepare(row.one, version, currentToday(), { step });
+          row.prepared = await withDateTrials(row, () => prepare(row.one, version, currentToday(), { step }));
           row.message = row.prepared.stop || row.prepared.nothing || '';
           if (row.prepared.stop) { row.diagnostic.reason = row.prepared.reasonCode || reasonCode(row.prepared.stop); row.diagnostic.failedStage = row.diagnostic.comparison?.agreed === false ? 'compare' : row.diagnostic.currentStage || 'prepare'; }
           if (row.diagnostic.reason === 'backupReadFailed') batch.diagnostic.unread.push({ person: batch.index + 1, code: 'backupReadFailed', stage: 'read' });
@@ -8573,7 +9100,13 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
           } else {
             tell();
             try {
-              row.result = await apply(row.one, row.prepared, options);
+              row.result = await withDateTrials(row, async () => {
+                try {
+                  const result = await apply(row.one, row.prepared, options);
+                  if (!result.ok) failBatchDateTrial();
+                  return result;
+                } catch (error) { failBatchDateTrial(); throw error; }
+              });
               row.diagnostic.method = row.result.method || methodOf(row.one.decision.plan);
               if (!row.result.ok) { if (!await recover(row)) return; continue; }
               row.after = row.result.after;
@@ -8851,14 +9384,14 @@ const { createBatch, BATCH } = __require("../run/batch.js");
 const { readSite } = __require("../mysource/site.js");
 const { batchCover, sessionExpired } = __require("../mysource/batch.js");
 const { PageError, setBatchGuard } = __require("../mysource/dom.js");
-const { restore, previewRestore } = __require("../run/work.js");
+const { restore, previewRestore, previewFromMemory } = __require("../run/work.js");
 const { usDate } = __require("../rules/dates.js");
-const { failedRow, personName, runningText, undoLine, undoRanges, undoChangeWords, mailFNoAction, canUndo, changedRow, undoState } = __require("./compact.js");
+const { failedRow, personName, runningText, undoLine, undoRanges, undoChangeWords, undoPastWords, undoProblem, mailFNoAction, canUndo, changedRow, undoState } = __require("./compact.js");
 const { LOA_CLIENT, DNS_CLIENT } = __require("../mysource/checks.js");
 const { setRunRecorder, timedRun, reasonCode } = __require("../core/run-records.js");
 const { REPORT_TIME_WORDS } = __require("../files/report-time.js");
 const { reportTimeLine } = __require("../files/report-time.js");
-const { requireSchedulePage, waitForPersonIdentity, SCHEDULE_PAGE_WORDS } = __require("../mysource/schedule.js");
+const { requireSchedulePage, waitForPersonIdentity, waitForCalendarSettled, SCHEDULE_PAGE_WORDS } = __require("../mysource/schedule.js");
 const { needsPersonPicture } = __require("../files/batch-outputs.js");
 const { loadedReports, reportKind } = __require("../files/report.js");
 const { reasonLine } = __require("./wording.js");
@@ -8967,6 +9500,7 @@ function renderBatch(batch, work, box, draw) {
         else if (canUndo(row)) line.append(button('Undo', 'undo', () => undoPopup(row, work, draw), work.busy || batch.saving));
         const warning = ['undone', 'undoFailed'].includes(row.state) && pastReportWarning(row.prepared?.backup);
         if (warning) line.append(el('div', { class: 'warn' }, warning));
+        if (row.state === 'undone' && row.undoPastWarning) line.append(el('div', { class: 'warn' }, row.undoPastWarning));
         list.append(line);
       }
       stack.append(el('div', { class: 'undo-fold' }, toggle, list));
@@ -9027,7 +9561,8 @@ async function undoPopup(row, work, draw) {
     if (work.busy || !undoable() || !preview || undo.disabled) return;
     try { requireSchedulePage(); } catch (error) { if (error.schedulePage) { pausePreview(); return; } throw error; }
     const previousState = row.state;
-    let undoWrote = false;
+    let undoWrote = false, pagePreview = false;
+    const fromMemory = !!preview.fromMemory;
     popup.remove(); row.state = 'undoing'; work.busy = true; work.undoActive = true; work.saved = false; work.saveMessage = '';
     work.batch?.invalidateFiles?.();
     work.host.dataset.batchReserved = 'true'; draw();
@@ -9036,15 +9571,19 @@ async function undoPopup(row, work, draw) {
     const releaseRecord = setRunRecorder(event => work.batch?.record?.(row, event));
     try {
       guard();
-      await waitForPersonIdentity(preview.identity);
-      const result = await timedRun('undo', () => restore(row.prepared.backup, { identity: preview.identity, after: row.after, previewBefore: preview.before, onWrite: () => { guard(); undoWrote = true; } }));
-      if (!result.same) throw new Error(result.differences?.map(one => one.message).join('; ') || 'Undo could not be proved');
+      if (fromMemory) await waitForCalendarSettled(); else await waitForPersonIdentity(preview.identity);
+      const result = await timedRun('undo', () => restore(row.prepared.backup, { identity: preview.identity, after: row.after, previewBefore: preview.before,
+        ...(fromMemory ? { fromMemory: true, previewDays: preview.changedDays } : {}), onWrite: () => { guard(); undoWrote = true; } }));
+      const problem = undoProblem(result);
+      if (problem) throw new Error(problem);
       row.undoResult = result;
       if(work.batch)work.batch.saveMessage='';
       row.state = 'undone'; row.one.run = { state: 'undone', prepared: row.prepared };
       row.undoWarning = result.skippedLater?.length ? undoLaterWords(result.skippedLater, row.one.decision.plan) : '';
+      row.undoPastWarning = undoPastWords(result.skippedPastDays);
     } catch (error) {
       if (error.schedulePage && !undoWrote) { row.state = previousState; pausePreview(); parent.append(popup); keep.focus(); }
+      else if (fromMemory && error.previewChanged && !undoWrote) { row.state = previousState; row.undoFromPage = true; pagePreview = true; parent.append(popup); keep.focus(); }
       else {
         row.state = 'undoFailed'; row.message = error.message;
         row.diagnostic ||= { steps: [], paint: [] };
@@ -9052,6 +9591,7 @@ async function undoPopup(row, work, draw) {
       }
     }
     finally { releaseRecord(); releaseGuard(); release(); work.busy = false; work.undoActive = false; delete work.host.dataset.batchReserved; draw(); }
+    if (pagePreview) await readPreview();
   }, disabled: true }, 'Undo');
   const popup = el('div', { class: 'popup-shade' }, el('div', { class: 'popup', role: 'alertdialog', 'aria-label': `Undo ${personName(row.one)}?` },
     el('div', { class: 'popup-title' }, `Undo ${personName(row.one)}?`), el('div', {}, undoLine(row.one, row.prepared)), detail, el('div', { class: 'buttons' }, keep, undo)));
@@ -9077,7 +9617,9 @@ async function undoPopup(row, work, draw) {
       if (sessionExpired()) throw new PageError('MySource session expired; Undo preview could not be read');
       requireSchedulePage();
       popup.style.pointerEvents = 'none';
-      preview = await timedRun('undo preview', () => previewRestore(row.prepared.backup, { after: row.after }));
+      preview = await timedRun('undo preview', async () => (row.state === 'done' && !row.undoFromPage
+        && await previewFromMemory(row.prepared.backup, { after: row.after, identity: row.prepared.identity }))
+        || previewRestore(row.prepared.backup, { after: row.after }));
       const dates = preview.changedDays.map(usDate);
       detail.replaceChildren();
       if (preview.skippedLater.length) detail.append(el('div', { class: 'warn' }, undoLaterWords(preview.skippedLater, row.one.decision.plan)));
@@ -9569,9 +10111,10 @@ const { emailKey, valueKey, rememberPageName, professionalName } = __require("..
 const { PageError, withPersonGuard, stopFlagged, cleanupAfter } = __require("../mysource/dom.js");
 const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, beginScheduleTurn, exitCalendarSnapshot, settledExitCalendar, allowWeeklyRows, allowGreyedWeekStart, weeklyRowsShown } = __require("../mysource/schedule.js");
 const { leaveRuns, leavePeriod, loaBlocks, dayRanges, inRange } = __require("../rules/leaves.js");
-const { deleteAll, deleteRange, splitDeleteWeeks, addAssignment, preflightDates, refreshNotes, setAssignmentHours } = __require("../mysource/write.js");
-const { compareCopies, copyWindow, entriesToAdd, dayOf, knownAssignmentRows } = __require("../mysource/copy.js");
-const { restoreWindow, restorePlan } = __require("../mysource/restore.js");
+const { deleteAll, deleteRange, deleteFromTable, splitDeleteWeeks, addAssignment, preflightDates, refreshNotes, setAssignmentHours } = __require("../mysource/write.js");
+const { compareCopies, copyWindow, entriesToAdd, dayOf, knownAssignmentRows, retainAssignmentEvidence } = __require("../mysource/copy.js");
+const { calendarBefore, calendarShowsDelete } = __require("../mysource/calendar-check.js");
+const { restoreWindow, restorePlan, memoryRestorePlan } = __require("../mysource/restore.js");
 const { LOA_CLIENT, DNS_CLIENT, checkDnsAdded, checkLoaAdded } = __require("../mysource/checks.js");
 const { BACKUP_KIND, backupRecord, recordLaterChange, compareByDay, reportDays, withPagePricing, validatePageDays, withLaterDays, laterDays } = __require("./backup.js");
 const { requireDayReport, reportAssignPeriod } = __require("../files/report.js");
@@ -9641,12 +10184,17 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
   const identity = personIdentity();
   checks.push(['✓', 'Schedule open', `${shownName || record.person.professional || record.email}${record.person.professional ? ', as the Staff Schedule Hours Report names them' : ''}`]);
   let window, futureCopy, runs = [], kept = [];
+  const locked = plan.lockedPeriod?.start;
+  const early = await earlyLoaTrial({ slice, plan, today, locked, identity, step, termText: slice.person?.termDate ?? record.person.termDate });
+  if (early?.stop) return early;
   const readLoa = async () => {
-    futureCopy = await withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => copyWindow({start:today,end:today},{future:true}));
+    futureCopy = await withPersonGuard(probe => checkPersonIdentity(identity, 'identity check', probe), () => copyWindow({start:today,end:today},{future:true, keepOpen: !!early}));
     return futureCopy.days.filter(row => valueKey(row.client) === valueKey(LOA_CLIENT));
   };
-  const locked = plan.lockedPeriod?.start;
   const loa = (await step(() => readLoa())).filter(row => !locked || compareDays(row.day, locked) < 0);
+  const earlyEdit = early ? knownAssignmentRows(futureCopy).edit : null;
+  let handed = false, preparationError = null;
+  try {
   const period = leavePeriod(loa, plan, today);
   plan.loaStart = period.start;
   ({ runs, kept } = leaveRuns(loa, { start: plan.loaStart, end: plan.loaEnd }));
@@ -9691,9 +10239,15 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
     .filter(day => compareDays(day, today) >= 0);
   const retained = copy.days.filter(row => inRange(row.day, plan.loaStart || window.start, plan.loaEnd || window.end));
   const canRefreshNotes = knownAssignmentRows(futureCopy).canRefreshNotes;
-  const bulkCandidate = (!runs.length || smallReduction(copy, plan, runs, canRefreshNotes)) && alreadyAdded(copy, plan.loaStart, plan.loaEnd, LOA_CLIENT)
-    && noteRowsEligible(retained);
-  const dateCheck = await caseDates(requiredDates, identity, step, { anchor: today, keepOpen: workingDays(plan.loaStart, plan.loaEnd).length > 0 && !bulkCandidate });
+  const sameDates = (days, predicted) => { const mine = new Set(days.map(usDate)); return mine.size === predicted.size && [...mine].every(date => predicted.has(date)); };
+  const runDays = runs.flatMap(run => run.rows.map(row => row.day));
+  const deleteFirst = !!(early && earlyEdit?.isConnected && runs.length && workingDays(plan.loaStart, plan.loaEnd).length
+    && compareDays(plan.loaStart, early.start) === 0 && sameDates(runDays, early.runDays) && sameDates(requiredDates, early.required)
+    && runs.every(run => run.rows.every(row => row.id)) && ![...runDays, plan.loaEnd].some(day => compareDays(day, reportEnd) > 0));
+  const bulkCandidate = !deleteFirst && runs.length > 0 && !!smallReduction(copy, plan, runs, canRefreshNotes)
+    && alreadyAdded(copy, plan.loaStart, plan.loaEnd, LOA_CLIENT) && noteRowsEligible(retained);
+  if (earlyEdit?.isConnected && !deleteFirst) await step(() => closeEdit(earlyEdit));
+  const dateCheck = deleteFirst ? {} : await caseDates(requiredDates, identity, step, { anchor: today, keepOpen: workingDays(plan.loaStart, plan.loaEnd).length > 0 && !bulkCandidate });
   if (dateCheck.stop) return dateCheck;
   checks.push(['✓', 'Could be put back', 'no weekend entry, no entry twice on a day']);
   const datesAlready = alreadyAdded(copy, plan.loaStart, plan.loaEnd, LOA_CLIENT);
@@ -9723,7 +10277,36 @@ async function prepare(one, version, today = todayOf(), { step = fn => fn() } = 
       && inRange(row.day, plan.loaStart, plan.loaEnd)).map(row => row.day),
   });
   if (!slice.liveScope) withLaterDays(backup, copy, entriesToAdd);
-  return { window, watchedWindow, copy, watched: copy, backup, removing: [...removing.values()], daysCompared, checks, reportEnd, identity, replacedOldNote, runs, kept, canRefreshNotes, dateForm: dateCheck.modal };
+  handed = deleteFirst;
+  return { window, watchedWindow, copy, watched: copy, backup, removing: [...removing.values()], daysCompared, checks, reportEnd, identity, replacedOldNote, runs, kept, canRefreshNotes, replaceRefresh: true, dateForm: dateCheck.modal,
+    ...(deleteFirst ? { deleteEdit: earlyEdit, loaDeleteFirst: { today, read: futureCopy } } : {}) };
+  } catch (error) { preparationError = error; throw error; }
+  finally {
+    if (!handed && earlyEdit?.isConnected) {
+      if (preparationError && !stopFlagged(preparationError)) await cleanupAfter(preparationError, () => closeEdit(earlyEdit));
+      else if (!preparationError) await step(() => closeEdit(earlyEdit));
+    }
+  }
+}
+async function earlyLoaTrial({ slice, plan, today, locked, identity, step, termText }) {
+  if (slice.liveScope || plan.action !== 'add' || !plan.loaEnd) return null;
+  const termString = String(termText ?? '').trim();
+  const term = termString ? termDayOf(termString) : null;
+  if (termString && !term) return null;
+  const reportEnd = slice.reportEnd || reportWindow(today).end;
+  let rows;
+  try { rows = reportDays({ ...slice, entries: slice.backupEntries ?? slice.entries }, { start: today, end: reportEnd }); } catch { return null; }
+  const loa = rows.filter(row => valueKey(row.client) === valueKey(LOA_CLIENT) && (!locked || compareDays(row.day, locked) < 0));
+  const start = leavePeriod(loa, plan, today).start;
+  if (!start) return null;
+  const { runs } = leaveRuns(loa, { start, end: plan.loaEnd });
+  const runDays = runs.flatMap(run => run.rows.map(row => row.day));
+  if (!runs.length || !workingDays(start, plan.loaEnd).length || [...runDays, plan.loaEnd].some(day => compareDays(day, reportEnd) > 0)) return null;
+  const required = [...workingDays(start, plan.loaEnd), ...runDays].filter(day => compareDays(day, today) >= 0);
+  if (!required.length || term && required.some(day => !isEditableDay(day, today, term))) return null;
+  const checked = await caseDates(required, identity, step, { anchor: today });
+  if (checked.stop) return checked;
+  return { start, runDays: new Set(runDays.map(usDate)), required: new Set(required.map(usDate)) };
 }
 async function prepareAuditReadOnly(one, today, step) {
   if (one.personStop) return { stop: reasonLine(one.personStop), reasonCode: one.personStop.code };
@@ -9741,7 +10324,19 @@ async function prepareAuditReadOnly(one, today, step) {
     checks: [['✓', loaExact ? 'The report shows the LOA exactly; nothing changed' : 'Schedule read only; nothing changed', '']] };
 }
 function apply(one, prepared, options = {}) {
-  return withPersonGuard(probe => checkPersonIdentity(prepared.identity, 'identity check', probe), () => applyRecorded(one, prepared, options));
+  return withPersonGuard(probe => checkPersonIdentity(prepared.identity, 'identity check', probe), async () => {
+    let failure;
+    try { return await applyRecorded(one, prepared, options); }
+    catch (error) { failure = error; throw error; }
+    finally {
+      const edit = prepared.deleteEdit;
+      delete prepared.deleteEdit;
+      if (edit?.isConnected && !stopFlagged(failure)) {
+        if (failure) await cleanupAfter(failure, () => closeEdit(edit));
+        else await closeEdit(edit);
+      }
+    }
+  });
 }
 function exitReplaceEligible(plan, prepared) {
   const targets = prepared.exitRuns.flatMap(run => run.rows);
@@ -9754,6 +10349,24 @@ function exitReplaceEligible(plan, prepared) {
 function auditRangeTouchesKept(prepared, range) {
   return prepared.dnsKept?.some(row => compareDays(row.day, range.start) >= 0 &&
     (range.future || compareDays(row.day, range.end) <= 0));
+}
+const sameDates = (a, b) => a.length === b.length && a.every((day, index) => compareDays(day, b[index]) === 0);
+function dnsAdds(runs, provedSet) {
+  const dates = runs.flatMap(run => workingDays(run.start, run.end));
+  if (runs.length > 1 && provedSet && sameDates(dates, provedSet)) return [{ start: runs[0].start, end: runs.at(-1).end, dates, runs }];
+  return runs.map(run => ({ start: run.start, end: run.end, runs: [run] }));
+}
+function dnsSetDates({ addDns, dnsAddRuns, dnsRepairRuns }) {
+  const set = runs => runs?.length > 1 ? runs.flatMap(run => workingDays(run.start, run.end)) : null;
+  return { add: addDns ? set(dnsAddRuns) : null, repair: set(dnsRepairRuns) };
+}
+const dnsSetEntries = sets => [sets.add, sets.repair].filter(Boolean).map(dates => ({ dates, hoursPerDay: HOURS_PER_DAY }));
+const dnsAddTouchesKept =(prepared, add) => add.runs.some(run => auditRangeTouchesKept(prepared, run));
+const inDnsAdd = add => row => add.runs.some(run => inRange(row.day, run.start, run.end));
+function checkDnsAdd(after, plan, add) {
+  const problems = add.runs.flatMap(run => checkDnsAdded({ days: after.days.filter(row => inRange(row.day, run.start, run.end)) },
+    { ...plan, dnsStart: run.start, dnsEnd: run.end }, HOURS_PER_DAY).problems);
+  return { ok: !problems.length, problems };
 }
 function splitAuditExitRun(run, kept) {
   const cuts = [...new Map(kept.map(row => [usDate(row.day), row.day])).values()].filter(day => inRange(day, run.start, run.end)).sort(compareDays);
@@ -9813,39 +10426,43 @@ async function applyRecorded(one, prepared, { step = fn => fn(), onWrite: writeN
     let dateForm = null;
     if (prepared.exitDatePreflight) {
       const dateCheck = await caseDates(prepared.exitDatePreflight.dates, prepared.identity, step,
-        { anchor: prepared.exitDatePreflight.anchor, keepOpen: replace });
+        { anchor: prepared.exitDatePreflight.anchor, forceTrial: prepared.exitDatePreflight.forceTrial, keepOpen: replace });
       if (dateCheck.stop) throw Object.assign(new PageError(dateCheck.stop), { reasonCode: dateCheck.reasonCode });
       dateForm = dateCheck.modal;
     }
+    const dnsWriteFollows = !!(prepared.addDns || prepared.dnsRepairRuns?.length);
     if (!replace) for (const run of prepared.exitRuns) current = await removeExitEntries(
       { start: run.start, ...(run.future ? { future: true } : { end: run.end, clients: [run.client] }), ...(run.singleClientDay ? { singleClientDay: true } : {}) },
-      row => inRange(row.day, run.start, run.end) && (run.future || valueKey(row.client) === valueKey(run.client)), prepared, current, step, writeThrough(run.rows.map(row => row.day)));
-    for (const run of prepared.dnsRepairRuns || []) {
-      if (auditRangeTouchesKept(prepared, run)) throw new PageError('A kept DNS row is inside the repair range. Restore this person before continuing.');
-      await step(() => addAssignment({ client: DNS_CLIENT, start: run.start, end: run.end, hoursPerDay: HOURS_PER_DAY,
-        billable: 'Non-Billable', utilization: 'No', notes: plan.notes }, 'Normal', { onWrite: writeThrough(workingDays(run.start, run.end)) }));
+      row => inRange(row.day, run.start, run.end) && (run.future || valueKey(row.client) === valueKey(run.client)), prepared, current, step, writeThrough(run.rows.map(row => row.day)),
+      { calendar: dnsWriteFollows && run === prepared.exitRuns.at(-1) });
+    if (prepared.deleteEdit?.isConnected) await step(() => closeEdit(prepared.deleteEdit));
+    delete prepared.deleteEdit;
+    for (const run of dnsAdds(prepared.dnsRepairRuns || [], prepared.dnsRepairSet)) {
+      if (dnsAddTouchesKept(prepared, run)) throw new PageError('A kept DNS row is inside the repair range. Restore this person before continuing.');
+      await step(() => addAssignment({ client: DNS_CLIENT, start: run.start, end: run.end, ...(run.dates ? { dates: run.dates } : {}), hoursPerDay: HOURS_PER_DAY,
+        billable: 'Non-Billable', utilization: 'No', notes: plan.notes }, 'Normal', { onWrite: writeThrough(run.dates || workingDays(run.start, run.end)) }));
       const after = await copyWindow(prepared.watchedWindow, { future: true });
       recordLaterChange(prepared, after);
-      const added = row => inRange(row.day, run.start, run.end);
-      const checked = checkDnsAdded({ days: after.days.filter(added) }, { ...plan, dnsStart: run.start, dnsEnd: run.end }, HOURS_PER_DAY);
+      const added = inDnsAdd(run);
+      const checked = checkDnsAdd(after, plan, run);
       if (!checked.ok || !compareCopies({ days: current.days.filter(row => !added(row)) }, { days: after.days.filter(row => !added(row)) }).same
         || prepared.dnsKept?.some(old => !after.days.some(row => old.id === row.id && old.notes === row.notes))) throw new PageError(prepared.greyedExit ? 'The DNS repair could not be proved. By hand.' : 'The DNS repair could not be proved. Restore this person before continuing.');
-      current = writtenNoteCopy(after, { ...plan, dnsStart: run.start, dnsEnd: run.end });
+      current = run.runs.reduce((copy, part) => writtenNoteCopy(copy, { ...plan, dnsStart: part.start, dnsEnd: part.end }), after);
     }
     if (prepared.addDns) {
-      for (const run of prepared.dnsAddRuns || [{ start: plan.dnsStart, end: prepared.editableDnsEnd }]) {
+      for (const run of dnsAdds(prepared.dnsAddRuns || [{ start: plan.dnsStart, end: prepared.editableDnsEnd }], replace ? null : prepared.dnsAddSet)) {
         await step(() => {
-          if (auditRangeTouchesKept(prepared, run)) throw new PageError('The A&A DNS step could not be proved. Restore this person before continuing.');
-          return addAssignment({ client: DNS_CLIENT, start: run.start, end: run.end,
-            hoursPerDay: HOURS_PER_DAY, billable: 'Non-Billable', utilization: 'No', notes: plan.notes }, replace ? 'Replace' : 'Normal', { onWrite: writeThrough(workingDays(run.start, run.end)), preflightForm: dateForm });
+          if (dnsAddTouchesKept(prepared, run)) throw new PageError('The A&A DNS step could not be proved. Restore this person before continuing.');
+          return addAssignment({ client: DNS_CLIENT, start: run.start, end: run.end, ...(run.dates ? { dates: run.dates } : {}),
+            hoursPerDay: HOURS_PER_DAY, billable: 'Non-Billable', utilization: 'No', notes: plan.notes }, replace ? 'Replace' : 'Normal', { onWrite: writeThrough(run.dates || workingDays(run.start, run.end)), preflightForm: dateForm });
         });
         dateForm = null;
         const afterStep = await copyWindow(prepared.watchedWindow, { future: true });
         recordLaterChange(prepared, afterStep);
         if (plan.withoutNotes) {
-          const added = row => inRange(row.day, run.start, run.end);
+          const added = inDnsAdd(run);
           const unchanged = copy => ({ days: copy.days.filter(row => !added(row)) });
-          const checked = checkDnsAdded({ days: afterStep.days.filter(added) }, { ...plan, dnsStart: run.start, dnsEnd: run.end }, HOURS_PER_DAY);
+          const checked = checkDnsAdd(afterStep, plan, run);
           const kept = prepared.dnsKept || [];
           if (!checked.ok || !compareCopies(unchanged(current), unchanged(afterStep)).same || kept.some(old => !afterStep.days.some(row => row.id === old.id && row.notes === old.notes))) throw new PageError('The A&A DNS step could not be proved. Restore this person before continuing.');
         }
@@ -9866,9 +10483,13 @@ async function applyRecorded(one, prepared, { step = fn => fn(), onWrite: writeN
     return { ok: !wrong.length, problems: wrong, checks: wrong.length ? [] : [['✓', 'Editable entries removed; greyed-out DNS kept', '']], after: current };
   }
   if (['dns', 'clearClients'].includes(plan.action)) throw new PageError('The prepared Exit steps are missing. Nothing was changed.');
+  if (plan.action === 'add' && prepared.loaDeleteFirst) {
+    const done = await shortenInOpenWindow(prepared, plan, step, writeThrough, outside, checksAfter);
+    if (done) return done;
+  }
   if (plan.action === 'add') {
     const reduction = smallReduction(prepared.copy, plan, prepared.runs || [], prepared.canRefreshNotes);
-    const eligible = (!(prepared.runs || []).length || reduction) && alreadyAdded(prepared.copy, plan.loaStart, plan.loaEnd, LOA_CLIENT);
+    const eligible = prepared.canRefreshNotes !== false && ((prepared.runs || []).length ? reduction : !prepared.replaceRefresh) && alreadyAdded(prepared.copy, plan.loaStart, plan.loaEnd, LOA_CLIENT);
     const refreshed = eligible ? await step(() => refreshNotes(reduction?.query || { start: plan.loaStart, end: plan.loaEnd, clients: [LOA_CLIENT] },
       reduction?.expected || { days: prepared.copy.days.filter(row => inRange(row.day, plan.loaStart, plan.loaEnd)) }, plan.notes, { onWrite: writeThrough([...workingDays(plan.loaStart, plan.loaEnd), ...(reduction?.remove || []).map(row => row.day)]), remove: reduction?.remove || [] })) : false;
     if (!refreshed && workingDays(plan.loaStart, plan.loaEnd).length) await step(() => {
@@ -9877,8 +10498,9 @@ async function applyRecorded(one, prepared, { step = fn => fn(), onWrite: writeN
       return addAssignment({ client: LOA_CLIENT, start: plan.loaStart, end: plan.loaEnd, hoursPerDay: HOURS_PER_DAY,
         billable: 'Non-Billable', utilization: 'No', notes: plan.notes }, 'Replace', { onWrite: writeThrough(workingDays(plan.loaStart, plan.loaEnd)), formModal });
     });
-    const readOptions = {};
+    const readOptions = { keepOpen: !!(prepared.runs || []).length && !(refreshed && reduction) };
     let after = await copyWindow(prepared.watchedWindow || prepared.window, readOptions);
+    prepared.deleteEdit = knownAssignmentRows(after).edit;
     const added = checkedLoa(after, plan, prepared);
     if (refreshed && !compareCopies({ ...prepared.copy, days: prepared.copy.days.filter(row => !(reduction && onRun(prepared.runs, row))) }, after).same) { added.ok = false; added.problems.push('The note refresh changed assignment dates, hours or settings.'); }
     recordLaterChange(prepared, after, added.ok && prepared.writtenPastReport);
@@ -9913,6 +10535,24 @@ const leftOn = (runs, after) => after.days.filter(row => onRun(runs, row));
 async function removeLeaveRun(run, prepared, step, onWrite, before, readOptions) {
   return step(async () => {
     const query = { start: run.start, end: run.end, clients: [LOA_CLIENT] };
+    const readAfter = async () => {
+      const after = await copyWindow(prepared.watchedWindow || prepared.window, readOptions);
+      prepared.deleteEdit = knownAssignmentRows(after).edit;
+      recordLaterChange(prepared, after);
+      return after;
+    };
+    if (prepared.deleteEdit) {
+      const edit = prepared.deleteEdit;
+      delete prepared.deleteEdit;
+      try {
+        return await deleteFromTable(edit, query, before, { onWrite, read: readAfter,
+          validate: async actual => {
+            const wanted = prepared.copy.days.filter(row => onRun([run], row));
+            if (wanted.length !== run.rows.length || !compareCopies({ days: wanted }, actual).same) throw new PageError(`The LOA ${dayRanges([run.start, run.end])} changed since the backup. Nothing was deleted.`);
+          },
+        });
+      } catch (error) { if (!error.noBins) throw error; }
+    }
     const weekly = async edit => {
       const wanted = prepared.copy.days.filter(row => inRange(row.day, run.start, run.end) && valueKey(row.client) === valueKey(LOA_CLIENT));
       if (wanted.length !== run.rows.length) {
@@ -9926,11 +10566,7 @@ async function removeLeaveRun(run, prepared, step, onWrite, before, readOptions)
           const wanted = prepared.copy.days.filter(row => inRange(row.day, actual.window.start, actual.window.end) && valueKey(row.client) === valueKey(LOA_CLIENT));
           if (!compareCopies({ days: wanted }, actual).same) throw new PageError(`The LOA ${dayRanges([run.start, run.end])} changed since the backup. Nothing was deleted.`);
         },
-        read: async () => {
-          const after = await copyWindow(prepared.watchedWindow || prepared.window, readOptions);
-          recordLaterChange(prepared, after);
-          return after;
-        },
+        read: readAfter,
       });
     };
     if (knownAssignmentRows(before).range?.weekBoxes && splitDeleteWeeks(query).length > 1) return weekly(null);
@@ -9949,12 +10585,94 @@ async function removeLeaveRun(run, prepared, step, onWrite, before, readOptions)
       throw error;
     }
     await deleteAll(edit, { onWrite });
-    const after = await copyWindow(prepared.watchedWindow || prepared.window, readOptions);
-    recordLaterChange(prepared, after);
+    const after = await readAfter();
     const expected = { ...before, days: before.days.filter(row => !onRun([run], row)) };
     if (!compareCopies(expected, after).same) throw new PageError('The LOA delete could not be proved. Restore this person before continuing.');
     return after;
   });
+}
+async function shortenInOpenWindow(prepared, plan, step, writeThrough, outside, checksAfter) {
+  const { today, read } = prepared.loaDeleteFirst;
+  delete prepared.loaDeleteFirst;
+  const edit = prepared.deleteEdit;
+  delete prepared.deleteEdit;
+  if (!edit?.isConnected) return null;
+  const runs = prepared.runs;
+  const runRows = runs.flatMap(run => run.rows);
+  const days = runRows.map(row => row.day).sort(compareDays);
+  const query = { start: days[0], end: days.at(-1), clients: [LOA_CLIENT] };
+  const known = knownAssignmentRows(read);
+  const weekTotals = !prepared.kept?.length ? calendarBefore(today) : null;
+  const readAfter = async targets => {
+    if (weekTotals && targets?.length && targets.every(row => row.id && compareDays(row.day, prepared.reportEnd) <= 0)
+      && await calendarShowsDelete(weekTotals, targets, known.rows, today)) {
+      const removed = new Set(targets.map(row => row.id));
+      const checkedCopy = { ...read, days: read.days.filter(row => !removed.has(row.id)), calendarChecked: true };
+      retainAssignmentEvidence(checkedCopy, { window: known.range, days: known.rows.filter(row => !removed.has(row.id)) });
+      return checkedCopy;
+    }
+    const after = await copyWindow({ start: today, end: today }, { future: true });
+    recordLaterChange(prepared, after);
+    return after;
+  };
+  try {
+    await step(() => deleteFromTable(edit, query, read, { onlyIds: new Set(runRows.map(row => row.id)), onWrite: writeThrough(days), read: readAfter,
+      validate: async actual => {
+        const wanted = prepared.copy.days.filter(row => onRun(runs, row));
+        if (wanted.length !== runRows.length || !compareCopies({ days: wanted }, actual).same) throw new PageError(`The LOA ${dayRanges(days)} changed since the backup. Nothing was deleted.`);
+      } }));
+  } catch (error) { if (!error.noBins) throw error; return null; }
+  await step(() => addAssignment({ client: LOA_CLIENT, start: plan.loaStart, end: plan.loaEnd, hoursPerDay: HOURS_PER_DAY,
+    billable: 'Non-Billable', utilization: 'No', notes: plan.notes }, 'Replace', { onWrite: writeThrough(workingDays(plan.loaStart, plan.loaEnd)) }));
+  const after = await copyWindow(prepared.watchedWindow || prepared.window);
+  const result = checkedLoa(after, plan);
+  recordLaterChange(prepared, after, result.ok && prepared.writtenPastReport);
+  const left = leftOn(runs, after);
+  if (left.length) { result.ok = false; result.problems.push(`${left.length} LOA day${left.length === 1 ? '' : 's'} of the same leave still there (${dayRanges(left.map(row => row.day))})`); }
+  const wrong = outside(row => inRange(row.day, plan.loaStart, plan.loaEnd) || onRun(runs, row), after);
+  const ok = result.ok && !wrong.length;
+  return { ok, method: 'Replace', problems: [...wrong, ...result.problems],
+    checks: checksAfter(result, "LOA every working day, 8h, with notes; nothing else left on those days; the same leave's LOA outside the new dates removed", wrong),
+    after: ok ? writtenNoteCopy(after, plan) : after };
+}
+function dnsWritePlan(days, { plan, today, termDay, termGreyed, startGreyed, editableDnsEnd, withoutNotes, addDns, editable }) {
+  let lockedImproper = false;
+  const keepTail = alreadyAdded({ days: days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT)) }, plan.dnsStart, plan.dnsEnd, DNS_CLIENT, true)
+    && days.some(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, plan.dnsEnd) > 0);
+  if (keepTail) addDns = false;
+  const properDns = row => valueKey(row.client) === valueKey(DNS_CLIENT) && workingDays(row.day, row.day).length
+    && row.hours === HOURS_PER_DAY && valueKey(row.billable) === 'non billable' && valueKey(row.utilization) === 'no';
+  const oneDnsOnDay = row => days.filter(other => compareDays(other.day, row.day) === 0 && valueKey(other.client) === valueKey(DNS_CLIENT)).length === 1;
+  const replaceAllDns = withoutNotes && days.some(row => valueKey(row.client) === valueKey(DNS_CLIENT) && inRange(row.day, plan.dnsStart, editableDnsEnd)
+    && (!properDns(row) || !oneDnsOnDay(row)));
+  const dnsKept = keepTail ? days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, plan.dnsStart) >= 0) : replaceAllDns ? [] : withoutNotes ? days.filter(row => inRange(row.day, plan.dnsStart, editableDnsEnd)
+    && properDns(row) && oneDnsOnDay(row)) : [];
+  const dnsAddRuns = withoutNotes && addDns ? [] : null;
+  if (dnsAddRuns) for (const day of workingDays(plan.dnsStart, editableDnsEnd).filter(day => !dnsKept.some(row => compareDays(row.day, day) === 0))) {
+    const last = dnsAddRuns.at(-1);
+    if (last && !workingDays(addDays(last.end, 1), addDays(day, -1)).length) last.end = day;
+    else dnsAddRuns.push({ start: day, end: day });
+  }
+  if (dnsAddRuns && !dnsAddRuns.length) addDns = false;
+  const dnsEditableDates = new Set();
+  const improper = days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && inRange(row.day, plan.dnsStart, plan.dnsEnd) &&
+    (!properDns(row) || !oneDnsOnDay(row)));
+  const dnsCandidates = days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, today) >= 0
+    && (!termGreyed || compareDays(row.day, termDay) <= 0 || improper.includes(row)));
+  for (const row of dnsCandidates) if (editable(row.day)) dnsEditableDates.add(usDate(row.day));
+  const dnsEditable = row => (!startGreyed || improper.some(old => compareDays(old.day, row.day) === 0)) && dnsEditableDates.has(usDate(row.day));
+  if (improper.some(row => inRange(row.day, plan.dnsStart, editableDnsEnd) && !dnsEditable(row))) { addDns = false; lockedImproper = true; }
+  const repairDays = [...new Map(improper.filter(row => compareDays(row.day, plan.dnsEnd) <= 0 && dnsEditable(row) && (!addDns || !inRange(row.day, plan.dnsStart, editableDnsEnd)))
+    .map(row => [usDate(row.day), row.day])).values()].sort(compareDays);
+  const dnsRepairRuns = [];
+  for (const day of repairDays) {
+    const last = dnsRepairRuns.at(-1);
+    if (last && !workingDays(addDays(last.end, 1), addDays(day, -1)).length) last.end = day;
+    else dnsRepairRuns.push({ start: day, end: day });
+  }
+  if (!addDns && dnsRepairRuns.length) dnsKept.push(...days.filter(row => compareDays(row.day, plan.dnsStart) >= 0
+    && properDns(row) && !improper.includes(row) && !dnsKept.includes(row)));
+  return { keepTail, addDns, dnsKept, dnsAddRuns, improper, dnsEditableDates, dnsEditable, lockedImproper, repairDays, dnsRepairRuns };
 }
 async function prepareExit(one, version, today, { step }) {
   const { record, decision, slice } = one;
@@ -9992,13 +10710,36 @@ async function prepareExit(one, version, today, { step }) {
     plan.greyed = false;
     return { nothing: 'DNS already there; no change', alreadyDone: true, fromReport: true, checks: [], identity, copy: reportSays, termGreyed, greyedExit };
   }
+  const trialReportEnd = slice.reportEnd || reportWindow(today).end;
+  const reportPeriod = withoutNotes ? reportAssignPeriod({ entries: slice.backupEntries ?? slice.entries ?? [] }, record.email) : 'unknown';
+  let datesBeforeRead = false;
+  let trialSets = { add: null, repair: null };
+  if (!startGreyed && !termLimitsDns && reportPeriod !== 'Weekly' && compareDays(addDays(plan.dnsEnd, 56), trialReportEnd) <= 0) {
+    const reportRows = reportDays({ ...slice, entries: slice.backupEntries ?? slice.entries }, { start: today, end: trialReportEnd });
+    const later = reportRows.filter(row => compareDays(row.day, plan.dnsStart) >= 0);
+    const earlyDns = reportRows.some(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, plan.dnsStart) < 0);
+    const dnsDates = new Set(workingDays(plan.dnsStart, editableDnsEnd).map(usDate));
+    const retainedDns = withoutNotes && later.some(row => valueKey(row.client) === valueKey(DNS_CLIENT)
+      && row.hours === HOURS_PER_DAY && valueKey(row.billable) === 'non billable' && valueKey(row.utilization) === 'no');
+    const reportReplace = addDns && !earlyDns && !retainedDns && later.length > 0 && later.every(row => dnsDates.has(usDate(row.day)));
+    if (!reportReplace) {
+      const dates = [...(addDns ? workingDays(plan.dnsStart, editableDnsEnd) : []), ...reportRows.filter(row => compareDays(row.day, plan.dnsStart) >= 0
+        || valueKey(row.client) === valueKey(DNS_CLIENT)).map(row => row.day)];
+      const predicted = !withoutNotes || reportPeriod === 'Time' ? dnsSetDates(dnsWritePlan(reportRows.filter(row => compareDays(row.day, addDays(plan.dnsEnd, 56)) <= 0),
+        { plan, today, termDay, termGreyed, startGreyed, editableDnsEnd, withoutNotes, addDns, editable })) : { add: null, repair: null };
+      const entries = dnsSetEntries(predicted);
+      const checked = await caseDates(dates, identity, step, { anchor: today, forceTrial: entries.length > 0 || !!termDay && dates.some(day => compareDays(day, termDay) >= 0), ...(entries.length ? { entries } : {}) });
+      if (checked.stop) return checked;
+      if (entries.length && checked.exact === true) trialSets = predicted;
+      datesBeforeRead = true;
+    }
+  }
   if (withoutNotes) allowWeeklyRows();
   if (withoutNotes && greyedExit) allowGreyedWeekStart();
   let copy;
-  try { copy = await step(() => copyWindow({ start: today, end: addDays(plan.dnsEnd, 56) }, { future: true, keepOpen: greyedExit })); }
+  try { copy = await step(() => copyWindow({ start: today, end: addDays(plan.dnsEnd, 56) }, { future: true, keepOpen: greyedExit || datesBeforeRead })); }
   catch (error) { if (withoutNotes) { allowWeeklyRows(false); allowGreyedWeekStart(false); } throw error; }
   const initialEdit = knownAssignmentRows(copy).edit;
-  const reportPeriod = withoutNotes ? reportAssignPeriod({ entries: slice.backupEntries ?? slice.entries ?? [] }, record.email) : 'unknown';
   const pageWeekly = withoutNotes && weeklyRowsShown(knownAssignmentRows(copy).rows, knownAssignmentRows(copy).range);
   if (reportPeriod === 'Time' && pageWeekly) {
     allowWeeklyRows(false); allowGreyedWeekStart(false);
@@ -10023,48 +10764,17 @@ async function prepareExit(one, version, today, { step }) {
   let keepEdit = false;
   let preparationError = null;
   try {
-    const sameWindow = greyedExit && copy.days.length > 0 && copy.days.every(row => compareDays(row.day, plan.dnsStart) >= 0 && valueKey(row.client) !== valueKey(DNS_CLIENT));
+    let sameWindow = datesBeforeRead || greyedExit && copy.days.length > 0 && copy.days.every(row => compareDays(row.day, plan.dnsStart) >= 0 && valueKey(row.client) !== valueKey(DNS_CLIENT));
     if (initialEdit && !sameWindow) await step(() => closeEdit(initialEdit));
     const watchedWindow = copy.window;
     const dnsAlready = plan.action === 'dns' && alreadyAdded(copy, plan.dnsStart, plan.dnsEnd, DNS_CLIENT, true);
-    const keepTail = alreadyAdded({ days: copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT)) }, plan.dnsStart, plan.dnsEnd, DNS_CLIENT, true)
-      && copy.days.some(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, plan.dnsEnd) > 0);
-    if (keepTail) addDns = false;
-    const properDns = row => valueKey(row.client) === valueKey(DNS_CLIENT) && workingDays(row.day, row.day).length
-      && row.hours === HOURS_PER_DAY && valueKey(row.billable) === 'non billable' && valueKey(row.utilization) === 'no';
-    const oneDnsOnDay = row => copy.days.filter(other => compareDays(other.day, row.day) === 0 && valueKey(other.client) === valueKey(DNS_CLIENT)).length === 1;
-    const replaceAllDns = withoutNotes && copy.days.some(row => valueKey(row.client) === valueKey(DNS_CLIENT) && inRange(row.day, plan.dnsStart, editableDnsEnd)
-      && (!properDns(row) || !oneDnsOnDay(row)));
-    const dnsKept = keepTail ? copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, plan.dnsStart) >= 0) : replaceAllDns ? [] : withoutNotes ? copy.days.filter(row => inRange(row.day, plan.dnsStart, editableDnsEnd)
-      && properDns(row) && oneDnsOnDay(row)) : [];
-    const dnsAddRuns = withoutNotes && addDns ? [] : null;
-    if (dnsAddRuns) for (const day of workingDays(plan.dnsStart, editableDnsEnd).filter(day => !dnsKept.some(row => compareDays(row.day, day) === 0))) {
-      const last = dnsAddRuns.at(-1);
-      if (last && !workingDays(addDays(last.end, 1), addDays(day, -1)).length) last.end = day;
-      else dnsAddRuns.push({ start: day, end: day });
-    }
-    if (dnsAddRuns && !dnsAddRuns.length) addDns = false;
+    const dnsSteps = dnsWritePlan(copy.days, { plan, today, termDay, termGreyed, startGreyed, editableDnsEnd, withoutNotes, addDns, editable });
+    if (dnsSteps.lockedImproper) greyed = true;
+    addDns = dnsSteps.addDns;
+    const { keepTail, dnsKept, dnsAddRuns, dnsEditableDates, dnsEditable, repairDays, dnsRepairRuns } = dnsSteps;
+    if (repairDays.some(day => !workingDays(day, day).length)) return { stop: 'An improper DNS entry is on a weekend. Nothing was changed; By hand.' };
     const earlyCandidates = copy.days.filter(row => compareDays(row.day, plan.dnsStart) < 0 && valueKey(row.client) === valueKey(DNS_CLIENT)
       && (!termDay || compareDays(row.day, termDay) <= 0)).sort((a, b) => compareDays(a.day, b.day));
-    const dnsEditableDates = new Set();
-    const improper = copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && inRange(row.day, plan.dnsStart, plan.dnsEnd) &&
-      (!properDns(row) || !oneDnsOnDay(row)));
-    const dnsCandidates = copy.days.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT) && compareDays(row.day, today) >= 0
-      && (!termGreyed || compareDays(row.day, termDay) <= 0 || improper.includes(row)));
-    for (const row of dnsCandidates) if (editable(row.day)) dnsEditableDates.add(usDate(row.day));
-    const dnsEditable = row => (!startGreyed || improper.some(old => compareDays(old.day, row.day) === 0)) && dnsEditableDates.has(usDate(row.day));
-    if (improper.some(row => inRange(row.day, plan.dnsStart, editableDnsEnd) && !dnsEditable(row))) { addDns = false; greyed = true; }
-    const repairDays = [...new Map(improper.filter(row => compareDays(row.day, plan.dnsEnd) <= 0 && dnsEditable(row) && (!addDns || !inRange(row.day, plan.dnsStart, editableDnsEnd)))
-      .map(row => [usDate(row.day), row.day])).values()].sort(compareDays);
-    if (repairDays.some(day => !workingDays(day, day).length)) return { stop: 'An improper DNS entry is on a weekend. Nothing was changed; By hand.' };
-    const dnsRepairRuns = [];
-    for (const day of repairDays) {
-      const last = dnsRepairRuns.at(-1);
-      if (last && !workingDays(addDays(last.end, 1), addDays(day, -1)).length) last.end = day;
-      else dnsRepairRuns.push({ start: day, end: day });
-    }
-    if (!addDns && dnsRepairRuns.length) dnsKept.push(...copy.days.filter(row => compareDays(row.day, plan.dnsStart) >= 0
-      && properDns(row) && !improper.includes(row) && !dnsKept.includes(row)));
     const earlyDns = earlyCandidates.filter(row => dnsEditableDates.has(usDate(row.day)));
     const window = { start: earlyDns[0]?.day || plan.dnsStart, end: watchedWindow.end };
     const inChange = row => earlyDns.includes(row) || !dnsKept.includes(row) && compareDays(row.day, plan.dnsStart) >= 0 &&
@@ -10086,7 +10796,8 @@ async function prepareExit(one, version, today, { step }) {
     const inReport = row => compareDays(row.day, reportEnd) <= 0;
     const backupEnd = compareDays(watchedWindow.end, reportEnd) < 0 ? watchedWindow.end : reportEnd;
     const reportPart = reportDays({ ...slice, entries: slice.backupEntries ?? slice.entries }, { start: today, end: backupEnd });
-    const differences = timedRun('compare', () => compareByDay(copy.days.filter(inReport), reportPart, today));
+    const reportCompare = compareDays(backupEnd, reportEnd) < 0 ? reportDays({ ...slice, entries: slice.backupEntries ?? slice.entries }, { start: today, end: reportEnd }) : reportPart;
+    const differences = timedRun('compare', () => compareByDay(copy.days.filter(inReport), reportCompare, today));
     recordRun({ type: 'comparison', summary: reportDifferenceSummary(differences) });
     if (differences.length) return reportMismatch('The page and the Staff Schedule Hours Report disagree. Pull the Staff Schedule Hours Report again before Start.', differences);
     if (!addDns && !removing.size) {
@@ -10118,27 +10829,43 @@ async function prepareExit(one, version, today, { step }) {
       exitRuns.splice(0, exitRuns.length, ...split);
     }
     let exitDatePreflight = null;
+    const needsPageDates = reachesLater && (copy.days.some(row => !inReport(row) && inChange(row)) || addDns && compareDays(editableDnsEnd, reportEnd) > 0);
+    if (datesBeforeRead && needsPageDates) {
+      if (initialEdit?.isConnected) await step(() => closeEdit(initialEdit));
+      datesBeforeRead = false; sameWindow = false;
+    }
+    const actualSets = dnsSetDates({ addDns, dnsAddRuns, dnsRepairRuns });
+    const provedSets = { add: null, repair: null };
+    if (datesBeforeRead) for (const kind of ['add', 'repair']) {
+      if (actualSets[kind] && trialSets[kind] && sameDates(actualSets[kind], trialSets[kind])) provedSets[kind] = actualSets[kind];
+    }
     if (repairDays.length) {
-      const dateStop = await caseDates(repairDays, identity, step, { anchor: repairDays[0] });
+      const entries = datesBeforeRead ? [] : dnsSetEntries({ repair: actualSets.repair });
+      const dateStop = datesBeforeRead ? {} : await caseDates(repairDays, identity, step, { anchor: repairDays[0], forceTrial: entries.length > 0 || needsPageDates || !!termDay && repairDays.some(day => compareDays(day, termDay) >= 0), ...(entries.length ? { entries } : {}) });
       if (dateStop.stop) return dateStop;
+      if (entries.length && dateStop.exact === true) provedSets.repair = actualSets.repair;
     }
     if (termGreyed) {
       const dates = earlyDns.map(row => row.day).filter(day => compareDays(day, termDay) <= 0);
       if (dates.length) {
-        const dateStop = await caseDates(dates, identity, step, { anchor: dates[0] });
+        const dateStop = await caseDates(dates, identity, step, { anchor: dates[0], forceTrial: true });
         if (dateStop.stop) return dateStop;
       }
-    } else if (!greyedExit) {
+    } else if (!greyedExit && !datesBeforeRead) {
       const dates = [...(addDns ? workingDays(plan.dnsStart, editableDnsEnd) : []), ...copy.days.filter(inChange).map(row => row.day)];
-      if (exitReplaceEligible(plan, { exitRuns, copy, addDns, earlyDns, editableDnsEnd })) exitDatePreflight = { dates, anchor: today };
+      const forceTrial = needsPageDates || termLimitsDns || !!termDay && dates.some(day => compareDays(day, termDay) >= 0);
+      if (exitReplaceEligible(plan, { exitRuns, copy, addDns, earlyDns, editableDnsEnd })) exitDatePreflight = { dates, anchor: today, forceTrial };
       else {
-        const dateStop = await caseDates(dates, identity, step, { anchor: today });
+        const entries = dnsSetEntries({ add: actualSets.add });
+        const dateStop = await caseDates(dates, identity, step, { anchor: today, forceTrial: entries.length > 0 || forceTrial, ...(entries.length ? { entries } : {}) });
         if (dateStop.stop) return dateStop;
+        if (entries.length && dateStop.exact === true) provedSets.add = actualSets.add;
       }
     }
     keepEdit = sameWindow;
     return { greyedExit, ...(sameWindow ? { deleteEdit: initialEdit } : {}), window, watchedWindow, copy, watched: copy, backup, removing: [...removing.values()], daysCompared: new Set(copy.days.map(row => usDate(row.day))).size,
       reportEnd, checks: [], earlyDns, dnsAlready: false, identity, termGreyed, termDay, exitRuns, addDns, editableDnsEnd, exitDatePreflight, dnsRepairRuns,
+      ...(provedSets.add ? { dnsAddSet: provedSets.add } : {}), ...(provedSets.repair ? { dnsRepairSet: provedSets.repair } : {}),
       ...(withoutNotes || keepTail || dnsRepairRuns.length ? { dnsKept, dnsAddRuns } : {}) };
   } catch (error) { preparationError = error; throw error; }
   finally {
@@ -10157,21 +10884,51 @@ async function caseDates(dates, identity, step, options = {}) {
     return { stop: error.message, reasonCode: 'allowedDatesUnreadableOrOutside' };
   }
 }
-async function removeExitEntries(query, matches, prepared, before, step, onWrite) {
+async function removeExitEntries(query, matches, prepared, before, step, onWrite, { calendar = false } = {}) {
   return step(async () => {
-    const calendarBefore = prepared.greyedExit ? exitCalendarSnapshot(prepared.watchedWindow.start) : null;
-    const readAfter = async () => {
+    const reuseRead = !!prepared.deleteEdit && !prepared.greyedExit;
+    const greyedCalendar = prepared.greyedExit ? exitCalendarSnapshot(prepared.watchedWindow.start) : null;
+    const weekTotals = calendar && reuseRead && !prepared.dnsKept?.length ? calendarBefore(prepared.watchedWindow.start) : null;
+    const readAfter = async targets => {
+      if (weekTotals && targets?.length && targets.every(row => row.id) && (!prepared.reportEnd || targets.every(row => compareDays(row.day, prepared.reportEnd) <= 0))
+        && await calendarShowsDelete(weekTotals, targets, knownAssignmentRows(before).rows, prepared.watchedWindow.start)) {
+        const ids = new Set(targets.map(row => row.id)), known = knownAssignmentRows(before);
+        const checkedCopy = { ...before, days: before.days.filter(row => !ids.has(row.id)), calendarChecked: true };
+        retainAssignmentEvidence(checkedCopy, { window: known.range, days: known.rows.filter(row => !ids.has(row.id)) });
+        return checkedCopy;
+      }
       const kept = before.days.filter(row => !matches(row));
-      const after = await copyWindow(prepared.watchedWindow, { future: true,
+      const after = await copyWindow(prepared.watchedWindow, { future: true, keepOpen: reuseRead,
         ...(prepared.greyedExit ? { anchors: kept.filter(row => valueKey(row.client) === valueKey(DNS_CLIENT)), allowUnavailable: true } : {}) });
-      if (after) return after;
-      prepared.calendarAfter = await settledExitCalendar(calendarBefore, before.days.filter(matches), kept, prepared.watchedWindow.start);
+      if (after) {
+        prepared.deleteEdit = knownAssignmentRows(after).edit;
+        return after;
+      }
+      prepared.calendarAfter = await settledExitCalendar(greyedCalendar, before.days.filter(matches), kept, prepared.watchedWindow.start);
       return { ...before, days: kept, calendarChecked: true };
     };
     const deleteNotice = async () => {
       await onWrite();
       if (prepared.greyedExit) prepared.deletedDays = [...new Set([...(prepared.deletedDays || []), ...before.days.filter(matches).map(row => usDate(row.day))])];
     };
+    if (prepared.deleteEdit && !prepared.greyedExit) {
+      const edit = prepared.deleteEdit;
+      delete prepared.deleteEdit;
+      if (!query.singleClientDay && auditRangeTouchesKept(prepared, query)) {
+        const error = new PageError('The Exit entries changed since the backup. Nothing was deleted.', { reasonName: 'keptRowInRange' });
+        await cleanupAfter(error, () => closeEdit(edit));
+        throw error;
+      }
+      let after = null;
+      try {
+        after = await deleteFromTable(edit, query, before, { onWrite: deleteNotice, read: readAfter, protectedRows: prepared.dnsKept || [],
+          validate: async actual => {
+            if (actual.days.some(row => !matches(row))) throw new PageError('The Exit entries changed since the backup. Nothing was deleted.');
+          },
+        });
+      } catch (error) { if (!error.noBins) throw error; }
+      if (after) { recordLaterChange(prepared, after); return after; }
+    }
     const weeklyFuture = () => deleteRange({ start: query.start, end: prepared.watchedWindow.end, weekEndFriday: true }, before, { onWrite: deleteNotice,
       protectedRows: prepared.dnsKept || [],
       validate: async actual => {
@@ -10250,15 +11007,21 @@ async function previewRestore(backup, options = {}) {
   if (options.identity) await requirePersonIdentity(options.identity);
   return restorePlan(backup, { ...options, identity });
 }
+async function previewFromMemory(backup, { after = null, identity = null, today } = {}) {
+  if (backup.undoBlocked) throw new PageError(backup.undoBlocked);
+  if (!after || !identity) return null;
+  const plan = await memoryRestorePlan(backup, { after, ...(today ? { today } : {}) });
+  return plan && { ...plan, identity };
+}
 async function restore(backup, options = {}) {
   if (backup.undoBlocked) throw new PageError(backup.undoBlocked);
-  if (options.identity) await requirePersonIdentity(options.identity);
+  if (options.identity && !options.fromMemory) await requirePersonIdentity(options.identity);
   const release = batchCover();
   try {
     await openForRestore(backup, options);
     const identity = personIdentity();
     if (options.identity) await requirePersonIdentity(options.identity);
-    return await restoreWindow(backup, { ...options, identity });
+    return await restoreWindow(backup, { ...options, identity, calendarCheck: true });
   } finally { release(); }
 }
 async function recover(backup, options = {}) {
@@ -10347,6 +11110,7 @@ __exports.prepare = prepare;
 __exports.apply = apply;
 __exports.removeLeaveRun = removeLeaveRun;
 __exports.previewRestore = previewRestore;
+__exports.previewFromMemory = previewFromMemory;
 __exports.restore = restore;
 __exports.recover = recover;
 },
@@ -10452,11 +11216,12 @@ __exports.prepareTax = prepareTax;
 },
 "run/weekly-exit-work.js": function (__require, __exports, document, window) {
 'use strict';
-const { addDays, compareDays, mondayOf, usDate, workingDays } = __require("../rules/dates.js");
+const { addDays, compareDays, mondayOf, usDate, workingDays, todayOf } = __require("../rules/dates.js");
 const { valueKey, professionalName } = __require("../rules/prepare.js");
 const { planWeeklyExit } = __require("../rules/weekly-exit.js");
 const { exitMailChoice } = __require("../rules/exit.js");
-const { PageError, withPersonGuard } = __require("../mysource/dom.js");
+const { PageError, withPersonGuard, stopFlagged } = __require("../mysource/dom.js");
+const { calendarBefore, calendarShowsChange } = __require("../mysource/calendar-check.js");
 const { checkPersonIdentity, waitForPersonIdentity } = __require("../mysource/schedule.js");
 const { copyWindow, compareCopies, futureCopyFrom } = __require("../mysource/copy.js");
 const { deleteRange, addAssignment, preflightDates, setAssignmentHours, weekRuns } = __require("../mysource/write.js");
@@ -10561,18 +11326,66 @@ async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () 
   const prove = async (expected, fresh = null) => {
     const after = fresh || await read();
     if (!compareCopies({ days: expected }, after).same) throw new PageError(stopWords);
+    recordRun({ type: 'writeProof', ok: true });
     current = after; readAfterWrite = after;
     return after;
   };
   const week = monday => ({ start: monday, end: addDays(monday, 4), weekEndFriday: true });
   const inWeek = monday => row => sameWeek(row.day, monday);
-  for (const item of weekly.lower) await step(async () => {
-    const target = current.days.find(row => row.id === item.row.id);
-    if (!target || item.hours >= target.hours) throw new PageError(stopWords);
-    const monday = mondayOf(target.day);
-    const lowerNotice = async () => { await written(); if (prepared.greyedExit) prepared.deletedDays = [...new Set([...prepared.deletedDays, usDate(target.day)])]; };
-    await setAssignmentHours(week(monday), { days: current.days.filter(inWeek(monday)) }, target, item.hours, { onWrite: lowerNotice, weekly: true });
-    await prove(current.days.map(row => row.id === target.id ? { ...row, hours: item.hours } : row));
+  const runs = weekly.addDns ? prepared.dnsRuns?.length ? prepared.dnsRuns : weekRuns(weekly.addDns.start, weekly.addDns.end) : [];
+  const calendarAllowed = !prepared.greyedExit && !weekly.keptDns?.length;
+  const today = todayOf();
+  const proveOrCalendar = async (expected, shot, changes) => {
+    if (shot && await calendarShowsChange(shot, changes, current.days, today)) {
+      recordRun({ type: 'writeProof', ok: true });
+      current = { ...current, days: expected }; readAfterWrite = null;
+      return;
+    }
+    await prove(expected);
+  };
+  let oneWindow = false;
+  const changedRows = [...weekly.lower.map(item => item.row), ...weekly.remove];
+  if (!prepared.greyedExit && changedRows.length) {
+    const days = changedRows.map(row => row.day).sort(compareDays);
+    const start = mondayOf(days[0]), sunday = addDays(mondayOf(days.at(-1)), 6);
+    const inside = row => compareDays(row.day, start) >= 0 && compareDays(row.day, sunday) <= 0;
+    const targets = weekly.lower.map(item => ({ target: current.days.find(row => row.id === item.row.id), hours: item.hours }));
+    if (targets.some(({ target, hours }) => !target || hours >= target.hours)) throw new PageError(stopWords);
+    const shot = calendarAllowed && runs.length ? calendarBefore(today) : null;
+    let pressed = false;
+    try {
+      await step(() => setAssignmentHours({ start, end: addDays(sunday, -2), weekEndFriday: true }, { days: current.days.filter(inside) }, targets, null,
+        { onWrite: async () => { pressed = true; await written(); }, weekly: true, remove: weekly.remove }));
+      oneWindow = true;
+    } catch (error) {
+      if (pressed || stopFlagged(error) || error.identityChanged || error.identityPending) throw error;
+      recordRun({ type: 'weeklyOneWindow', ok: false });
+    }
+    if (oneWindow) {
+      const gone = new Set(weekly.remove.map(row => row.id));
+      const expected = current.days.filter(row => !gone.has(row.id)).map(row => {
+        const lower = targets.find(item => item.target.id === row.id);
+        return lower ? { ...row, hours: lower.hours } : row;
+      });
+      await proveOrCalendar(expected, shot, [...targets.map(({ target, hours }) => ({ day: target.day, client: target.client, hours: hours - target.hours })),
+        ...weekly.remove.map(row => ({ day: row.day, client: row.client, hours: -row.hours }))]);
+    }
+  }
+  const loweredWeeks = [];
+  for (const item of weekly.lower) if (!loweredWeeks.some(monday => sameWeek(item.row.day, monday))) loweredWeeks.push(mondayOf(item.row.day));
+  if (!oneWindow) for (const monday of loweredWeeks) await step(async () => {
+    const targets = weekly.lower.filter(item => sameWeek(item.row.day, monday)).map(item => ({ target: current.days.find(row => row.id === item.row.id), hours: item.hours }));
+    if (targets.some(({ target, hours }) => !target || hours >= target.hours)) throw new PageError(stopWords);
+    const remove = weekly.remove.filter(inWeek(monday));
+    const lowerNotice = async () => {
+      await written();
+      if (prepared.greyedExit) prepared.deletedDays = [...new Set([...prepared.deletedDays, ...targets.map(({ target }) => usDate(target.day)), ...remove.map(row => usDate(row.day))])];
+    };
+    await setAssignmentHours(week(monday), { days: current.days.filter(inWeek(monday)) }, targets, null, { onWrite: lowerNotice, weekly: true, remove });
+    await prove(current.days.filter(row => !remove.some(old => old.id === row.id)).map(row => {
+      const lower = targets.find(item => item.target.id === row.id);
+      return lower ? { ...row, hours: lower.hours } : row;
+    }));
   });
   const gone = new Set(weekly.remove.map(row => row.id));
   const removeIn = async (query, rows) => {
@@ -10587,22 +11400,23 @@ async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () 
       read: readOnce }));
     await prove(current.days.filter(row => !rows.some(old => old.id === row.id)), deleteRead && afterDelete === deleteRead ? deleteRead : null);
   };
-  for (const rows of sameDayClient(weekly.remove.filter(inWeek(weekly.weekStart)))) {
+  const remainingRemove = oneWindow ? [] : weekly.remove.filter(row => !loweredWeeks.some(monday => sameWeek(row.day, monday)));
+  for (const rows of sameDayClient(remainingRemove.filter(inWeek(weekly.weekStart)))) {
     await removeIn({ start: rows[0].day, end: rows[0].day, weekEndFriday: true, clients: [rows[0].client] }, rows);
   }
   const nextMonday = addDays(weekly.weekStart, 7);
-  const laterRows = weekly.remove.filter(row => compareDays(row.day, nextMonday) >= 0);
+  const laterRows = remainingRemove.filter(row => compareDays(row.day, nextMonday) >= 0);
   if (laterRows.length) {
     const clients = weekly.keptDns.length ? { clients: [...new Set(laterRows.map(row => row.client))] } : {};
     await removeIn({ start: nextMonday, end: window.end, weekEndFriday: true, ...clients }, laterRows);
   }
-  const runs = weekly.addDns ? prepared.dnsRuns?.length ? prepared.dnsRuns : weekRuns(weekly.addDns.start, weekly.addDns.end) : [];
   for (const run of runs) await step(async () => {
+    const shot = calendarAllowed && run !== runs.at(-1) ? calendarBefore(today) : null;
     await addAssignment({ client: DNS_CLIENT, start: run.start, end: run.end, hoursPerDay: 8,
       billable: 'Non-Billable', utilization: 'No', notes: '' }, 'Normal', { onWrite: written, weekly: true });
     const expected = weekly.expected.filter(row => row.id || compareDays(row.day, run.end) <= 0)
       .map(row => row.id ? current.days.find(live => live.id === row.id) || row : { jobCode: '', assignCode: '', assignCode2: '', wbs: '', pricingId: '', notes: 0, ...row });
-    await prove(expected);
+    await proveOrCalendar(expected, shot, workingDays(run.start, run.end).map(day => ({ day, client: DNS_CLIENT, hours: 8 })));
   });
   const after = readAfterWrite || await read();
   const same = compareCopies({ days: weekly.expected.map(row => ({ jobCode: '', assignCode: '', assignCode2: '', wbs: '', pricingId: '', ...row })) }, after).same;
@@ -10699,7 +11513,7 @@ __exports.applyBulkRestore = applyBulkRestore;
 },
 "screen/restore-panel.js": function (__require, __exports, document, window) {
 'use strict';
-const { el, saveFile, recoveryGuide } = __require("./ui.js");
+const { el, saveFile } = __require("./ui.js");
 const { readReport } = __require("../files/report.js");
 const { bulkRestorePeople, backupRestorePeople, previewBulkRestore, applyBulkRestore } = __require("../run/bulk-restore.js");
 const { isBackupFile, readBackupFile } = __require("../files/backup-file.js");
@@ -10722,7 +11536,7 @@ function restoreReportButton(work, body, onBack) {
     catch (error) { message.textContent = error.message; message.hidden = false; }
     finally { work.busy = false; button.disabled = false; }
   });
-  return el('div', { class: 'restore-entry' }, button, recoveryGuide(), input, message);
+  return el('div', { class: 'restore-entry' }, button, input, message);
 }
 const RESTORE_TITLE = 'Restore from a backup or report';
 const PLAIN_REPORT_LINE = 'A plain report only if the batch stopped before Save files: no Pricing ID or later days.';
@@ -11256,28 +12070,29 @@ __exports.runTaxLiveTest = runTaxLiveTest;
 const { beginLiveDiagnostics } = __require("./live-diagnostics.js");
 const { addressCount } = __require("../rules/prepare.js");
 const { compareDays, todayOf, usDate } = __require("../rules/dates.js");
-const { SMALL_LIVE_STEPS, WEEKLY_LIVE_STEPS, smallTestPeriod } = __require("./live-proof.js");
+const { SMALL_LIVE_STEPS, WEEKLY_LIVE_STEPS, smallTestPeriod, liveAbilities } = __require("./live-proof.js");
 const { withLiveConnection } = __require("./live-connection.js");
 const runSmallConsultingTest = (options, page) => withLiveConnection(options, page, runSmallConsultingRecorded);
 async function runSmallConsultingRecorded({ email, version, today = todayOf(), onUpdate = () => {}, assignPeriod = 'unknown' }, page) {
   const window = smallTestPeriod(today);
   if (!String(email || '').trim() || addressCount(email) > 1) throw new Error('Enter one professional email.');
-  const result = { kind: 'Snooze live test 1', mode: 'consulting', version, design: 'small8', length: 'twelveWeeks',
-    expectedSteps: 8, week: { start: usDate(window.start), end: usDate(window.end) },
+  const result = { kind: 'Snooze live test 1', mode: 'consulting', version, design: 'daily7', length: 'twelveWeeks',
+    expectedSteps: 7, week: { start: usDate(window.start), end: usDate(window.end) },
     state: 'running', cleanup: 'notNeeded', writes: 0, steps: Object.keys(SMALL_LIVE_STEPS).map(id => ({ id, state: 'notExercised' })),
-    events: [], pictures: [], outstanding: [] };
+    events: [], pictures: [], outstanding: [], abilities: [], rowNumbers: null };
   const diagnostic = beginLiveDiagnostics(result, page, assignPeriod, today);
   const write = () => { result.writes++; };
-  let actions = [() => page.smallStart(String(email).trim(), window), () => page.smallAdd(write),
-    () => page.smallChange(write), () => page.smallDelete(write),
-    async () => { result.pictures.push(...await page.smallPicture()); },
-    () => page.smallUndo(write), () => page.smallExit(write), () => page.auditClear(write)];
+  let actions = [() => page.smallStart(String(email).trim(), window), () => page.featureExact(write),
+    () => page.featureReplace(write), () => page.featureNotes(write),
+    async () => { result.pictures.push(...await page.featurePicture()); },
+    () => page.featureBins(write), () => page.featureClear(write)];
   const toWeekly = () => {
-    result.design = 'weekly6'; result.expectedSteps = 6;
+    result.design = 'weekly7'; result.expectedSteps = 7;
     result.steps = [result.steps[0], ...Object.keys(WEEKLY_LIVE_STEPS).slice(1).map(id => ({ id, state: 'notExercised' }))];
-    actions = [actions[0], () => page.weeklySetup(write), () => page.weeklyTable(write), () => page.weeklyExit(write), () => page.weeklyUndo(write), () => page.weeklyClear(write)];
+    actions = [actions[0], () => page.weeklySetup(write), () => page.weeklyExit(write), () => page.weeklyUndo(write), () => page.weeklyHours(write),
+      async () => { result.pictures.push(...await page.weeklyPicture()); }, () => page.featureClear(write)];
   };
-  const titles = () => result.design === 'weekly6' ? WEEKLY_LIVE_STEPS : SMALL_LIVE_STEPS;
+  const titles = () => result.design === 'weekly7' ? WEEKLY_LIVE_STEPS : SMALL_LIVE_STEPS;
   let release;
   try {
     release = await page.begin(result.events);
@@ -11296,10 +12111,13 @@ async function runSmallConsultingRecorded({ email, version, today = todayOf(), o
     if (error.connectionLost) throw error;
     if (!result.diagnostic.stop) diagnostic.fail(error, result.steps.find(s => s.state === 'running')?.id || 'smallOpen');
     result.state = 'failed'; diagnostic.cleanup();
-    try { result.cleanup = await (result.design === 'weekly6' ? page.weeklyCleanup(write, error) : page.auditCleanup(write, error)); }
+    try { result.cleanup = await (result.design === 'weekly7' ? page.weeklyCleanup(write, error) : page.auditCleanup(write, error)); }
     catch (cleanupError) { if (cleanupError.connectionLost) { result.connectionReturnState = 'failed'; result.state = 'paused'; throw cleanupError; } diagnostic.fail(cleanupError, 'recovery'); result.cleanup = 'unconfirmed'; }
   } finally {
-    result.outstanding = page.auditOutstanding(result.cleanup); release?.(); diagnostic.finish(); onUpdate(result);
+    result.outstanding = page.auditOutstanding(result.cleanup);
+    result.abilities = liveAbilities(result.design, result.steps, page.featureProofs?.() || {});
+    result.rowNumbers = page.featureRowNumbers?.() || null;
+    release?.(); diagnostic.finish(); onUpdate(result);
   }
   return result;
 }
@@ -11635,17 +12453,75 @@ async function testPart(part, action) {
   try { return await action(); } catch (error) { if (!LIVE_TEST_PARTS.has(error.livePart)) error.livePart = part; throw error; }
 }
 const SMALL_LIVE_STEPS = {
-  smallOpen: 'Open and read', smallAdd: 'Add LOA, DNS and blank-note A&A DNS',
-  smallChange: 'Replace, combined Edit Submit and Cancel', smallDelete: 'Delete around a kept DNS day',
-  smallPicture: 'Hover picture and plain A&A picture', smallUndo: 'Undo from the backup file',
-  smallExit: 'Consulting Exit, then automatic put-back', cleanup: 'Clear and check empty',
+  smallOpen: 'Open and read', featureExact: 'Add DNS on an exact date set; read back',
+  featureReplace: 'Replace with LOA; read back, View Notes, then Cancel', featureNotes: 'Note refresh and a bin, one Submit',
+  featurePicture: 'Open again; hover picture and plain picture', featureBins: 'Bins around a kept DNS day, one Submit',
+  cleanup: 'Clear and check empty',
 };
 const WEEKLY_LIVE_STEPS = {
   smallOpen: 'Open and read', weeklySetup: 'Weekly setup: DNS 4 h a day, three weeks',
-  weeklyTable: 'Weekly table: lower one week, remove two rows one by one, one Submit; put back',
   weeklyExit: 'Weekly A&A Exit: DNS in whole weeks, each Add checked', weeklyUndo: 'Undo from the backup',
-  cleanup: 'Clear and check empty',
+  weeklyHours: 'Lower one week and remove one, one Submit; part-week Add',
+  weeklyPicture: 'Open again; plain picture', cleanup: 'Clear and check empty',
 };
+const LIVE_ABILITIES = {
+  open: 'Schedule page, person search by email, identity',
+  view: 'Custom view, No. of Periods, Go to Date',
+  find: 'Find over the period, table read',
+  trial: 'Date trial kept open, next Add uses it',
+  exactSet: 'Add on an exact date set',
+  calendarAdd: 'Calendar check after an Add',
+  rangeReplace: 'Replace by a date range clears other rows on its days',
+  notesTyped: 'Note typed or left blank in Add',
+  viewNotes: 'View Notes reads the note text',
+  cancel: 'Staged bins discarded by Cancel',
+  clientFilter: 'Find with a Clients filter',
+  bulkNote: 'Bulk Edit note and a bin, one Submit',
+  reopen: 'Same person opened again without a reload',
+  hover: 'Note hover picture',
+  picture: 'Plain picture',
+  bins: 'Bins on chosen rows, one Submit, other rows kept',
+  calendarDelete: 'Calendar check after a saved delete',
+  deleteAll: 'Delete All with Yes',
+  weeklyAdd: 'Weekly Add in whole weeks',
+  calendarWeekly: 'Calendar check after a Weekly Add',
+  weeklyExit: 'Weekly A&A Exit end to end',
+  weeklyUndo: 'Weekly Undo end to end',
+  weekFind: 'Find with Week boxes from a mid-week day',
+  lowerRemove: 'Hours lowered with a removal, one Submit',
+  calendarSubmit: 'Calendar check after a Weekly Submit',
+  partWeek: 'Weekly Add of a part week from mid-week',
+};
+const LIVE_ABILITY_PARTS = {
+  notProved: 'not proved', findDisagreed: 'Find disagreed', textDiffers: 'note text differs',
+  weekNotShown: 'Week not shown', unreadableBefore: 'calendar unreadable', unreadableAfter: 'calendar unreadable',
+  unreadable: 'calendar unreadable', hoursDiffer: 'totals differ', differsFromRead: 'calendar differed from the read',
+  belowZero: 'totals below zero', noEvidence: 'nothing to check',
+};
+const SMALL_LIVE_ABILITIES = {
+  smallOpen: ['open', 'view', 'find'], featureExact: ['trial', 'exactSet', 'calendarAdd'],
+  featureReplace: ['rangeReplace', 'notesTyped', 'viewNotes'], featureNotes: ['cancel', 'clientFilter', 'bulkNote'],
+  featurePicture: ['reopen', 'hover', 'picture'], featureBins: ['bins', 'calendarDelete'], cleanup: ['deleteAll'],
+};
+const WEEKLY_LIVE_ABILITIES = {
+  smallOpen: ['open', 'view', 'find'], weeklySetup: ['trial', 'weeklyAdd', 'calendarWeekly'],
+  weeklyExit: ['weeklyExit'], weeklyUndo: ['weeklyUndo'],
+  weeklyHours: ['weekFind', 'clientFilter', 'lowerRemove', 'calendarSubmit', 'partWeek'],
+  weeklyPicture: ['reopen', 'picture'], cleanup: ['deleteAll'],
+};
+function liveAbilities(design, steps = [], proofs = {}) {
+  const table = design === 'daily7' ? SMALL_LIVE_ABILITIES : design === 'weekly7' ? WEEKLY_LIVE_ABILITIES : null;
+  if (!table) return [];
+  return Object.entries(table).flatMap(([stepId, ids]) => {
+    const step = steps.find(one => one.id === stepId);
+    return ids.map(id => {
+      const proof = proofs[id];
+      if (proof?.state === 'passed') return { id, step: stepId, verdict: 'PASS' };
+      if (proof?.state === 'notOffered' || !step || ['notExercised', 'running'].includes(step.state) && proof?.state !== 'failed') return { id, step: stepId, verdict: 'Not exercised' };
+      return { id, step: stepId, verdict: 'FAIL', part: Object.hasOwn(LIVE_ABILITY_PARTS, proof?.part) ? proof.part : 'notProved' };
+    });
+  });
+}
 const SMALL_TAX_STEPS = {
   taxEmpty: 'Open, read and check empty span', taxAdd: 'Add LOA, DNS, Holiday and Replace',
   taxHours: 'Lower and restore saved Hours', taxPartial: 'Partial-week apply and Undo',
@@ -11698,6 +12574,11 @@ __exports.LIVE_TEST_PARTS = LIVE_TEST_PARTS;
 __exports.testPart = testPart;
 __exports.SMALL_LIVE_STEPS = SMALL_LIVE_STEPS;
 __exports.WEEKLY_LIVE_STEPS = WEEKLY_LIVE_STEPS;
+__exports.LIVE_ABILITIES = LIVE_ABILITIES;
+__exports.LIVE_ABILITY_PARTS = LIVE_ABILITY_PARTS;
+__exports.SMALL_LIVE_ABILITIES = SMALL_LIVE_ABILITIES;
+__exports.WEEKLY_LIVE_ABILITIES = WEEKLY_LIVE_ABILITIES;
+__exports.liveAbilities = liveAbilities;
 __exports.SMALL_TAX_STEPS = SMALL_TAX_STEPS;
 __exports.TAX_LIVE_STEPS = TAX_LIVE_STEPS;
 __exports.TAX_LIVE_FINDINGS = TAX_LIVE_FINDINGS;
@@ -11708,6 +12589,7 @@ __exports.taxLiveReport = taxLiveReport;
 "mysource/live-test.js": function (__require, __exports, document, window) {
 'use strict';
 const { stageNotes, stageRemoval } = __require("./note-stage.js");
+const { calendarBefore, calendarShowsChange, calendarShowsDelete } = __require("./calendar-check.js");
 const { createLiveGroups } = __require("./live-groups.js");
 const { createLivePictures } = __require("./live-pictures.js");
 const { PageError, setBatchGuard, shown, click, settled, text, waitFor, WAIT, closeWindow, cleanupAfter } = __require("./dom.js");
@@ -11718,21 +12600,19 @@ const { sessionExpired, cancelBatchWindows } = __require("./batch.js");
 const { copyWindow, compareCopies, dayOf, entriesToAdd, knownAssignmentRows } = __require("./copy.js");
 const { isEditableDay } = __require("./editability.js");
 const { calendarDates, showDate } = __require("./calendar.js");
-const { addAssignment, deleteAll, deleteRange, refreshNotes, preflightDates, setAssignmentHours, splitDeleteWeeks, saveStagedNotes, weekRuns } = __require("./write.js");
+const { addAssignment, deleteAll, deleteFromTable, refreshNotes, preflightDates, setAssignmentHours, weekRuns } = __require("./write.js");
 const { restoreWindow } = __require("./restore.js");
 const { addDays, compareDays, mondayOf, todayOf, usDate, workingDays } = __require("../rules/dates.js");
 const { inside } = __require("../rules/leaves.js");
 const { readSite, isTaxPage } = __require("./site.js");
-const { valueKey, addressCount } = __require("../rules/prepare.js");
+const { valueKey, addressCount, noteTextKey } = __require("../rules/prepare.js");
 const { entryKind } = __require("../rules/entries.js");
 const { planTaxWeeks } = __require("../rules/tax-weeks.js");
-const { apply, prepare, restore, recover, BACKUP_KIND } = __require("../run/work.js");
-const { backupFileSheets, readBackupFile } = __require("../files/backup-file.js");
-const { xlsxBytes } = __require("../files/xlsx-writer.js");
+const { apply, prepare, restore, BACKUP_KIND } = __require("../run/work.js");
 const { taxRestorePlan } = __require("./tax-restore.js");
 const { taxTestPeriod, smallTestPeriod } = __require("../run/live-proof.js");
 const { termDayOf } = __require("../rules/shared.js");
-const { setRunRecorder, timedRun, recordRun, STAGES, WINDOWS, FIELDS, REASON_CODES } = __require("../core/run-records.js");
+const { setRunRecorder, observeRun, timedRun, recordRun, STAGES, WINDOWS, FIELDS, REASON_CODES } = __require("../core/run-records.js");
 const { auditTestPeriod } = __require("../run/audit-live-test.js");
 const { decideExit } = __require("../rules/exit.js");
 const { readNotification } = __require("../servicenow/tickets.js");
@@ -11829,7 +12709,7 @@ async function cancelLiveWindows() {
     for (const edit of openEdits().reverse()) await closeEdit(edit);
     await cancelBatchWindows();
     if (openEdits().length) throw new PageError('Edit Assignment could not be closed safely.');
-    await pageReady('live test cleanup');
+    await pageReady('live test cleanup', WAIT.person, { purpose: 'liveCleanup' });
   } catch (error) { error.pageBlocked = true; throw error; }
 }
 function liveTestPage(options = {}) {
@@ -12303,20 +13183,19 @@ function auditLivePage(today, small = false) {
     if (!scope || !inside(range.start, scope) || !inside(range.end, scope) || compareDays(range.start, range.end) > 0) throw new PageError('Outside the approved A&A period.');
   };
   let writeSeq = 0, deleteProof = null;
-  const read = async () => { bounded(scope); const copy = await copyWindow(scope); check(); return copy; };
+  const read = async (options = {}) => { bounded(scope); const copy = await copyWindow(scope, options); check(); return copy; };
   const deleteRead = async () => { const copy = await read(); deleteProof = { copy, at: writeSeq }; return copy; };
   let fresh = false;
-  const assertKnown = async () => { if (fresh && !pending) { check(); return known; } const actual = await read(); if (!matches(known, actual)) throw new PageError('The owned A&A test rows changed.'); fresh = true; return actual; };
+  const assertKnown = async () => {
+    if (fresh && !pending && !chain.length) { check(); return known; }
+    const actual = await read();
+    if (chain.length) return proveChain(actual);
+    if (!matches(known, actual)) throw new PageError('The owned A&A test rows changed.'); fresh = true; return actual;
+  };
   const resolveRead = (actual, mustBeAfter = false) => {
+    if (chain.length) return proveChain(actual, !mustBeAfter);
     if (!pending ? !matches(known, actual) : !matches(pending.after, actual) && (mustBeAfter || !matches(pending.before, actual))) throw new PageError('A&A save ownership is unconfirmed.');
-    if (pending && matches(pending.after, actual)) {
-      if (smallKept && pending.renewedIds.includes(smallKept.id)) {
-        const rows = actual.days.filter(row => matches({ days: [{ ...smallKept, id: '' }] }, { days: [row] }));
-        if (rows.length !== 1) throw new PageError('The kept DNS day changed.');
-        smallKept = rows[0];
-      }
-      recordRun({type:'writeProof',ok:true,whole:true});
-    }
+    if (pending && matches(pending.after, actual)) recordRun({type:'writeProof',ok:true,whole:true});
     known = actual; pending = null; fresh = true; return actual;
   };
   const resolve = async (mustBeAfter = false) => {
@@ -12348,7 +13227,7 @@ function auditLivePage(today, small = false) {
           const clipped={start:compareDays(range.start,operation.range.start)>0 ? range.start : operation.range.start,
             end:compareDays(range.end,operation.range.end)<0 ? range.end : operation.range.end};
           bounded(clipped);
-          const staged=!!range.weekBoxes && ![...document.querySelectorAll('.bootbox-confirm')].some(shown);
+          const staged=![...document.querySelectorAll('.bootbox-confirm')].some(shown);
           const deletes=row=>inside(row.day,clipped) && (!operation.client || valueKey(row.client)===valueKey(operation.client));
           const queried=staged ? range : clipped;
           const rows={days:known.days.filter(row=>inside(row.day,queried) && (!operation.client || valueKey(row.client)===valueKey(operation.client)) && (!staged || !deletes(row)))};
@@ -12359,13 +13238,7 @@ function auditLivePage(today, small = false) {
       }
       const deletes = row => inside(row.day,deleteRange) && (!operation.client || valueKey(row.client)===valueKey(operation.client));
       const after = operation.kind === 'delete' ? known.days.filter(row=>!deletes(row)) : operation.after(known.days);
-      const savedRange = small ? staged ? editRange : operation.savedEdit ? operation.range : null : null;
-      const coveredBySave = row => savedRange && inside(row.day, savedRange)
-        && (!operation.range.clients || operation.range.clients.some(client => valueKey(client) === valueKey(row.client)))
-        && (!operation.client || valueKey(row.client) === valueKey(operation.client));
-      pending = { before: known,
-        after: { days: after.map(row => coveredBySave(row) ? { ...row, id: '' } : row) },
-        renewedIds: known.days.filter(coveredBySave).map(row => row.id) };
+      pending = { before: known, after: { days: after } };
       if (operation.kind !== 'delete' || !pending.after.days.some(row=>inside(row.day,operation.range) && (!operation.client || valueKey(row.client)===valueKey(operation.client)))) index++;
       const proveDelete = async () => {
         if (operation.kind !== 'delete') return;
@@ -12400,16 +13273,20 @@ function auditLivePage(today, small = false) {
       await deleteAll(edit, { onWrite: notice });
     }, write);
   };
-  let weeklyCheckpoint = null, weeklyGrouped = false;
-  const weeklyRead = () => withWeeklyRows(() => read());
-  const weeklyAdd = async (entry, write) => { bounded(entry); await addAssignment(entry, 'Normal', { onWrite: write, weekly: true }); };
-  const weeklyExpect = (copy, rows, message) => {
-    const want = rows.map(([offset, client, hours]) => `${usDate(addDays(scope.start, offset))} ${client} ${hours}`).sort();
-    const got = copy.days.map(row => `${usDate(mondayOf(row.day))} ${row.client} ${row.hours}`).sort();
-    if (want.join('|') !== got.join('|')) throw new PageError(message);
+  let weeklyCheckpoint = null, weeklyGrouped = false, weeklyMode = false;
+  const day = offset => addDays(scope.start, offset);
+  const weeklyRead = (options = {}) => withWeeklyRows(() => read(options));
+  const featureRead = (options = {}) => weeklyMode ? weeklyRead(options) : read(options);
+  const weekRows = entry => {
+    const rows = [];
+    for (let from = entry.start; compareDays(from, entry.end) <= 0; from = addDays(mondayOf(from), 7)) {
+      const friday = addDays(mondayOf(from), 4), to = compareDays(friday, entry.end) < 0 ? friday : entry.end;
+      rows.push({ ...entryRows({ ...entry, dates: undefined, start: from, end: from })[0], hours: workingDays(from, to).length * entry.hoursPerDay });
+    }
+    return rows;
   };
   const weeklyEmpty = async write => {
-    known = await weeklyRead();
+    known = await weeklyRead(); chain = [];
     if (!known.days.length) return;
     await withWeeklyRows(async () => {
       const edit = await findAssignments(scope);
@@ -12422,19 +13299,79 @@ function auditLivePage(today, small = false) {
     known = await weeklyRead();
     if (known.days.length) throw new PageError('Weekly span is not empty.');
   };
-  const throughBackupFile = async record => {
-    const rows = [{ state: 'done', diagnostic: { changeAttempted: true }, prepared: { backup: record },
-      one: { record: { number: 'diagnostic', email, notification: { kind: 'loa' }, person: { professional: record.professional } } } }];
-    const bytes = xlsxBytes(backupFileSheets(rows, 'live test'));
-    const read = await readBackupFile({ name: 'Snooze backup live test.xlsx', arrayBuffer: async () => new Blob([bytes]).arrayBuffer() });
-    if (read.length !== 1 || emailKey(read[0].email) !== emailKey(email) || read[0].backup.days.length !== record.days.length) throw new PageError('The backup file did not read back.');
-    return { ...read[0].backup, diagnostic: true };
+  const smallNote = 'Snooze small live test', refreshedNote = smallNote + ' refreshed';
+  let chain = [], rowNumbers = null, rowNumbersRefused = false;
+  const proofs = {};
+  const prove = (id, state, part = null) => { if (proofs[id]?.state !== 'failed') proofs[id] = { state, ...(part ? { part } : {}) }; };
+  const lastModel = () => chain.at(-1)?.after || known;
+  const coveredIds = (rows, covered) => rows.filter(covered).map(row => row.id).filter(Boolean);
+  const planWrite = (days, { abilities = [], renewed = [] } = {}) => {
+    check(); fresh = false; writeSeq++; deleteProof = null;
+    const entry = { after: { days }, abilities, renewed, calendar: null };
+    chain.push(entry); return entry;
   };
-  const smallNote = 'Snooze small live test';
-  let smallCheckpoint = null, smallKept = null, smallKeptOriginalId = null;
-  const smallKeep = () => {
-    const row = known.days.find(row => row.id === smallKept?.id);
-    if (!row || !matches({ days: [smallKept] }, { days: [row] })) throw new PageError('The kept DNS day changed.');
+  function proveChain(actual, cleanup = false) {
+    const states = [known, ...chain.map(one => one.after)];
+    let hit = matches(states.at(-1), actual) ? states.length - 1 : -1;
+    if (hit < 0 && cleanup) for (let index = states.length - 2; index >= 0 && hit < 0; index--) if (matches(states[index], actual)) hit = index;
+    if (hit < 0) {
+      if (!cleanup) for (const one of chain) {
+        for (const id of one.abilities) prove(id, 'failed', 'findDisagreed');
+        if (one.calendar) prove(one.calendar.id, 'failed', one.calendar.ok ? 'findDisagreed' : one.calendar.part);
+      }
+      throw new PageError('A&A save ownership is unconfirmed.');
+    }
+    if (hit === states.length - 1 && chain.length) {
+      for (const one of chain) {
+        for (const id of one.abilities) prove(id, 'passed');
+        if (one.calendar) prove(one.calendar.id, one.calendar.ok ? 'passed' : 'failed', one.calendar.ok ? null : one.calendar.part);
+        if (one.renewed.length) rowNumbers = rowNumbers === 'changed' || one.renewed.some(id => !actual.days.some(row => row.id === id)) ? 'changed' : 'kept';
+      }
+      recordRun({ type: 'writeProof', ok: true, whole: true });
+    }
+    known = actual; chain = []; fresh = true; return actual;
+  }
+  const calendarCheck = async (id, run) => {
+    let part = null, ok = false;
+    const stop = observeRun(event => { if (event.type === 'calendarCheck' && event.ok === false) part = event.part; });
+    try { ok = await run(); } finally { stop(); }
+    const entry = chain.at(-1);
+    if (entry) entry.calendar = { id, ok, part: ok ? null : part || 'unreadable' };
+    return ok;
+  };
+  const keptOpen = async (copy, action) => {
+    const edit = knownAssignmentRows(copy).edit;
+    try { return await action(edit); }
+    catch (error) { if (edit?.isConnected && shown(edit) && !error.addPressed) await cleanupAfter(error, () => closeEdit(edit)); throw error; }
+  };
+  const noteText = (copy, client, at) => noteTextKey(copy.days.find(row => row.client === client && sameDay(row.day, at))?.noteText || '');
+  const plainPicture = async () => {
+    const one = { record: { email, person: { professional: identity.name.split('(')[0].trim() }, subcategory: { business: 'audit' } },
+      decision: { plan: { action: 'dns', dnsStart: scope.start, dnsEnd: scope.end, withoutNotes: true } } };
+    const row = { state: 'done', one, prepared: { identity }, after: { window: scope, days: lastModel().days }, diagnostic: { steps: [], paint: [] } };
+    try {
+      await capturePerson(row, { alreadyOpen: true, identity }); check();
+      const shots = one.outputs?.screenshots || [];
+      if (!shots.length || one.outputs.warnings || lastPicture.notesPainted || row.diagnostic.paint.length) throw new PageError('The plain A&A picture was not proved.');
+      prove('picture', 'passed');
+      return { kind: 'audit', views: shots.length, bytes: shots.reduce((sum, blob) => sum + blob.size, 0), notesPainted: false, omissions: [] };
+    } finally { if (one.outputs) one.outputs.screenshots = []; }
+  };
+  const reopen = async () => {
+    check(); await withReopen(() => openPerson(email)); check(); prove('reopen', 'passed');
+  };
+  const featureClear = async write => {
+    check();
+    const copy = await featureRead({ keepOpen: true });
+    let found = null;
+    await keptOpen(copy, async edit => {
+      proveChain(copy);
+      if (!copy.days.length) { await closeEdit(edit); return; }
+      await deleteFromTable(edit, scope, copy, { read: async () => (found = await featureRead()),
+        onWrite: async () => { planWrite([], { abilities: ['deleteAll'] }); await write(); } });
+    });
+    if (found) proveChain(found);
+    if (known.days.length) throw new PageError('A&A span is not empty.');
   };
   return {
     diagnosticState: liveDiagnosticState,
@@ -12452,196 +13389,204 @@ function auditLivePage(today, small = false) {
       return () => { stop(); release?.(); release = null; };
     },
     setStep(id) { step = id; },
-    async smallExit(write) {
-      await clear(write);
-      await add(LOA, { start: scope.start, end: addDays(scope.start, 1) }, 8, '', write);
-      const before = await assertKnown();
-      const person = { professional: identity.name.split('(')[0].trim(), business: 'Consulting Services', region: 'US - US', resourceManager: 'Planner, Invented', termDate: scheduleFacts().termDate || '12/31/9999' };
-      const lwd = addDays(scope.start, -3);
-      const record = { number: 'diagnostic', email, person, subcategory: { business: 'consulting', kind: 'exit' },
-        notification: readNotification(`Date of resignation: ${usDate(addDays(lwd, -7))}\nPlanned last working day: ${usDate(lwd)}`) };
-      const entries = before.days.map(row => ({ ...row, email: emailKey(email), days: [{ day: row.day, hours: row.hours }], fields: {} }));
-      const slice = { status: 'ready', mode: 'day', entries, backupEntries: entries, person, resourceManager: person.resourceManager, reportEnd: scope.end, liveScope: true };
-      const exit = { record, slice, decision: decideExit(record, scope.start, slice) };
-      if (!exit.decision.plan || exit.decision.byHand) throw new PageError('The production Consulting decision was not proved.');
-      exit.decision.plan.dnsEnd = addDays(scope.start, 1);
-      const ready = await withReopen(() => prepare(exit, 'diagnostic', scope.start));
-      if (ready.stop || !ready.backup) throw new PageError('The production Consulting Exit was not prepared.');
-      const done = await withReopen(() => apply(exit, ready, { onWrite: write, step: fn => fn() }));
-      if (!done.ok) throw new PageError('The production Consulting Exit result was not proved.');
-      known = await read(); fresh = true;
-      const dns = workingDays(scope.start, addDays(scope.start, 1));
-      if (known.days.length !== dns.length || known.days.some(row => row.client !== DNS || row.hours !== 8)) throw new PageError('The Consulting Exit did not leave DNS on the two days.');
-      const back = await withReopen(() => recover(ready.backup, { today: scope.start, identity, after: done.after, onWrite: write }));
-      known = await read(); fresh = true;
-      if (!back.same || !matches({ days: before.days.map(row => ({ ...row, id: '', notes: 0 })) }, known)) throw new PageError('The automatic put-back did not bring the LOA back.');
-      return { productionExit: true, putBack: true };
-    },
+    featureProofs() { return structuredClone(proofs); },
+    featureRowNumbers() { return rowNumbers ? rowNumbersRefused ? 'changedRefused' : rowNumbers : null; },
     async smallStart(typedEmail, window) {
       const found = await this.auditStart(typedEmail, window);
+      for (const id of ['open', 'view', 'find']) prove(id, 'passed');
+      weeklyMode = !!found?.week;
       return found?.week ? { weekly: true } : {};
     },
-    async weeklySetup(write) {
-      const setup = { start: addDays(scope.start, 14), end: addDays(scope.start, 32) };
-      const held = await preflightDates(workingDays(setup.start, setup.end), { anchor: setup.start,
-        trial: { ...setup, hoursPerDay: 4, label: 'DNS' } });
-      weeklyGrouped = !!held?.grouped;
-      for (const run of weekRuns(setup.start, setup.end, weeklyGrouped))
-        await weeklyAdd({ ...run, client: DNS, hoursPerDay: 4, billable: 'Non-Billable', utilization: 'No', notes: '' }, write);
-      weeklyCheckpoint = await weeklyRead();
-      weeklyExpect(weeklyCheckpoint, [[14, DNS, 20], [21, DNS, 20], [28, DNS, 20]], 'The Weekly setup was not saved as three weeks of 20 h.');
-      return { weeks: 3 };
+    async featureExact(write) {
+      check();
+      const set = [day(0), day(2), day(8)];
+      const entry = { client: DNS, start: set[0], end: set.at(-1), dates: set, hoursPerDay: 8, billable: 'Non-Billable', utilization: 'No', notes: '' };
+      const trial = await preflightDates(set, { anchor: set[0], entries: [entry], keepOpen: true });
+      const entries = trial.exact ? [entry] : set.map(one => ({ ...entry, start: one, end: one, dates: undefined }));
+      if (!trial.exact) prove('exactSet', 'notOffered');
+      const shot = calendarBefore(today);
+      for (const [index, one] of entries.entries()) {
+        bounded(one);
+        await addAssignment(one, 'Normal', { ...(index === 0 && trial.modal ? { preflightForm: trial.modal } : {}),
+          onWrite: async () => { bounded(one); planWrite([...lastModel().days, ...entryRows(one)], { abilities: index === 0 ? ['trial', ...(trial.exact ? ['exactSet'] : [])] : [] }); await write(); } });
+      }
+      const calendar = await calendarCheck('calendarAdd', () => calendarShowsChange(shot, set.map(one => ({ day: one, client: DNS, hours: 8 })), known.days, today));
+      proveChain(await read());
+      return { exactSet: trial.exact, calendar };
     },
-    async weeklyTable(write) {
-      const before = await weeklyRead();
-      if (!matches(weeklyCheckpoint, before)) throw new PageError('The Weekly setup changed before the table edit.');
-      const span = { start: addDays(scope.start, 14), end: addDays(scope.start, 32), weekEndFriday: true };
-      const inWeek = offset => row => sameDay(mondayOf(row.day), addDays(scope.start, offset));
-      const target = before.days.find(inWeek(14));
-      const remove = before.days.filter(row => inWeek(21)(row) || inWeek(28)(row));
-      if (!target || remove.length !== 2) throw new PageError('The Weekly table rows are unreadable.');
-      await withWeeklyRows(() => setAssignmentHours(span, before, target, 12, { onWrite: write, weekly: true, remove }));
-      const after = await weeklyRead();
-      weeklyExpect(after, [[14, DNS, 12]], 'The Weekly table edit was not saved as one 12 h week.');
-      await withWeeklyRows(() => setAssignmentHours(span, after, after.days[0], 20, { onWrite: write, weekly: true, restoring: true }));
-      for (const run of weekRuns(addDays(scope.start, 21), addDays(scope.start, 32), weeklyGrouped))
-        await weeklyAdd({ ...run, client: DNS, hoursPerDay: 4, billable: 'Non-Billable', utilization: 'No', notes: '' }, write);
-      weeklyCheckpoint = await weeklyRead();
-      weeklyExpect(weeklyCheckpoint, [[14, DNS, 20], [21, DNS, 20], [28, DNS, 20]], 'The Weekly table edit was not put back.');
-      return { rowsRemoved: 2, hoursLowered: true, putBack: true };
+    async featureReplace(write) {
+      check();
+      const range = { start: day(2), end: day(11) };
+      const entry = { ...range, client: LOA, hoursPerDay: 8, notes: smallNote, billable: 'Non-Billable', utilization: 'No' };
+      const trial = await preflightDates(workingDays(range.start, range.end), { anchor: range.start, keepOpen: true });
+      bounded(range);
+      await addAssignment(entry, 'Replace', { ...(trial.modal ? { preflightForm: trial.modal } : {}), onWrite: async () => {
+        bounded(range); planWrite([...lastModel().days.filter(row => !inside(row.day, range)), ...entryRows(entry)], { abilities: ['rangeReplace', 'notesTyped'] }); await write();
+      } });
+      const copy = await read({ keepOpen: true, noteRows: [{ day: range.start, client: LOA }] });
+      await keptOpen(copy, async edit => {
+        proveChain(copy);
+        if (noteText(copy, LOA, range.start) !== noteTextKey(smallNote)) { prove('viewNotes', 'failed', 'textDiffers'); throw new PageError('The View Notes text differs from the note added.'); }
+        prove('viewNotes', 'passed');
+        const loa = copy.days.filter(row => row.client === LOA);
+        const staged = await stageRemoval(edit, { days: knownAssignmentRows(copy).rows }, loa.slice(1, 3));
+        const cancels = [...staged.edit.querySelectorAll('button')].filter(node => shown(node) && text(node) === 'Cancel' && !node.disabled);
+        if (cancels.length !== 1) throw new PageError('The staged Cancel button is unclear.');
+        fresh = false; await click(cancels[0]);
+        await waitFor(() => !staged.edit.isConnected || !shown(staged.edit), 'the staged Cancel to close', WAIT.window);
+        check();
+      });
+      return { replaced: true, viewNotes: true, cancelStaged: true };
+    },
+    async featureNotes(write) {
+      check();
+      const query = { start: day(2), end: day(11), clients: [LOA] };
+      const rows = known.days.filter(row => row.client === LOA && inside(row.day, query));
+      const remove = rows.filter(row => sameDay(row.day, day(2)));
+      if (rows.length !== 8 || remove.length !== 1) throw new PageError('The note refresh checkpoint is unreadable.');
+      const covered = row => row.client === LOA && inside(row.day, query);
+      const saved = await refreshNotes(query, { days: rows }, refreshedNote, { remove, onWrite: async () => {
+        prove('cancel', 'passed'); prove('clientFilter', 'passed');
+        const kept = known.days.filter(row => row.id !== remove[0].id);
+        planWrite(kept.map(row => covered(row) ? { ...row, id: '' } : row), { abilities: ['bulkNote'], renewed: coveredIds(kept, covered) });
+        await write();
+      } });
+      if (!saved) throw new PageError('The note refresh was refused. Nothing was saved.');
+      return { notesRefreshed: true, binned: 1 };
+    },
+    async featurePicture() {
+      await reopen();
+      const pictures = createLivePictures({ today, scope: () => scope, identity: () => identity, email: () => email,
+        bounded: async range => bounded(range), checked: async () => check(), assertSame: async () => check() });
+      const hover = await pictures.diagnosticPicture(LOA, { window: scope, days: lastModel().days }, refreshedNote);
+      prove('hover', 'passed');
+      const plain = await plainPicture();
+      await showDate(scope.start, { cellProof: true }); check();
+      return [{ kind: 'loa', ...hover }, plain];
+    },
+    async featureBins(write) {
+      check();
+      const copy = await read({ keepOpen: true, noteRows: [{ day: day(3), client: LOA }] });
+      let targets, kept, retained, found = null, entry = null, shot = null;
+      try {
+        await keptOpen(copy, async edit => {
+          proveChain(copy);
+          if (noteText(copy, LOA, day(3)) !== noteTextKey(refreshedNote)) { prove('bulkNote', 'failed', 'textDiffers'); throw new PageError('The refreshed note text was not proved.'); }
+          kept = copy.days.filter(row => row.client === DNS);
+          targets = copy.days.filter(row => row.client === LOA && compareDays(row.day, day(9)) <= 0);
+          if (kept.length !== 1 || !sameDay(kept[0].day, day(0)) || targets.length !== 5) throw new PageError('The bins checkpoint is unreadable.');
+          retained = { days: copy.days.filter(row => !targets.includes(row)) };
+          shot = calendarBefore(today);
+          await deleteFromTable(edit, scope, copy, { onlyIds: new Set(targets.map(row => row.id)), protectedRows: kept,
+            onWrite: async () => {
+              entry = planWrite(retained.days.map(row => ({ ...row, id: '' })), { abilities: ['bins'], renewed: retained.days.map(row => row.id) });
+              await write(); check();
+              await ownedDeleteEdit(() => ({ rows: retained }), matches);
+            },
+            read: async removed => {
+              if (await calendarCheck('calendarDelete', () => calendarShowsDelete(shot, removed, copy.days, today))) return { ...copy, window: knownAssignmentRows(copy).range, days: knownAssignmentRows(copy).rows.filter(row => !targets.includes(row)) };
+              return (found = await read());
+            } });
+        });
+      } catch (error) {
+        if (!found || !entry || chain.at(-1) !== entry) throw error;
+        proveChain(found); rowNumbersRefused = true;
+      }
+      if (found && chain.length) proveChain(found);
+      return { binned: targets.length, keptDns: true };
+    },
+    featureClear,
+    async weeklySetup(write) {
+      check();
+      const setup = { start: day(14), end: day(32) };
+      const held = await preflightDates(workingDays(setup.start, setup.end), { anchor: setup.start,
+        trial: { ...setup, hoursPerDay: 4, label: 'DNS' }, keepOpen: true });
+      weeklyGrouped = !!held?.grouped;
+      const shot = calendarBefore(today);
+      let first = true;
+      for (const run of weekRuns(setup.start, setup.end, weeklyGrouped)) {
+        const entry = { ...run, client: DNS, hoursPerDay: 4, billable: 'Non-Billable', utilization: 'No', notes: '' };
+        bounded(entry);
+        await addAssignment(entry, 'Normal', { weekly: true, ...(first && held?.modal ? { preflightForm: held.modal } : {}),
+          onWrite: async () => { bounded(entry); planWrite([...lastModel().days, ...weekRows(entry)], { abilities: ['trial', 'weeklyAdd'] }); await write(); } });
+        first = false;
+      }
+      const calendar = await calendarCheck('calendarWeekly', () => calendarShowsChange(shot, [14, 21, 28].map(offset => ({ day: day(offset), client: DNS, hours: 20 })), known.days, today));
+      return { weeks: 3, calendar };
     },
     async weeklyExit(write) {
-      known = weeklyCheckpoint;
+      const setup = lastModel();
       const person = { professional: identity.name.split('(')[0].trim(), business: 'Audit & Assurance', region: 'US - US', resourceManager: 'Planner, Invented', termDate: scheduleFacts().termDate || '12/31/9999' };
       const lwd = addDays(scope.start, 16);
       const record = { number: 'diagnostic', email, person, subcategory: { business: 'audit', kind: 'exit' },
         notification: readNotification(`Date of resignation: ${usDate(addDays(lwd, -4))}\nPlanned last working day: ${usDate(lwd)}`) };
-      const entries = known.days.map(row => ({ ...row, email: emailKey(email), days: [{ day: row.day, hours: row.hours }], fields: { 'Assign Period': 'Weekly' } }));
+      const entries = setup.days.map(row => ({ ...row, email: emailKey(email), days: [{ day: row.day, hours: row.hours }], fields: { 'Assign Period': 'Weekly' } }));
       const slice = { status: 'ready', mode: 'day', entries, backupEntries: entries, person, resourceManager: person.resourceManager, reportEnd: scope.end, liveScope: true };
       one = { record, slice, decision: decideExit(record, scope.start, slice) };
       if (!record.notification.dates.lastWorkingDay || !one.decision.plan?.withoutNotes) throw new PageError('The production A&A decision was not proved.');
       one.decision.plan.dnsEnd = addDays(scope.start, 30);
       prepared = await withReopen(() => prepare(one, 'diagnostic', scope.start));
-      if (prepared.stop || !prepared.weekly || !prepared.backup) throw new PageError('The production Weekly Exit was not prepared.');
+      if (prepared.stop || !prepared.weekly || !prepared.backup) {
+        if (chain.length) proveChain(await weeklyRead());
+        throw new PageError('The production Weekly Exit was not prepared.');
+      }
+      if (chain.length) {
+        const copy = prepared.copy;
+        proveChain(copy?.window && compareDays(copy.window.start, scope.start) <= 0 && knownAssignmentRows(copy).range?.end == null
+          ? { window: scope, days: copy.days.filter(row => inside(row.day, scope)) } : await weeklyRead());
+      }
+      weeklyCheckpoint = known;
       applied = await withReopen(() => apply(one, prepared, { onWrite: write, step: fn => fn() }));
       if (!applied.ok) throw new PageError('The production Weekly Exit result was not proved.');
-      known = await weeklyRead();
+      check();
+      known = applied.after?.window && compareDays(applied.after.window.start, scope.start) <= 0 && compareDays(applied.after.window.end, scope.end) >= 0
+        ? { ...applied.after, window: scope, days: applied.after.days.filter(row => inside(row.day, scope)) }
+        : await weeklyRead();
+      fresh = true;
       if (!known.days.length || known.days.some(row => row.client !== DNS || compareDays(row.day, addDays(scope.start, 32)) > 0)) throw new PageError('The Weekly Exit left more than DNS to the fifth week.');
+      prove('weeklyExit', 'passed');
       return { productionPrepare: true, productionApply: true };
     },
     async weeklyUndo(write) {
       const restored = await withReopen(() => restore(prepared.backup, { today: scope.start, after: applied.after, identity, onWrite: write }));
-      known = await weeklyRead();
+      known = await weeklyRead(); fresh = true;
       if (!restored.same || !matches({ days: weeklyCheckpoint.days.map(row => ({ ...row, id: '', notes: 0 })) }, known)) throw new PageError('Weekly Undo was not proved.');
+      prove('weeklyUndo', 'passed');
       return { productionUndo: true, setupRestored: true };
     },
-    async weeklyClear(write) { await weeklyEmpty(write); },
+    async weeklyHours(write) {
+      check();
+      const inWeek = offset => row => sameDay(mondayOf(row.day), day(offset));
+      const target = known.days.filter(inWeek(21)), remove = known.days.filter(inWeek(28));
+      if (target.length !== 1 || remove.length !== 1 || target[0].hours !== 20 || remove[0].hours !== 20) throw new PageError('The Weekly hours rows are unreadable.');
+      const query = { start: day(23), end: day(30), weekEndFriday: true, clients: [DNS] };
+      const covered = row => row.client === DNS && inside(row.day, { start: day(21), end: day(32) });
+      const shot = calendarBefore(today);
+      await withWeeklyRows(() => setAssignmentHours(query, { days: known.days.filter(covered) }, [{ target: target[0], hours: 12 }], null, { weekly: true, remove,
+        onWrite: async () => {
+          const kept = known.days.filter(row => row.id !== remove[0].id).map(row => row.id === target[0].id ? { ...row, hours: 12 } : row);
+          planWrite(kept.map(row => covered(row) ? { ...row, id: '' } : row), { abilities: ['weekFind', 'clientFilter', 'lowerRemove'], renewed: coveredIds(kept, covered) });
+          await write();
+        } }));
+      const calendar = await calendarCheck('calendarSubmit', () => calendarShowsChange(shot, [{ day: day(21), client: DNS, hours: -8 }, { day: day(28), client: DNS, hours: -20 }], known.days, today));
+      const part = { start: day(31), end: day(32), client: DNS, hoursPerDay: 8, billable: 'Non-Billable', utilization: 'No', notes: '' };
+      bounded(part);
+      await addAssignment(part, 'Normal', { weekly: true, onWrite: async () => {
+        bounded(part); planWrite([...lastModel().days, ...weekRows(part)], { abilities: ['partWeek'] }); await write();
+      } });
+      return { hoursLowered: true, rowsRemoved: 1, partWeek: true, calendar };
+    },
+    async weeklyPicture() {
+      await reopen();
+      return [await plainPicture()];
+    },
     async weeklyCleanup(write, error) {
       if (!started) return 'notNeeded';
       if (error?.identityChanged || error?.session || error?.pageBlocked) return 'unconfirmed';
       await cancelLiveWindows(); check();
-      try { await weeklyEmpty(write); } catch (cleanupError) { await cancelLiveWindows(); if (cleanupError?.session || cleanupError?.identityChanged) return 'unconfirmed'; }
+      try { await weeklyEmpty(write); return known.days.length ? 'unconfirmed' : 'empty'; }
+      catch (cleanupError) { await cancelLiveWindows(); if (cleanupError?.session || cleanupError?.identityChanged) return 'unconfirmed'; }
       return (await weeklyRead()).days.length ? 'unconfirmed' : 'empty';
-    },
-    async smallAdd(write) {
-      const week = { start: scope.start, end: addDays(scope.start, 39) };
-      const next = { start: addDays(scope.start, 42), end: scope.end };
-      await add(LOA, week, 8, smallNote, write);
-      await add(DNS, next, 8, smallNote, write);
-      await add(DNS, { start: wednesday, end: wednesday }, 8, '', write);
-      smallCheckpoint = await assertKnown();
-      smallKept = known.days.find(row => sameDay(row.day, addDays(scope.start, 44)) && row.client === DNS);
-      if (!smallKept?.id || smallKept.notes !== 1) throw new PageError('The kept DNS checkpoint is unreadable.');
-      smallKeptOriginalId = smallKept.id;
-      return { blankNotesAccepted: true };
-    },
-    async smallChange(write) {
-      await assertKnown();
-      const replace = { start: addDays(scope.start, 38), end: addDays(scope.start, 39), client: DNS,
-        hoursPerDay: 8, notes: smallNote, billable: 'Non-Billable', utilization: 'No' };
-      await sequence([{ range: replace, after: before => [...before.filter(row => !inside(row.day, replace)), ...entryRows(replace)] }],
-        notice => addAssignment(replace, 'Replace', { onWrite: notice }), write);
-      const removedDay = addDays(scope.start, 37);
-      const query = { start: scope.start, end: removedDay, clients: [LOA] };
-      const rows = known.days.filter(row => row.client === LOA && inside(row.day, query));
-      const remove = rows.filter(row => sameDay(row.day, removedDay));
-      if (rows.length !== 28 || remove.length !== 1) throw new PageError('The combined reduction checkpoint is unreadable.');
-      await sequence([{ range: query, savedEdit: true, after: before => before.filter(row => !remove.some(old => old.id === row.id)) }],
-        notice => refreshNotes(query, { days: rows }, smallNote + ' refreshed', { remove, onWrite: notice }), write);
-      await assertKnown();
-      const cancelQuery = { start: scope.start, end: addDays(scope.start, 4), clients: [LOA] };
-      const cancelRows = known.days.filter(row => row.client === LOA && inside(row.day, cancelQuery));
-      const staged = await stageNotes(cancelQuery, { days: cancelRows }, 'Snooze small discarded note', { remove: cancelRows.slice(1) });
-      if (!staged) throw new PageError('The Cancel stage could not be proved.');
-      const cancels = [...staged.edit.querySelectorAll('button')].filter(node => shown(node) && text(node) === 'Cancel' && !node.disabled);
-      if (cancels.length !== 1) throw new PageError('The staged Cancel button is unclear.');
-      fresh = false; await click(cancels[0]);
-      await waitFor(() => !staged.edit.isConnected || !shown(staged.edit), 'the staged Cancel to close', WAIT.window);
-      await assertKnown(); smallKeep(); return { combinedReduction: true, cancelUnchanged: true };
-    },
-    async smallDelete(write) {
-      fresh = false; await assertKnown(); smallKeep();
-      const ranges = [{ start: scope.start, end: addDays(smallKept.day, -1) }, { start: addDays(smallKept.day, 1), end: scope.end }];
-      let weekBoxes = false;
-      for (const range of ranges) {
-        for (const part of splitDeleteWeeks(range)) {
-          await sequence([deleteOp(part)], async notice => {
-            const edit = await findAssignments({ ...part, weekEndFriday: true });
-            const found = findAssignmentsRange(edit);
-            weekBoxes ||= !!found?.weekBoxes;
-            if (found?.weekBoxes && part.partial) {
-              const expected = { days: known.days.filter(row => inside(row.day, found)) };
-              const targets = expected.days.filter(row => inside(row.day, part));
-              if (targets.some(row => row.id === smallKept.id)) {
-                await closeEdit(edit); throw new PageError('The small delete exceeds its owned days.');
-              }
-              await saveStagedNotes(await stageRemoval(edit, expected, targets), notice);
-            } else await deleteRange(part, known, { edit, read: deleteRead, protectedRows: [smallKept],
-              validate: async () => { check(); }, onWrite: notice });
-          }, write);
-        }
-        smallKeep();
-      }
-      if (known.days.length !== 1) throw new PageError('The delete left unexpected rows.');
-      return { keptId: true, keptNotes: true, partWeek: weekBoxes };
-    },
-    async smallPicture() {
-      await assertKnown(); smallKeep();
-      const pictures = createLivePictures({ today, scope: () => scope, identity: () => identity, email: () => email,
-        bounded: async range => bounded(range), checked: async () => check(), assertSame: async expected => {
-          if (!matches(expected, await read())) throw new PageError('The picture checkpoint changed.');
-        } });
-      const hover = await pictures.diagnosticPicture(DNS, known, smallNote);
-      const one = { record: { email, person: { professional: identity.name.split('(')[0].trim() }, subcategory: { business: 'audit' } },
-        decision: { plan: { action: 'dns', dnsStart: scope.start, dnsEnd: scope.end, withoutNotes: true } } };
-      const row = { state: 'done', one, prepared: { identity }, after: known, diagnostic: { steps: [], paint: [] } };
-      try {
-        await capturePerson(row, { alreadyOpen: true, identity }); check(); await assertKnown();
-        const shots = one.outputs?.screenshots || [];
-        if (!shots.length || one.outputs.warnings || lastPicture.notesPainted || row.diagnostic.paint.length) throw new PageError('The plain A&A picture was not proved.');
-        return [{ kind: 'dns', ...hover }, { kind: 'audit', views: shots.length,
-          bytes: shots.reduce((sum, blob) => sum + blob.size, 0), notesPainted: false, omissions: [] }];
-      } finally { if (one.outputs) one.outputs.screenshots = []; }
-    },
-    async smallUndo(write) {
-      await assertKnown(); smallKeep();
-      const ranges = [{ start: scope.start, end: addDays(smallKept.day, -1) }, { start: addDays(smallKept.day, 1), end: scope.end }];
-      const missing = smallCheckpoint.days.filter(row => row.id !== smallKeptOriginalId);
-      const exactEntries = ranges.flatMap(range => entriesToAdd({ days: missing.filter(row => inside(row.day, range)) }, { exact: true }).entries);
-      const capability = await preflightDates(missing.map(row => row.day), { anchor: scope.start, entries: exactEntries });
-      const operations = ranges.flatMap(range => entriesToAdd({ days: missing.filter(row => inside(row.day, range)) }, { exact: capability.exact }).entries.map(addOp));
-      const record = { kind: BACKUP_KIND, email, professional: identity.name.split('(')[0].trim(),
-        window: scope, days: smallCheckpoint.days, plan: { action: 'add' } };
-      const backup = await throughBackupFile(record);
-      const after = known;
-      const restored = await sequence(operations, notice => restoreWindow(backup, { today, identity, after,
-        verifyBefore: async actual => {
-          bounded(actual.window); const expected = pending?.after || known;
-          if (!matches({ days: expected.days.filter(row => inside(row.day, actual.window)) }, actual)) throw new PageError('The small Undo table changed.');
-        }, onWrite: notice }), write);
-      const expected = { days: smallCheckpoint.days.map(row => row.id === smallKeptOriginalId ? smallKept : { ...row, id: '', notes: 0 }) };
-      if (!restored.same || restored.skippedLater?.length || !matches(expected, known)) throw new PageError('The small backup was not restored.');
-      smallKeep(); return { backupRestored: true, fromBackupFile: true };
     },
     async auditStart(typedEmail, window) {
       if (scope || !String(typedEmail || '').trim() || addressCount(typedEmail) > 1) throw new PageError('Enter one test professional.');
@@ -12728,7 +13673,7 @@ function auditLivePage(today, small = false) {
       if (!restored.same || restored.skippedLater?.length || !matches({ days: checkpoint.days.map(row => ({ ...row, id: '', notes: 0 })) }, known)) throw new PageError('A&A Undo was not proved.');
       return { productionUndo: true, setupRestored: true };
     },
-    async auditClear(write) { await clear(write); if ((await read()).days.length) throw new PageError('A&A span is not empty.'); },
+    async auditClear(write) { await clear(write); if (known.days.length) throw new PageError('A&A span is not empty.'); },
     async auditCleanup(write, error) {
       fresh = false;
       if (!started) return 'notNeeded';
@@ -12736,13 +13681,13 @@ function auditLivePage(today, small = false) {
       await cancelLiveWindows(); check(); await resolve();
       try { await clear(write); }
       catch (error) { await cancelLiveWindows(); await resolve(); if (known.days.length) throw error; }
-      return (await read()).days.length ? 'unconfirmed' : 'empty';
+      return known.days.length ? 'unconfirmed' : 'empty';
     },
     auditOutstanding(cleanup) {
       if (!started) return [];
-      const rows = pending ? [...pending.before.days, ...pending.after.days] : known?.days || [];
+      const rows = pending ? [...pending.before.days, ...pending.after.days] : [...known?.days || [], ...chain.flatMap(one => one.after.days)];
       if (cleanup === 'unconfirmed') return workingDays(scope.start, scope.end).map(day => ({ date: usDate(day), rows: null }));
-      return [...new Set(rows.map(row => usDate(row.day)))].sort().map(date => ({ date, rows: pending ? null : rows.filter(row => usDate(row.day) === date).length }));
+      return [...new Set(rows.map(row => usDate(row.day)))].sort().map(date => ({ date, rows: pending || chain.length ? null : rows.filter(row => usDate(row.day) === date).length }));
     },
   };
 }
@@ -13020,7 +13965,7 @@ function createLivePictures(context) {
       await assertSame(copy, copy.window);
       const start = days[0].day, end = days.at(-1).day;
       await showDate(start, { cellProof: true }); await checked();
-      const hover = await hoverNotePicture(client, copy.days, notes);
+      const hover = await hoverNotePicture(client, copy.days, notes, start);
       try {
         if (!hoverNotes(hover.tooltip.textContent).some(words => noteTextKey(words) === noteTextKey(notes))) throw new PageError('The actual hover note differs from the diagnostic notification.');
       } finally { hover.cleanup(); }
@@ -13346,6 +14291,7 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
   work.setScreenTitle?.(mode === 'tax' ? 'Tax live test · 2028' : 'Live test · 2028'); work.refreshClockControls = null;
   const panel = body.closest('.panel'); panel?.classList.add('restore-open');
   const originalWidth = panel?.style.width || '';
+  const originalMinWidth = panel?.style.minWidth || '';
   let result = null, active = false, slow = false, notice = '', photo = false;
   const email = el('input', { type: 'email', autocomplete: 'off', placeholder: 'Professional email', 'aria-label': 'Professional email' });
   const box = el('div', { class: 'restore-screen' }); body.replaceChildren(box);
@@ -13353,7 +14299,9 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     if (active) return;
     const leave = () => {
       work.liveTest = null;
-      panel?.classList.remove('restore-open'); if (panel) panel.style.width = originalWidth; work.setScreenTitle?.(''); onBack();
+      panel?.classList.remove('restore-open');
+      if (panel) { panel.style.width = originalWidth; panel.style.minWidth = originalMinWidth; }
+      work.setScreenTitle?.(''); onBack();
     };
     if (result && !work.liveTest?.saved) newBatchPopup({ ...work, saved: false }, leave);
     else leave();
@@ -13398,14 +14346,17 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
   } }, 'Download log');
   function draw() {
     const scroll = box.querySelector('.restore-list')?.scrollTop || 0;
-    if (panel) panel.style.width = photo ? 'min(1280px, calc(100vw - 32px))' : originalWidth;
-    box.style.overflow = photo ? 'auto' : '';
+    const small = photo && result && (['daily7','weekly7','tax5'].includes(result.design) || !Array.isArray(result.events));
+    if (panel) {
+      panel.style.width = photo ? small ? 'max-content' : 'min(1280px, calc(100vw - 32px))' : originalWidth;
+      panel.style.minWidth = small ? 'min(360px, calc(100vw - 32px))' : originalMinWidth;
+    }
+    box.style.overflow = photo ? small ? 'hidden' : 'auto' : '';
     box.replaceChildren(); email.disabled = active || !!result;
     back.disabled = active; go.disabled = active || !!result; downloadButton.disabled = active; logButton.disabled = active;
     if (photo && result && !active) {
-      const small = ['small8','weekly6','tax5'].includes(result.design) || !Array.isArray(result.events);
-      const report = small ? el('div', { role: 'region', 'aria-label': 'Photo report' },
-        el('pre', { style: 'font:13px/1.35 Consolas,monospace;white-space:pre;margin:0' }, shortLiveReport(result))) : renderPhotoReport(result);
+      const report = small ? el('div', { role: 'region', 'aria-label': 'Photo report', style: 'min-height:0;overflow:auto' },
+        el('pre', { style: 'font:13px/1.35 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;margin:0' }, shortLiveReport(result))) : renderPhotoReport(result);
       box.append(report);
       if (notice) box.append(el('div', { class: 'restore-warning', role: 'status' }, notice));
       box.append(el('div', { class: 'restore-footer' }, el('div', { class: 'buttons' }, back, downloadButton, logButton)));
@@ -13418,7 +14369,7 @@ function mountLiveTestPanel(work, body, onBack, { mode = 'consulting', page, run
     if (!result) {
       box.append(el('label', { class: 'sign-off' }, 'Professional email', email),
         el('div', { class: 'restore-notice' }, mode === 'tax' ? 'April 3–June 23, 2028 · twelve Monday–Friday weeks' : 'May 1–July 21, 2028 · twelve Monday–Friday weeks'),
-        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'Checks an empty span with LOA, DNS, Holiday and Undo, then clears its entries. Separately lowers and restores this week’s past Monday only when exactly one eligible entry is present.' : 'One Consulting and A&A test: open and read, Add, Change, Delete, Picture, Undo and Clear. Run with a Time person.'));
+        el('div', { class: 'restore-notice' }, mode === 'tax' ? 'Checks an empty span with LOA, DNS, Holiday and Undo, then clears its entries. Separately lowers and restores this week’s past Monday only when exactly one eligible entry is present.' : 'One Consulting and A&A test of each page ability: open and read, Add on exact dates, Replace, notes, bins, pictures and Clear. A Weekly person also runs the Weekly A&A Exit and its Undo.'));
     } else {
       box.append(el('div', { class: 'restore-top' }, el('strong', {}, (active ? 'Testing…' : result.state === 'complete' ? 'Tests complete' : 'Test stopped'))),
         el('div', { class: 'restore-notice' }, `${result.week.start} – ${result.week.end}`));
@@ -13497,6 +14448,13 @@ const STRUCTURES = new Set(['select[id^="ScheduleAddForm_Staff_Form_field_"]', '
 const PAGE_LIBRARIES = ['jQuery', 'Select2', 'FullCalendar', 'DataTables', 'daterangepicker', 'bootbox', 'window.moment'];
 const PAGE_SELECTORS = ['select[id^="ScheduleAddForm_Staff_Form_field_"]', '.select2-container', '.calendar-name', '.fc-view', 'td.fc-day', '.fc-event', 'div.loading', '.modal', '.bootbox', '#FindAssignmentsModal', '#editEventGridModal', '#addShiftEventModal', 'table#editGrid', 'input.shift-date-picker-dates'];
 const FIELDS = new Set(['Hours', 'Client', 'WBS', 'Billable', 'Utilization Generating', 'Job Code', 'Assign Code', 'Assign Code 1', 'Assign Code 2', 'Pricing ID', 'Notes', 'Date', 'Start Date', 'End Date', 'Clients', 'Include All Clients', 'Include All Future Assignments', 'Hours Per Day', 'Mode', 'Professional']);
+const CALM_PURPOSES = { search: 'before a new search', afterClose: 'after closing the shown person', resume: 'before Resume',
+  reusePerson: 'before reusing the shown person', searchResults: 'person search results', personLoaded: 'after choosing the person',
+  customView: 'after the Custom view change', viewChange: 'after the view change', beforePeriods: 'before No. of Periods',
+  afterPeriods: 'after No. of Periods', rightClick: 'before a right-click', coverRightClick: 'a cover before a right-click',
+  findSettle: 'Find Assignments settle', calendarCheck: 'calendar check after a change', calendarMove: 'after Go to Date',
+  liveCleanup: 'live test cleanup', recoveryDays: 'between recovery days', taxRecovery: 'between Tax recovery dates',
+  weeklyRecovery: 'between Weekly recovery steps', other: 'purpose not recorded' };
 const MENU_ITEMS = new Set(['New Assignment', 'Paste', 'Select Assignments', 'Deselect Assignments', 'Find Assignments', 'Clear Selection', 'Close Schedule', 'Edit', 'Delete']);
 const CALENDAR_CHECK_PARTS = { weekUnreadable: 'a shown week could not be read', currentWeekNotShownBefore: 'this week was not shown before the delete',
   weekNotShown: 'a week up to the last deleted day is not shown', tileUnreadable: 'a calendar entry could not be read', keptEntryNotDns: 'a kept later entry is not DNS',
@@ -13843,6 +14801,7 @@ __exports.STRUCTURES = STRUCTURES;
 __exports.PAGE_LIBRARIES = PAGE_LIBRARIES;
 __exports.PAGE_SELECTORS = PAGE_SELECTORS;
 __exports.FIELDS = FIELDS;
+__exports.CALM_PURPOSES = CALM_PURPOSES;
 __exports.MENU_ITEMS = MENU_ITEMS;
 __exports.CALENDAR_CHECK_PARTS = CALENDAR_CHECK_PARTS;
 __exports.reasonCode = reasonCode;
@@ -13921,11 +14880,11 @@ __exports.errorReason = errorReason;
 },
 "run/live-diagnostics.js": function (__require, __exports, document, window) {
 'use strict';
-const { SMALL_LIVE_STEPS, SMALL_TAX_STEPS, WEEKLY_LIVE_STEPS } = __require("./live-proof.js");
+const { SMALL_LIVE_STEPS, SMALL_TAX_STEPS, WEEKLY_LIVE_STEPS, LIVE_ABILITIES, LIVE_ABILITY_PARTS } = __require("./live-proof.js");
 const { observeRun, recordRun, STAGES, WINDOWS, FIELDS, WAIT_NAMES, REASON_CODES, reasonCode } = __require("../core/run-records.js");
 const { REASON_NAMES, errorReason } = __require("../core/reason-names.js");
 const { dayFromParts, mondayOf, weekday, usDate } = __require("../rules/dates.js");
-const steps = new Set('smallExit weeklySetup weeklyTable weeklyExit weeklyUndo smallOpen smallAdd smallChange smallDelete smallPicture smallUndo aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
+const steps = new Set('featureExact featureReplace featureNotes featurePicture featureBins weeklyHours weeklyPicture smallExit weeklySetup weeklyTable weeklyExit weeklyUndo smallOpen smallAdd smallChange smallDelete smallPicture smallUndo aaSetup aaExit aaKept aaDns aaPicture aaUndo aaClear taxEmpty taxFind taxAdd taxHoliday taxHours taxPartial taxClear taxPast dateGuard aEmpty aSetup aRefresh aCancel aReduce aClear bLoa bDns bDelete bRestore bReplace bClear cLoa cDns sevenSetup sevenCancel sevenReduce sevenClear cDelete cRestore cClear open empty editable loaAdd loaReplace loaDelete loaAlter loaRestore dnsAdd dnsReplace dnsDelete dnsAlter dnsRestore dnsClear cleanup recovery dnsEmpty loaFallback exitFallback cSetup cRemove cSplitRestore'.split(' '));
 const word = (value, allowed, fallback = 'unknown') => allowed.has(value) ? value : fallback;
 const count = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
 const stages = new Set([...STAGES, 'move calendar']);
@@ -14057,8 +15016,13 @@ function liveReportSummary(result, includeMonday = true) {
     cleanup:word(result.cleanup,new Set(['empty','notNeeded','unconfirmed']),'unconfirmed'),
     unconfirmed:dateRanges(outstanding), unconfirmedSpan:result.cleanup === 'unconfirmed' && !outstanding.length ? {start:date(result.week?.start),end:date(result.week?.end)} : null,
     writes:{attempted:result.diagnostic ? (data.events || []).filter(e=>e.type==='writeAttempt').length : count(result.writes),proved:(data.events || []).filter(e=>e.type==='writeAttempt' && e.proof==='passed').length},
+    abilities:cleanAbilities(result.abilities), rowNumbers:word(result.rowNumbers,rowNumberWords,null),
     finish:cleanPage(data.finish), seconds:(data.events || []).map(e=>e.time).filter(n=>Number.isFinite(n) && n>=0).at(-1) ?? null };
 }
+const verdicts = new Set(['PASS','FAIL','Not exercised']);
+const rowNumberWords = new Set(['kept','changed','changedRefused']);
+const cleanAbilities = list => (Array.isArray(list) ? list : []).filter(a => Object.hasOwn(LIVE_ABILITIES, a?.id) && verdicts.has(a.verdict))
+  .map(a => ({ id:a.id, step:stepName(a.step), verdict:a.verdict, ...(a.verdict === 'FAIL' ? { part:Object.hasOwn(LIVE_ABILITY_PARTS, a.part) ? a.part : 'notProved' } : {}) }));
 function dateRanges(dates) {
   const sorted = [...new Set(dates)].sort((a,b)=>dateNumber(a)-dateNumber(b)), ranges = [];
   for (const day of sorted) {
@@ -14130,7 +15094,7 @@ function shortLiveReport(result) {
     return parts.join(' · ');
   };
   line('Verdict', `${report.verdict}; version ${report.version}`);
-  const smallSteps = result.design === 'small8' ? SMALL_LIVE_STEPS : result.design === 'weekly6' ? WEEKLY_LIVE_STEPS : result.design === 'tax5' ? SMALL_TAX_STEPS : null;
+  const smallSteps = result.design === 'daily7' ? SMALL_LIVE_STEPS : result.design === 'weekly7' ? WEEKLY_LIVE_STEPS : result.design === 'tax5' ? SMALL_TAX_STEPS : null;
   if (smallSteps) {
     const states = Object.entries(smallSteps).map(([id, title]) => {
       const step = result.steps?.find(step => step.id === id);
@@ -14147,6 +15111,13 @@ function shortLiveReport(result) {
       line('Steps', groups.map(group => `${group.start === group.end ? group.start : `${group.start}-${group.end}`} ${group.state}${group.state === 'FAIL' ? ` ${group.title.split(':')[0]}` : ''}`).join(' · '));
     }
   }
+  if (report.abilities.length) {
+    const pass = report.abilities.filter(a => a.verdict === 'PASS').length, failed = report.abilities.filter(a => a.verdict === 'FAIL');
+    const notRun = report.abilities.filter(a => a.verdict === 'Not exercised').length;
+    line('Abilities', `${pass}/${report.abilities.length} PASS${failed.length ? `, ${failed.length} FAIL` : ''}${notRun ? `, ${notRun} not run` : ''}`);
+    if (failed.length) line('Ability FAIL', failed.map(a => `${LIVE_ABILITIES[a.id]} (${LIVE_ABILITY_PARTS[a.part]})`));
+  }
+  if (report.rowNumbers) line('Row numbers', { kept: 'kept on save', changed: 'changed on save', changedRefused: 'changed on save; Snooze’s own delete check refused them' }[report.rowNumbers]);
   if (stop) {
     const where = [stop.stage, stop.lastAction].find(known);
     line('Failed step', `${stop.step}${stop.time==null?'':` at ${stop.time} s`}${where ? ` · in ${where}` : ''}`);
@@ -14241,9 +15212,9 @@ __exports.liveEventLog = liveEventLog;
 'use strict';
 const { pastReportWarning } = __require("../run/backup.js");
 const { compareDays, usDate, todayOf } = __require("../rules/dates.js");
-const { failedRow } = __require("../screen/compact.js");
+const { failedRow, undoPastWords } = __require("../screen/compact.js");
 const { chooseMail } = __require("../rules/mails.js");
-const { RULE_CODES, REASON_CODES, STAGES, WINDOWS, FIELDS, STRUCTURES, PAGE_LIBRARIES, PAGE_SELECTORS, MENU_ITEMS, CALENDAR_CHECK_PARTS, stopSentence } = __require("../core/run-records.js");
+const { RULE_CODES, REASON_CODES, STAGES, WINDOWS, FIELDS, STRUCTURES, PAGE_LIBRARIES, PAGE_SELECTORS, MENU_ITEMS, CALENDAR_CHECK_PARTS, CALM_PURPOSES, stopSentence } = __require("../core/run-records.js");
 const number = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 const amount = value => number(value) === null ? 'not recorded' : String(Math.round(value * 1000) / 1000);
 const code = value => RULE_CODES.has(value) || REASON_CODES.has(value) ? value : 'unknownFailure';
@@ -14320,6 +15291,8 @@ function runReportText(batch, version, now = Date.now()) {
     lines.push(
       `${row.state === 'done' || row.state === 'undone' ? 'Done' : 'Planned'}: ${action(one, today)}${row.state === 'undone' ? '; undone' : ''}`,
       `Page/Staff Schedule Hours Report: ${comparison?.agreed === true ? 'agreed' : comparison?.agreed === false ? 'disagreed' : 'not compared'}; differing days: ${amount(comparison?.days)}; fields: ${fields.join(', ') || 'none'}`);
+    const pastDays = row.state === 'undone' && Array.isArray(row.undoResult?.skippedPastDays) ? row.undoResult.skippedPastDays.filter(day => [day?.y, day?.m, day?.d].every(Number.isInteger)) : [];
+    if (pastDays.length) lines.push(undoPastWords(pastDays));
     for (const step of data.steps || []) lines.push(`Step: ${stage(step.stage)} ${amount(step.seconds)} s; ${step.ok === true ? 'ok' : 'failed'}${step.retry === true ? '; retry' : ''}`);
     if (data.reason || row.state === 'skipped' || failedRow(row)) lines.push(`Reason: ${code(data.reason || one.personStop?.code)}${sentence ? '; ' + sentence : ''}; failed stage: ${stage(data.failedStage)}`);
     if (data.deletedDates?.length) lines.push(`Deleted days to check by hand: ${data.deletedDates.join(', ')}`);
@@ -14402,6 +15375,12 @@ function runReportText(batch, version, now = Date.now()) {
     const back = (calm.back || []).filter(item => number(item.latest) !== null);
     lines.push(`Calm waits: ${amount(calm.waits)}; a cover came back in ${back.length}${back.length ? `, latest after ${Math.max(...back.map(item => number(item.latest)))} ms of calm` : ''}`);
     for (const item of back.slice(0, 40)) lines.push(`#${amount(item.person)} ${stage(item.stage)}: back ${amount(item.times)} time(s), after ${amount(item.latest)} ms`);
+    for (const [key, words] of Object.entries(CALM_PURPOSES)) {
+      const one = calm.purposes && Object.hasOwn(calm.purposes, key) ? calm.purposes[key] : null;
+      if (!one) continue;
+      const seconds = value => number(value) === null ? 'not recorded' : String(Math.round(value / 10) / 100);
+      lines.push(`Calm wait, ${words}: ${amount(one.waits)}; cover seen in ${amount(one.cover)}; page changed in ${amount(one.changed)}; total ${seconds(one.ms)} s; longest ${seconds(one.longest)} s`);
+    }
   }
   lines.push('Waits:');
   for (const item of records.waits || []) lines.push(`#${amount(item.person)} ${WINDOWS.has(item.name) ? windowWords(item.name) : 'unrecognized window'}: ${amount(item.seconds)} s / ${amount(item.ceiling)} s limit; ${['passed', 'failed', 'late', 'refused', 'unconfirmed'].includes(item.result) ? item.result : 'unconfirmed'}`);
@@ -14490,15 +15469,9 @@ function saveFile(name, content, type = 'application/json') {
   link.remove();
   setTimeout(() => URL.revokeObjectURL(link.href), 10000);
 }
-const RECOVERY_LINE = "Use the backup file from the batch's zip.";
-function recoveryGuide() {
-  return el('div', { class: 'recovery-guide' }, RECOVERY_LINE);
-}
 __exports.el = el;
 __exports.wrongPageNotice = wrongPageNotice;
 __exports.saveFile = saveFile;
-__exports.RECOVERY_LINE = RECOVERY_LINE;
-__exports.recoveryGuide = recoveryGuide;
 },
 "rules/mails.js": function (__require, __exports, document, window) {
 'use strict';
@@ -15455,7 +16428,7 @@ button{font:bold 13px system-ui,sans-serif;border:0;border-radius:8px;padding:8p
 .popup-title{margin:0;padding:8px 12px;background:${COLOURS.header};border-bottom:1px solid ${COLOURS.divider};font-size:14px}.popup>div:not(.popup-title){padding:12px;line-height:1.6}.popup .buttons{display:grid;gap:8px;margin:0;padding:0 12px 12px!important}.popup .buttons>button{width:100%}
 .counts{white-space:normal;display:flex;flex-wrap:wrap;align-items:baseline}.file-line>span{white-space:normal;min-width:0}.undo-state{color:var(--family-muted);font-size:12px}
 .undo-fold{display:grid;gap:6px}.undo-toggle{width:100%}.stack>button,.undo-toggle{line-height:17px}.undo-list{max-height:240px;overflow-y:auto;overscroll-behavior:contain}.undo-list .person-row{min-height:44px}
-.recovery-guide,.package-check{font-size:11px;line-height:1.5;overflow-wrap:anywhere}.recovery-guide summary,.package-check summary{cursor:pointer;padding:4px 0}.package-scroll{overflow:auto;max-height:240px}.package-check table{border-collapse:collapse;min-width:620px;font-size:11px}.package-check th{background:${COLOURS.header};color:${COLOURS.text};font-weight:bold}.package-check td,.package-check th{padding:5px;border:1px solid ${COLOURS.divider};text-align:left;vertical-align:top;white-space:pre-wrap}
+.package-check{font-size:11px;line-height:1.5;overflow-wrap:anywhere}.package-check summary{cursor:pointer;padding:4px 0}.package-scroll{overflow:auto;max-height:240px}.package-check table{border-collapse:collapse;min-width:620px;font-size:11px}.package-check th{background:${COLOURS.header};color:${COLOURS.text};font-weight:bold}.package-check td,.package-check th{padding:5px;border:1px solid ${COLOURS.divider};text-align:left;vertical-align:top;white-space:pre-wrap}
 .screen-title{font-size:11px;color:${COLOURS.muted};white-space:nowrap}.sign-off{display:grid;gap:4px;font-size:12px;color:${COLOURS.muted}}.sign-off input{margin:0;padding:7px 9px;line-height:18px}.review-actions{margin-top:0}.batch{gap:8px}.restore-entry>button{width:100%}
 .live-test-entry{display:flex;align-items:center;gap:6px}.head .live-test-entry>button{width:auto;padding:0 6px}.live-test-entry .restore-warning{font-size:11px}.live-test-entry .restore-warning:empty{display:none}.live-test-entry>button{font:11px system-ui,sans-serif;background:transparent;color:${COLOURS.muted};padding:2px 0}.live-test-entry>button:hover:not(:disabled){box-shadow:none;filter:none;transform:none;text-decoration:underline}
 .panel.restore-open{display:flex;flex-direction:column;overflow:hidden}.restore-open>.head{flex:none}.restore-open>.body{display:flex;flex-direction:column;min-height:0;overflow:hidden}.restore-screen{display:flex;flex-direction:column;min-height:0;gap:0}.restore-top{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex:none}.restore-top strong{font-size:12px;flex:1}.restore-small{padding:6px 8px;font-size:11px;white-space:nowrap}.restore-list{max-height:calc(100vh - 265px);min-height:0;overflow:auto;overscroll-behavior:contain}.restore-person{display:block;background:${COLOURS.surface};border-radius:8px;padding:8px 10px 9px;margin-bottom:4px;cursor:pointer}.restore-person:hover{filter:brightness(1.08)}.restore-person:focus-within{outline:2px solid ${COLOURS.selection};outline-offset:2px}.restore-person input{position:absolute;width:1px;height:1px;opacity:0;margin:0}.restore-main{display:flex;align-items:baseline;gap:8px;line-height:17px}.restore-main strong{font-size:12px;font-weight:600;flex:1;min-width:0;overflow-wrap:anywhere}.restore-state{font-size:11px;white-space:nowrap;color:${COLOURS.muted}}.restore-person.selected strong,.restore-person.selected .restore-state{color:${COLOURS.greenText}}.restore-dates{display:inline-block;margin-top:3px;padding:1px 5px;border-radius:4px;font-size:10px;color:${COLOURS.muted};background:${COLOURS.divider}}.restore-warning{font-size:10px;color:${COLOURS.amber};margin-top:3px;overflow-wrap:anywhere}.restore-footer{flex:none}.restore-count{font-size:11px;font-weight:600;color:${COLOURS.muted};margin-top:8px}.restore-footer .buttons{margin-top:8px}.restore-notice{font-size:11px;line-height:1.45;color:${COLOURS.muted};margin-top:8px}
@@ -15744,5 +16717,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.14.9");
+__snoozeLoad("screen/panel.js").start("0.15.4");
 })();
