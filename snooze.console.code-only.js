@@ -1,4 +1,4 @@
-// v0.15.10
+// v0.15.11
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -2182,7 +2182,7 @@ __exports.notesFor = notesFor;
 "servicenow/files.js": function (__require, __exports, document, window) {
 'use strict';
 const { readWorkbook, ReaderUnreadableError } = __require("../family/reader/index.js");
-const { emailKey, headerKey } = __require("../rules/prepare.js");
+const { headerKey } = __require("../rules/prepare.js");
 const { parseDelimited } = __require("../family/reader/csv.js");
 const { readXlsx } = __require("../family/reader/xlsx.js");
 const { sheetRows, ERROR_CODES } = __require("../family/reader/sheet.js");
@@ -2648,12 +2648,7 @@ function reportPull(reportCases, today) {
     if (one.decision.plan?.action === 'dns' && compareDays(one.decision.plan.window.start, start) < 0) start = one.decision.plan.window.start;
   }
   end = addDays(start, 51 * 7 + 4);
-  const emails = [];
-  const seen = new Set();
-  for (const one of reportCases) {
-    const key = emailKey(one.record.email);
-    if (!seen.has(key)) { seen.add(key); emails.push(key); }
-  }
+  const emails = [...new Set(reportCases.map(one => emailKey(one.record.email)))];
   return { start, end, emails, cases: reportCases };
 }
 __exports.reportPull = reportPull;
@@ -5706,9 +5701,9 @@ const { timedRun, recordRun } = __require("../core/run-records.js");
 const { addDays, compareDays, sameDay, mondayOf, todayOf, readIsoDay, usDate, workingDays } = __require("../rules/dates.js");
 const { valueKey } = __require("../rules/prepare.js");
 const { entryKind } = __require("../rules/entries.js");
-const { compareCopies, copyWindow, coverAssignmentRange, retainAssignmentEvidence, dayOf, ENTRY_FIELDS, scheduleWriteAttempt, knownAssignmentRows } = __require("./copy.js");
-const { PageError, WAIT, guardReady, chooseInSelect2, click, closeWindow, fieldByLabel, keepFlags, cleanupAfter, modalTransitioning, sameText, settled, shown, stopFlagged, text, typeInto, waitFor } = __require("./dom.js");
-const { proveDates, setDates, proveAllowedDates, proveDateSet, setDateSet } = __require("./dates-box.js");
+const { copyWindow, coverAssignmentRange, retainAssignmentEvidence, dayOf, scheduleWriteAttempt, knownAssignmentRows } = __require("./copy.js");
+const { PageError, WAIT, guardReady, chooseInSelect2, click, closeWindow, fieldByLabel, cleanupAfter, modalTransitioning, sameText, settled, shown, stopFlagged, text, typeInto, waitFor } = __require("./dom.js");
+const { setDates, proveAllowedDates, setDateSet } = __require("./dates-box.js");
 const { waitForDates, waitForDateSet, readDates } = __require("./dates-box.js");
 const { buttonIn, emptySpots, menuItem, findAssignments, findAssignmentsRange, readEditTable, closeEdit, personIdentity, waitForPersonIdentity } = __require("./schedule.js");
 const { calendarHolds, showDate } = __require("./calendar.js");
@@ -8270,6 +8265,13 @@ async function capturePersonRecorded(row, { identity, operation = 'capture' } = 
         return takeScreenshot();
       } finally { note?.cleanup(); }
     };
+    const recordPicture = () => {
+      if (row.diagnostic) {
+        row.diagnostic.paint.push(...lastPicture.omissions);
+        const counts = row.diagnostic.approximations ||= {};
+        for (const [kind, count] of Object.entries(lastPicture.approximations || {})) counts[kind] = (counts[kind] || 0) + count;
+      }
+    };
     let pictureStart = start;
     try {
       await requirePersonIdentity(pictureIdentity, operation);
@@ -8285,20 +8287,12 @@ async function capturePersonRecorded(row, { identity, operation = 'capture' } = 
     }
     const endShown = end && pictureWeeksHold(pictureStart, end);
     out.screenshots.push(await shot(pictureStart));
-    if (row.diagnostic) {
-      row.diagnostic.paint.push(...lastPicture.omissions);
-      const counts = row.diagnostic.approximations ||= {};
-      for (const [kind, count] of Object.entries(lastPicture.approximations || {})) counts[kind] = (counts[kind] || 0) + count;
-    }
+    recordPicture();
     if (pictureWarnings()) warnings.push(pictureWarnings());
     if (end && !endShown) {
       await showDate(end);
       out.screenshots.push(await shot(end));
-      if (row.diagnostic) {
-      row.diagnostic.paint.push(...lastPicture.omissions);
-      const counts = row.diagnostic.approximations ||= {};
-      for (const [kind, count] of Object.entries(lastPicture.approximations || {})) counts[kind] = (counts[kind] || 0) + count;
-    }
+      recordPicture();
       if (pictureWarnings()) warnings.push(pictureWarnings());
     }
   } catch (error) {
@@ -8370,7 +8364,6 @@ function rowWarnings(row) {
     one.exit?.dpNotFound && 'RM not applicable.',
     one.outputs?.warnings,
     row.undoWarning,
-    row.state === 'undone' && row.undoPastWarning,
   ].filter(Boolean))]);
   if (!hasPlan) return words;
   const unchanged = ['skipped', 'pending', 'ready'].includes(row.state) || row.state === 'failed' && row.diagnostic?.changeAttempted === false;
@@ -8855,10 +8848,10 @@ __exports.estimateBatch = estimateBatch;
 "run/batch.js": function (__require, __exports, document, window) {
 'use strict';
 const { createSessionClock, PERSON_RESERVE_MS, CONFIRM_RESERVE_MS, SESSION_WORDS } = __require("../screen/session-clock.js");
-const { prepare, apply, restore, recover: recoverBackup } = __require("./work.js");
+const { prepare, apply, recover: recoverBackup } = __require("./work.js");
 const { requireDayReport, loadedReports, reportAssignPeriod } = __require("../files/report.js");
 const { requireFreshReport } = __require("../files/report-time.js");
-const { PageError, setBatchGuard, stopFlagged, waitFor, WAIT, guardReady } = __require("../mysource/dom.js");
+const { PageError, setBatchGuard, stopFlagged, waitFor, WAIT } = __require("../mysource/dom.js");
 const { sessionExpired, cancelBatchWindows, closeSkippedPerson, batchCover, unlockPage, watchConnection, connectionPageReady, CONNECTION_WORDS } = __require("../mysource/batch.js");
 const { todayOf, compareDays, workingDays, usDate, reportWindow } = __require("../rules/dates.js");
 const { compareCopies, copyWindow } = __require("../mysource/copy.js");
@@ -9636,7 +9629,7 @@ const { batchCover, sessionExpired } = __require("../mysource/batch.js");
 const { PageError, setBatchGuard } = __require("../mysource/dom.js");
 const { restore, previewRestore, previewFromMemory } = __require("../run/work.js");
 const { usDate } = __require("../rules/dates.js");
-const { failedRow, personName, runningText, undoLine, undoRanges, undoChangeWords, undoPastWords, undoProblem, mailFNoAction, canUndo, changedRow, undoState } = __require("./compact.js");
+const { failedRow, personName, runningText, undoLine, undoRanges, undoChangeWords, undoProblem, mailFNoAction, canUndo, changedRow, undoState } = __require("./compact.js");
 const { LOA_CLIENT, DNS_CLIENT } = __require("../mysource/checks.js");
 const { setRunRecorder, timedRun, reasonCode } = __require("../core/run-records.js");
 const { REPORT_TIME_WORDS } = __require("../files/report-time.js");
@@ -9644,7 +9637,6 @@ const { reportTimeLine } = __require("../files/report-time.js");
 const { requireSchedulePage, waitForPersonIdentity, waitForCalendarSettled, SCHEDULE_PAGE_WORDS } = __require("../mysource/schedule.js");
 const { needsPersonPicture } = __require("../files/batch-outputs.js");
 const { loadedReports, reportKind } = __require("../files/report.js");
-const { reasonLine } = __require("./wording.js");
 function renderBatch(batch, work, box, draw) {
   const rows = batch.rows;
   const listedRows = rows.filter(row => !mailFNoAction(row.one));
@@ -9668,7 +9660,6 @@ function renderBatch(batch, work, box, draw) {
   const clock = batch.clock || work.clock;
   const clockLeft = () => clock?.left() ?? Infinity;
   work.refreshClockControls = null;
-  const actions = el('div', { class: 'buttons' });
   const button = (label, colour, fn, disabled = false) => el('button', { class: colour, onclick: fn, disabled }, label);
   const saveButton = () => button(batch.saving ? 'Saving files…' : !batch.saved && (batch.hasSaved || batch.saveMessage || rows.some(row => row.state === 'undone')) ? 'Save files · not saved' : 'Save files', 'blue', async () => {
     if (work.busy || batch.active || batch.saving) return;
@@ -9750,7 +9741,6 @@ function renderBatch(batch, work, box, draw) {
         else if (canUndo(row)) line.append(button('Undo', 'undo', () => undoPopup(row, work, draw), work.busy || batch.saving));
         const warning = ['undone', 'undoFailed'].includes(row.state) && pastReportWarning(row.prepared?.backup);
         if (warning) line.append(el('div', { class: 'warn' }, warning));
-        if (row.state === 'undone' && row.undoPastWarning) line.append(el('div', { class: 'warn' }, row.undoPastWarning));
         list.append(line);
       }
       stack.append(el('div', { class: 'undo-fold' }, toggle, list));
@@ -9822,15 +9812,16 @@ async function undoPopup(row, work, draw) {
     try {
       guard();
       if (fromMemory) await waitForCalendarSettled(); else await waitForPersonIdentity(preview.identity);
+      row.undoPastDays = [];
       const result = await timedRun('undo', () => restore(row.prepared.backup, { identity: preview.identity, after: row.after, previewBefore: preview.before,
         ...(fromMemory ? { fromMemory: true, previewDays: preview.changedDays } : {}), onWrite: () => { guard(); undoWrote = true; } }));
+      row.undoPastDays = Array.isArray(result.skippedPastDays) ? result.skippedPastDays : [];
       const problem = undoProblem(result);
       if (problem) throw new Error(problem);
       row.undoResult = result;
       if(work.batch)work.batch.saveMessage='';
       row.state = 'undone'; row.one.run = { state: 'undone', prepared: row.prepared };
       row.undoWarning = result.skippedLater?.length ? undoLaterWords(result.skippedLater, row.one.decision.plan) : '';
-      row.undoPastWarning = undoPastWords(result.skippedPastDays);
     } catch (error) {
       if (error.schedulePage && !undoWrote) { row.state = previousState; pausePreview(); parent.append(popup); keep.focus(); }
       else if (fromMemory && error.previewChanged && !undoWrote) { row.state = previousState; row.undoFromPage = true; pagePreview = true; parent.append(popup); keep.focus(); }
@@ -12496,7 +12487,6 @@ async function runLiveGroups({ page, window, email, result, step, known, confirm
   const ten = workingDays(window.start, addDays(window.start, 11));
   const six = ten.slice(0, 6), sixWindow = { start: six[0], end: six.at(-1) };
   const sameDay = (a, b) => compareDays(a, b) === 0;
-  const subset = (copy, dates) => ({ ...copy, days: copy.days.filter(row => dates.some(day => sameDay(day, row.day))) });
   const retained = (before, after) => before.every(old => {
     const row = after.days.find(row => row.id === old.id);
     return row && compareCopies({ days: [old] }, { days: [row] }).same && (row.notes > 0) === (old.notes > 0);
@@ -13444,7 +13434,6 @@ function auditLivePage(today, small = false) {
   };
   let writeSeq = 0, deleteProof = null;
   const read = async (options = {}) => { bounded(scope); const copy = await copyWindow(scope, options); check(); return copy; };
-  const deleteRead = async () => { const copy = await read(); deleteProof = { copy, at: writeSeq }; return copy; };
   let fresh = false;
   const assertKnown = async () => {
     if (fresh && !pending && !chain.length) { check(); return known; }
@@ -15633,7 +15622,7 @@ function runReportText(batch, version, now = Date.now()) {
     lines.push(
       `${row.state === 'done' || row.state === 'undone' ? 'Done' : 'Planned'}: ${action(one, today)}${row.state === 'undone' ? '; undone' : ''}`,
       `Page/Staff Schedule Hours Report: ${comparison?.agreed === true ? 'agreed' : comparison?.agreed === false ? 'disagreed' : 'not compared'}; differing days: ${amount(comparison?.days)}; fields: ${fields.join(', ') || 'none'}`);
-    const pastDays = row.state === 'undone' && Array.isArray(row.undoResult?.skippedPastDays) ? row.undoResult.skippedPastDays.filter(day => [day?.y, day?.m, day?.d].every(Number.isInteger)) : [];
+    const pastDays = row.state === 'undoFailed' && Array.isArray(row.undoPastDays) ? row.undoPastDays.filter(day => [day?.y, day?.m, day?.d].every(Number.isInteger)) : [];
     if (pastDays.length) lines.push(undoPastWords(pastDays));
     for (const step of data.steps || []) lines.push(`Step: ${stage(step.stage)} ${amount(step.seconds)} s; ${step.ok === true ? 'ok' : 'failed'}${step.retry === true ? '; retry' : ''}`);
     if (data.reason || row.state === 'skipped' || failedRow(row)) lines.push(`Reason: ${code(data.reason || one.personStop?.code)}${sentence ? '; ' + sentence : ''}; failed stage: ${stage(data.failedStage)}`);
@@ -17072,5 +17061,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.10");
+__snoozeLoad("screen/panel.js").start("0.15.11");
 })();
