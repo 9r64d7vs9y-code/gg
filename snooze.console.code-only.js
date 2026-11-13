@@ -1,4 +1,4 @@
-// v0.15.8
+// v0.15.9
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -6419,6 +6419,11 @@ async function stageRemoval(edit, expected, remove) {
   const shell = table => {
     const clone = table.cloneNode(true);
     for (const body of clone.querySelectorAll('tbody')) body.replaceChildren();
+    for (const node of [clone, ...clone.querySelectorAll('[style]')]) {
+      if (!node.hasAttribute('style')) continue;
+      node.style.removeProperty('width');
+      if (!node.getAttribute('style').trim()) node.removeAttribute('style');
+    }
     return clone;
   };
   let originalRows, originalShell, originalShellValues;
@@ -17056,5 +17061,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.8");
+__snoozeLoad("screen/panel.js").start("0.15.9");
 })();
