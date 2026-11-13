@@ -1,4 +1,4 @@
-// v0.15.6
+// v0.15.7
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -3666,11 +3666,10 @@ const { within } = __require("../rules/leaves.js");
 const { PageError, WAIT, stopFlagged } = __require("./dom.js");
 const { cancelBatchWindows } = __require("./batch.js");
 const { pageReady } = __require("./schedule.js");
-const { copyWindow, compareCopies, knownAssignmentRows, retainAssignmentEvidence } = __require("./copy.js");
+const { copyWindow, compareCopies, knownAssignmentRows, retainAssignmentEvidence, memoryCopy } = __require("./copy.js");
 const { calendarBefore, calendarShowsChange, calendarShowsDelete } = __require("./calendar-check.js");
 const { deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
 const { recordRun } = __require("../core/run-records.js");
-const { memoryCopy } = __require("./restore.js");
 const sameRow = (a, b) => compareCopies({ days: [a] }, { days: [b] }).same;
 const previewChanged = message => Object.assign(new PageError(message), { previewChanged: true });
 const sameBut = (old, row) => sameRow({ ...old, hours: row.hours }, row);
@@ -6655,7 +6654,7 @@ __exports.stageNotes = stageNotes;
 "mysource/copy.js": function (__require, __exports, document, window) {
 'use strict';
 const { timedRun, recordRun } = __require("../core/run-records.js");
-const { compareDays, localStamp, dayFromParts, usDate, nextWorkday, isWeekend } = __require("../rules/dates.js");
+const { compareDays, sameDay, localStamp, dayFromParts, usDate, nextWorkday, isWeekend } = __require("../rules/dates.js");
 const { valueKey } = __require("../rules/prepare.js");
 const { PageError, cleanupAfter } = __require("./dom.js");
 const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity } = __require("./schedule.js");
@@ -6840,6 +6839,20 @@ function compareCopiesRecorded(before, after) {
 }
 function copyWindow(...args) { return timedRun("read", () => copyWindowRecorded(...args)); }
 function compareCopies(...args) { return timedRun("check", () => compareCopiesRecorded(...args)); }
+function memoryCopy(after, window, { noteRows = [], future = false } = {}) {
+  if (!after?.window || !Array.isArray(after.days) || after.calendarChecked) return null;
+  if (compareDays(after.window.start, window.start) > 0 || compareDays(after.window.end, window.end) < 0) return null;
+  const days = [];
+  for (const row of after.days) {
+    if (!row.day || compareDays(row.day, window.start) < 0 || (!future && compareDays(row.day, window.end) > 0)) continue;
+    const { noteText, noteTextSubmitted, ...rest } = row;
+    if (!noteRows.some(old => sameDay(old.day, row.day) && valueKey(old.client) === valueKey(row.client))) days.push(rest);
+    else if (typeof noteText === 'string') days.push({ ...rest, noteText });
+    else if (!(row.notes > 0)) days.push({ ...rest, noteText: '' });
+    else return null;
+  }
+  return { window: { ...window }, days, fromMemory: true };
+}
 __exports.knownAssignmentRows = knownAssignmentRows;
 __exports.retainAssignmentEvidence = retainAssignmentEvidence;
 __exports.futureCopyFrom = futureCopyFrom;
@@ -6853,6 +6866,7 @@ __exports.mergeIdentical = mergeIdentical;
 __exports.entriesToAdd = entriesToAdd;
 __exports.copyWindow = copyWindow;
 __exports.compareCopies = compareCopies;
+__exports.memoryCopy = memoryCopy;
 },
 "mysource/checks.js": function (__require, __exports, document, window) {
 'use strict';
@@ -6976,7 +6990,7 @@ const { compareByDay, RESTORE_FIELDS, pastReportWarning } = __require("../run/ba
 const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity, scheduleFacts, pageReady, withWeeklyRows } = __require("./schedule.js");
 const { isEditableDay } = __require("./editability.js");
 const { deleteAll, deleteRange, deleteFromTable, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
-const { copyWindow, coverAssignmentRange, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows, retainAssignmentEvidence } = __require("./copy.js");
+const { copyWindow, coverAssignmentRange, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows, retainAssignmentEvidence, memoryCopy } = __require("./copy.js");
 const { calendarBefore, calendarShowsDelete } = __require("./calendar-check.js");
 const { sameAssignmentRows } = __require("./note-stage.js");
 const { valueKey, noteTextKey } = __require("../rules/prepare.js");
@@ -7044,20 +7058,6 @@ const sameRetained = (a, b) => {
     && a.days.every(old => old.id && byId.has(old.id)
       && sameLive({ days: [old] }, { days: [byId.get(old.id)] }));
 };
-function memoryCopy(after, window, { noteRows = [], future = false } = {}) {
-  if (!after?.window || !Array.isArray(after.days) || after.calendarChecked) return null;
-  if (compareDays(after.window.start, window.start) > 0 || compareDays(after.window.end, window.end) < 0) return null;
-  const days = [];
-  for (const row of after.days) {
-    if (!row.day || compareDays(row.day, window.start) < 0 || (!future && compareDays(row.day, window.end) > 0)) continue;
-    const { noteText, noteTextSubmitted, ...rest } = row;
-    if (!noteRows.some(old => sameDay(old.day, row.day) && valueKey(old.client) === valueKey(row.client))) days.push(rest);
-    else if (typeof noteText === 'string') days.push({ ...rest, noteText });
-    else if (!(row.notes > 0)) days.push({ ...rest, noteText: '' });
-    else return null;
-  }
-  return { window: { ...window }, days, fromMemory: true };
-}
 function pastChangedDays(backup, after, today) {
   if (!after?.window) return [];
   const noteDays = (backup.noteChangedDays || []).filter(day => within(day, backup.window) && compareDays(day, today) < 0);
@@ -7487,7 +7487,6 @@ async function restoreTaxWindow(backup, options = {}) {
     differences: unrestoredDates.map(date => ({ date, message: `${date}: Tax restore unconfirmed.` })), missing: [], extra: [], recoveryFailures: failures };
 }
 __exports.missingAssignments = missingAssignments;
-__exports.memoryCopy = memoryCopy;
 __exports.memoryRestorePlan = memoryRestorePlan;
 __exports.restorePlan = restorePlan;
 __exports.restoreWindow = restoreWindow;
@@ -16985,5 +16984,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.6");
+__snoozeLoad("screen/panel.js").start("0.15.7");
 })();
