@@ -1,4 +1,4 @@
-// v0.15.9
+// v0.15.10
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -16835,12 +16835,22 @@ function showLoad(body, sorted, onReport, work, { onTickets = () => {}, report =
   const ticketLine = fileLine(`${cases.length + duplicates} tickets: ${loa} LOA · ${exit} Exit${unknown ? ` · ${unknown} by hand` : ''} · ${noAction} no action${duplicates ? ` · ${duplicates} duplicates` : ''}`, onTickets, work);
   body.replaceChildren(ticketLine);
   if (pull && compareDays(pull.start, reportWindow(todayOf()).start) < 0) body.append(el('div', { class: 'dates early-pull' }, earlyPullLine(pull.start)));
+  const needs = reportNeeds(actionable);
   if (Array.isArray(report)) {
     for (const one of report) body.append(fileLine(`${reportKind(one) === 'audit' ? 'Audit' : 'Consulting'} · ${reportTimeLine(one.pullTime.time)}`, file => onReport(file, reportKind(one)), work));
-    if (report.length < 2) body.append(dropArea(`Drop ${reportKind(report[0]) === 'audit' ? 'Consulting' : 'Audit'} Staff Schedule Hours Report · max 2 h old`, onDrop));
+    const other = reportKind(report[0]) === 'audit' ? 'consulting' : 'audit', name = other === 'audit' ? 'Audit' : 'Consulting';
+    if (report.length < 2) body.append(dropArea(needs.known && !needs[other] ? `No ${name} tickets: ${name} report not needed` : `Drop ${name} Staff Schedule Hours Report · max 2 h old`, onDrop));
   }
   else if (report) body.append(fileLine(reportTimeLine(report.pullTime.time), file => onReport(file), work));
-  else body.append(dropArea('Drop Staff Schedule Hours Report · max 2 h old', onDrop));
+  else body.append(dropArea(!needs.known || needs.audit && needs.consulting ? 'Drop Staff Schedule Hours Report · max 2 h old'
+    : needs.audit ? 'Drop Audit Staff Schedule Hours Report · max 2 h old · no Consulting tickets'
+      : 'Drop Consulting Staff Schedule Hours Report · max 2 h old · no Audit tickets', onDrop));
+}
+function reportNeeds(cases) {
+  const looked = cases.filter(one => one.record.email);
+  const audit = looked.some(one => one.record.subcategory?.business === 'audit');
+  const consulting = looked.some(one => one.record.subcategory?.business !== 'audit');
+  return { known: looked.length > 0, audit, consulting };
 }
 function fileLine(label, receive, work) {
   const input = el('input', { type: 'file', accept: '.csv,.xlsx', hidden: true });
@@ -17037,6 +17047,7 @@ __exports.mountPanel = mountPanel;
 __exports.DROP_WORDS = DROP_WORDS;
 __exports.hideTaxOnConsulting = hideTaxOnConsulting;
 __exports.showLoad = showLoad;
+__exports.reportNeeds = reportNeeds;
 __exports.attachReport = attachReport;
 __exports.start = start;
 }
@@ -17061,5 +17072,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.9");
+__snoozeLoad("screen/panel.js").start("0.15.10");
 })();
