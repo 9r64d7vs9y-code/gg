@@ -1,33 +1,18 @@
 (async () => {
-  const options = window.snoozeCalendarProbeOptions || {};
-  const QUIET = options.quiet ?? 800, POLL = options.poll ?? 100, AGAIN = options.again ?? 2000, LIMIT = options.limit ?? 300000;
-  const sleep = options.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms))), clock = options.now || (() => Date.now());
-  const shown = node => { if (!node) return false; const s = getComputedStyle(node); return s.display !== 'none' && s.visibility !== 'hidden' && node.getClientRects().length > 0; };
+  const options = window.snoozeClickPathsProbeOptions || {};
+  const sleep = options.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const now = options.now || (() => Date.now());
+  const TIMEOUT = options.timeout ?? 6000, QUIET = options.quiet ?? 800, POLL = options.poll ?? 100;
   const words = node => (node?.textContent || '').replace(/\s+/g, ' ').trim();
-  const started = clock(), at = () => ((clock() - started) / 1000).toFixed(1);
-  const report = { probe: 'calendar save 1', changes: [] }, lines = ['Calendar save probe 1 (reads only; saves nothing)'];
-  document.querySelector('[data-snooze-calendar-probe]')?.remove();
-  const panel = document.createElement('div');
-  panel.setAttribute('data-snooze-calendar-probe', '');
-  panel.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:760px;max-height:60vh;overflow:auto;background:#111;color:#eee;font:12px/1.4 monospace;padding:10px;border:2px solid #6cf';
-  const stop = document.createElement('button');
-  stop.textContent = 'Stop';
-  stop.style.cssText = 'float:right;font:12px sans-serif;margin-left:8px';
-  const text = document.createElement('pre');
-  text.style.cssText = 'margin:0;white-space:pre-wrap';
-  panel.append(stop, text);
-  document.body.append(panel);
-  let stopped = false;
-  stop.addEventListener('click', () => { stopped = true; });
-  const show = () => { text.textContent = lines.join('\n'); };
-  const BUSY = 'div.loading, .blockUI.blockOverlay, .loading-overlay';
-  const covers = () => [...document.querySelectorAll(BUSY)].filter(node => shown(node) && getComputedStyle(node).pointerEvents !== 'none').length;
+  const shown = node => !!node && node.isConnected && styled(node) && node.getClientRects().length > 0;
   const content = node => {
     const control = node.closest('[id^="controlCalendar_"]');
     if (!control) return true;
     if (!control.querySelector(':scope > .fc-toolbar')) return false;
     return !node.closest('.fc-view-container, .fc-view');
   };
+  // A dated cell proves a view only when it and every parent are shown (and,
+  // on a laid-out page, it has a size): the page keeps hidden calendar copies.
   const styled = node => !node || node === document.body || !node.hidden && getComputedStyle(node).display !== 'none' && getComputedStyle(node).visibility !== 'hidden'
     && (!node.classList.contains('tab-pane') || node.classList.contains('active')) && styled(node.parentElement);
   const laidOut = () => document.body.getBoundingClientRect().width > 0;
@@ -81,78 +66,218 @@
     } catch { row.how = 'segment unreadable'; return row; }
     row.day = day; row.how = 'week row'; return row;
   };
-  const read = () => {
-    const found = views();
-    if (found.length !== 1) return { error: `${found.length} calendar views shown` };
-    const view = found[0];
-    const days = [...view.querySelectorAll('td.fc-day[data-date]')].map(node => node.getAttribute('data-date')).sort();
-    const tiles = [...document.querySelectorAll('.fc-event')].filter(tile => content(tile) && shown(tile) && !panel.contains(tile)).map(tile => readTile(tile, view));
-    const keys = tiles.filter(row => row.day).map(row => `${row.day} ${row.kind} ${row.hours ?? '?'}h${row.note ? ' note' : ''}`).sort();
-    return { from: days[0], to: days[days.length - 1], tiles: tiles.length, unread: tiles.filter(row => !row.day).map(row => row.how), keys };
+  const report = { probe: 'click paths 2', steps: [] };
+  const windows = () => [...document.querySelectorAll('.modal, [role="dialog"]')].filter(shown).filter(n => !n.parentElement?.closest('.modal, [role="dialog"]'));
+  const menus = () => [...document.querySelectorAll('.context-menu-root')].filter(shown);
+  const busy = () => [...document.querySelectorAll('div.loading, .blockUI.blockOverlay, .loading-overlay, .dataTables_processing, .dt-processing')].some(shown);
+  const escape = () => (document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+  const wait = async predicate => {
+    const start = now(); let calm = null;
+    while (now() - start < TIMEOUT) {
+      if (!busy() && predicate()) { calm ??= now(); if (now() - calm >= QUIET) return true; }
+      else calm = null;
+      await sleep(POLL);
+    }
+    return false;
   };
-  const counted = list => { const map = new Map(); for (const key of list) map.set(key, (map.get(key) || 0) + 1); return map; };
-  const difference = (before, after) => {
-    const a = counted(before), b = counted(after), added = [], removed = [];
-    for (const [key, n] of b) for (let i = a.get(key) || 0; i < n; i++) added.push(key);
-    for (const [key, n] of a) for (let i = b.get(key) || 0; i < n; i++) removed.push(key);
-    return { added, removed };
-  };
-  const brief = list => list.length > 12 ? [...list.slice(0, 12), `… ${list.length - 12} more`] : list;
-  let saveAt = null, saveWord = '';
-  const SAVES = /^(add|apply & add more|submit|save|ok|yes|delete|delete all|confirm)$/i;
-  const onClick = event => {
-    const button = event.target.closest?.('button, a.btn, input[type="submit"], input[type="button"]');
-    if (!button || panel.contains(button)) return;
-    const word = words(button) || button.value || '';
-    if (SAVES.test(word.trim())) { saveAt = clock(); saveWord = word.trim(); }
-  };
-  document.addEventListener('click', onClick, true);
-  let last = read();
-  if (last.error) lines.push(`Start: ${last.error}. Open the test person's calendar first.`);
-  else {
-    lines.push(`Start at ${at()} s: calendar ${last.from} to ${last.to}; ${last.tiles} entries shown, ${last.keys.length} read${last.unread.length ? `, ${last.unread.length} not read (${[...new Set(last.unread)].join(', ')})` : ''}.`);
-    lines.push('Now save a change by hand on this test person; wait for "Change n" after each. Press Stop when done.');
-  }
-  report.start = last; show();
-  let coverSeen = false, coverFrom = null, coverSeconds = 0, clearSince = null, changedDom = false;
-  const watch = new MutationObserver(records => { if (records.some(record => !panel.contains(record.target))) changedDom = true; });
-  watch.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
-  while (!stopped && clock() - started < LIMIT && !last.error) {
-    await sleep(POLL);
-    const now = clock();
-    if (covers()) { if (!coverSeen) coverFrom = now; coverSeen = true; clearSince = null; continue; }
-    if (coverFrom !== null) { coverSeconds += (now - coverFrom) / 1000; coverFrom = null; }
-    clearSince ??= now;
-    if (!changedDom || now - clearSince < QUIET) continue;
-    const windowOpen = [...document.querySelectorAll('.modal')].some(node => shown(node) && !panel.contains(node));
-    if (windowOpen) continue;
-    changedDom = false;
-    const readAt = clock(), next = read();
-    if (next.error) { lines.push(`At ${at()} s: ${next.error}.`); show(); continue; }
-    const diff = difference(last.keys, next.keys);
-    if (!diff.added.length && !diff.removed.length && next.unread.length === last.unread.length && next.from === last.from && next.to === last.to) { coverSeen = false; coverSeconds = 0; continue; }
-    await sleep(AGAIN);
-    const again = read(), steady = !again.error && difference(next.keys, again.keys).added.length === 0 && difference(next.keys, again.keys).removed.length === 0;
-    const change = {
-      n: report.changes.length + 1, after: saveAt ? saveWord : 'no save press seen',
-      readSecondsAfterSave: saveAt ? Number(((readAt - saveAt) / 1000).toFixed(1)) : null,
-      coverSeen, coverSeconds: Number(coverSeconds.toFixed(1)), shown: `${next.from} to ${next.to}`,
-      added: diff.added, removed: diff.removed, unread: next.unread, sameAgain: steady
+  const disabled = node => !!node.closest('.disabled, .context-menu-disabled, [aria-disabled="true"], [disabled]');
+  // Getter calls only. Never stringify page objects or callback functions.
+  const calendarSettings = view => {
+    const step = { n: 0, title: 'calendar settings', options: {}, view: {}, callbacks: {}, buttons: [] };
+    const fc = view?.closest('.fc');
+    const read = action => { try { return action(); } catch { return undefined; } };
+    const jq = read(() => window.jQuery(fc));
+    const option = name => read(() => fc ? jq.fullCalendar('option', name) : undefined);
+    const scalar = value => typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value)
+      || typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(value) ? value : 'unreadable';
+    for (const name of ['selectable', 'selectHelper', 'unselectAuto', 'editable', 'eventStartEditable', 'eventDurationEditable', 'defaultView', 'firstDay', 'weekends']) step.options[name] = scalar(option(name));
+    const current = read(() => fc ? jq.fullCalendar('getView') : undefined);
+    step.view.name = scalar(current?.name); step.view.type = scalar(current?.type);
+    const duration = value => {
+      if (!value || typeof value !== 'object') return 'unreadable';
+      if (typeof value.asDays === 'function') {
+        const days = read(() => value.asDays());
+        return typeof days === 'number' && Number.isFinite(days) ? { weeks: 0, days } : 'unreadable';
+      }
+      const keys = Object.keys(value);
+      if (!keys.length || keys.some(key => !['weeks', 'days'].includes(key))
+        || keys.some(key => typeof value[key] !== 'number' || !Number.isFinite(value[key]))) return 'unreadable';
+      return { weeks: value.weeks ?? 0, days: value.days ?? 0 };
     };
-    report.changes.push(change);
-    lines.push('', `Change ${change.n} (after "${change.after}"): read ${change.readSecondsAfterSave ?? '?'} s after the press; loading cover ${coverSeen ? `${change.coverSeconds} s` : 'not seen'}; calendar ${change.shown}.`);
-    if (next.from !== last.from || next.to !== last.to) lines.push(`  The calendar moved: was ${last.from} to ${last.to}.`);
-    lines.push(`  Added: ${diff.added.length ? brief(diff.added).join('; ') : 'none'}`, `  Removed: ${diff.removed.length ? brief(diff.removed).join('; ') : 'none'}`);
-    if (next.unread.length) lines.push(`  Not read: ${next.unread.length} (${[...new Set(next.unread)].join(', ')})`);
-    lines.push(`  Same ${AGAIN / 1000} s later: ${steady ? 'yes' : 'NO'}`);
-    show();
-    last = steady ? next : again; saveAt = null; coverSeen = false; coverSeconds = 0;
+    step.view.dateIncrement = duration(current?.dateProfile?.dateIncrement ?? current?.dateIncrement ?? read(() => current?.opt('dateIncrement')) ?? option('dateIncrement'));
+    step.view.duration = duration(current?.viewSpec?.duration ?? current?.intervalDuration ?? current?.duration ?? read(() => current?.opt('duration')) ?? option('duration'));
+    const names = new Set(['select', 'dayClick', 'eventClick', 'eventRightclick', 'eventDrop', 'eventResize']);
+    const instance = read(() => jq.data('fullCalendar'));
+    const findNames = object => {
+      if (!object || typeof object !== 'object') return;
+      for (const name of Object.keys(object)) if (/contextmenu|rightclick/i.test(name) && /^[A-Za-z][A-Za-z0-9_]{0,47}$/.test(name)) names.add(name);
+    };
+    for (const object of [instance?.options, instance?.optionsManager?.computed, current?.options]) findNames(object);
+    const configuredViews = option('views');
+    if (configuredViews && typeof configuredViews === 'object') for (const config of Object.values(configuredViews)) findNames(config);
+    for (const name of names) {
+      // A successful getter returning undefined means the callback is unset.
+      try { step.callbacks[name] = fc && typeof jq?.fullCalendar === 'function' ? typeof jq.fullCalendar('option', name) === 'function' : 'unreadable'; }
+      catch { step.callbacks[name] = 'unreadable'; }
+    }
+    const headerRoot = fc?.closest('.js-calendar-wrapper, .staff-calendar-wrapper') || fc;
+    for (const button of headerRoot?.querySelectorAll('.fc-toolbar button, .fc-toolbar a, .fc-toolbar input[type="button"], .fc-header button, .calendar-title button, .calendar-title a, button[class*="fc-"], a[class*="fc-"]') || []) {
+      if (!shown(button)) continue;
+      const classes = [...button.classList].filter(name => /^fc-[A-Za-z0-9_-]+-button$/.test(name));
+      if (classes.length) for (const name of classes) step.buttons.push({ class: name, disabled: disabled(button) });
+      else {
+        const word = words(button) || button.value || '';
+        if (/^[A-Za-z]{1,16}(?: [A-Za-z]{1,16}){0,2}$/.test(word)) step.buttons.push({ word, disabled: disabled(button) });
+      }
+    }
+    return step;
+  };
+  const press = (node, extra = {}) => {
+    for (const type of ['mousedown', 'mouseup', 'click']) node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, ...extra }));
+  };
+  const close = async modal => {
+    const cancel = [...modal.querySelectorAll('button, a, input[type="button"]')].find(n => shown(n) && !disabled(n) && /^(cancel|close)$/i.test(words(n) || n.value || ''));
+    const cross = [...modal.querySelectorAll('button.close, button.btn-close, [data-dismiss="modal"], [data-bs-dismiss="modal"]')]
+      .find(n => shown(n) && !disabled(n) && /^(close|×|x)?$/i.test(words(n) || n.value || '')
+        && /^(close)?$/i.test(n.getAttribute('aria-label') || ''));
+    if (cancel || cross) press(cancel || cross);
+    if (await wait(() => !shown(modal))) return true;
+    escape();
+    return wait(() => !shown(modal));
+  };
+  // Only dates may leave a date field. Other page values are never printed.
+  const datesOnly = value => (String(value || '').match(/\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})\b/g) || []).join(', ');
+  const rangeOf = modal => {
+    const result = {};
+    for (const label of modal.querySelectorAll('label')) {
+      const word = words(label).replace(/[*?]/g, '').trim();
+      if (!/^(Start|End) (Date|Week)$/i.test(word)) continue;
+      const id = label.getAttribute('for');
+      const input = id ? document.getElementById(id) : label.parentElement?.querySelector('input');
+      result[word] = input ? datesOnly(input.value) || 'blank or unreadable' : 'missing';
+    }
+    return result;
+  };
+  const addDates = modal => {
+    const range = modal.querySelector('.shift-date-picker'), inputs = [...(range?.querySelectorAll('input') || [])];
+    const data = node => { try { return window.jQuery?.(node)?.data() || {}; } catch { return {}; } };
+    const pickerInput = inputs.find(n => data(n).datepicker || data(n).daterangepicker);
+    const stored = pickerInput ? data(pickerInput) : {};
+    const picker = stored.datepicker || stored.daterangepicker;
+    const summary = words(modal), number = name => summary.match(new RegExp(name + ':\\s*([\\d.]+)', 'i'))?.[1] || 'not shown';
+    return { start: datesOnly(inputs.find(n => /-start$/.test(n.id))?.value) || 'blank or missing',
+      end: datesOnly(inputs.find(n => /-end$/.test(n.id))?.value) || 'blank or missing',
+      datesBox: datesOnly(inputs.find(n => n.classList.contains('shift-date-picker-dates'))?.value),
+      boxes: inputs.length, picker: stored.datepicker ? 'bootstrap' : stored.daterangepicker ? 'daterangepicker' : 'none',
+      multidate: typeof picker?.o?.multidate === 'boolean' || typeof picker?.o?.multidate === 'number' ? picker.o.multidate : null,
+      pickerInputs: picker?.inputs?.length ?? 0, subPickers: picker?.pickers?.length ?? 0,
+      days: number('Days'), weeks: number('Weeks') };
+  };
+  const observeWindow = async (step, action) => {
+    action();
+    const opened = await wait(() => windows().length > 0);
+    const found = windows();
+    if (!found.length) { step.opened = opened ? 'window disappeared before read' : 'nothing opened'; return !busy(); }
+    step.opened = opened ? 'window opened' : 'window not settled';
+    const modal = found[0];
+    step.title = words(modal.querySelector('.modal-title, h4, h5, .modal-header h3')) || 'untitled';
+    if (step.n === 1) {
+      const table = modal.querySelector('table#editGrid');
+      step.table = !!table;
+      step.rows = table ? [...table.querySelectorAll('tbody tr')].filter(n => !n.querySelector('.dataTables_empty')).length : 0;
+      step.dates = [...(table?.querySelectorAll('tbody td.column-start') || [])].map(n => datesOnly(words(n)) || 'unreadable');
+      step.range = rangeOf(modal);
+      step.hoursCells = table?.querySelectorAll('tbody td.column-hours').length || 0;
+      step.bins = table?.querySelectorAll('tbody .js-assignment-edit-delete, tbody .action-column button.btn-danger, tbody .action-column .fa-trash, tbody .action-column .fa-trash-can').length || 0;
+      step.submit = [...modal.querySelectorAll('button, input[type="submit"]')].some(n => shown(n) && /^submit$/i.test(words(n) || n.value || ''));
+    } else if (/^Add Assignment$/i.test(step.title) || modal.id === 'addShiftEventModal') step.dates = addDates(modal);
+    step.closed = true;
+    for (const node of found.reverse()) if (!await close(node)) step.closed = false;
+    return step.closed && !windows().length && !busy();
+  };
+  let safe = false;
+  const original = new Set(windows());
+  const tilesIn = view => [...document.querySelectorAll('.fc-event')].filter(n => content(n) && shown(n)).map(node => ({ node, ...readTile(node, view) }));
+  try {
+    const found = views();
+    report.steps.push(calendarSettings(found.length === 1 ? found[0] : null));
+    safe = original.size === 0 && menus().length === 0 && found.length === 1 && await wait(() => !busy());
+    const view = found.length === 1 ? found[0] : null;
+    const first = { n: 1, opened: 'not attempted: page not ready' }; report.steps.push(first);
+    if (safe) {
+      const tile = tilesIn(view).find(n => n.day && n.hours !== null);
+      if (tile) { first.kind = tile.kind; first.day = tile.day; safe = await observeWindow(first, () => press(tile.node)); }
+      else first.opened = 'no readable entry';
+    }
+    const second = { n: 2, opened: 'not attempted: page not ready' }; report.steps.push(second);
+    if (safe) {
+      const tiles = tilesIn(view), occupied = new Set(tiles.map(n => n.day));
+      const today = new Date();
+      const todayIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+      let spot = null;
+      // Hit-test the white area. Never dispatch a day click through a tile or
+      // an unrelated layer. Unknown tile dates prevent claiming an empty day.
+      if (tiles.every(n => n.day)) for (const cell of view.querySelectorAll('td.fc-day[data-date]')) {
+        const day = cell.getAttribute('data-date');
+        if (!shown(cell) || !/^\d{4}-\d{2}-\d{2}$/.test(day) || day < todayIso || occupied.has(day)
+          || !cell.matches('.fc-today, .fc-future') || cell.closest('.fc-past, .disabled, .greyed, .grayed, [aria-disabled="true"]')) continue;
+        const box = cell.getBoundingClientRect();
+        for (const fraction of [0.8, 0.5, 0.2]) {
+          const x = box.left + box.width / 2, y = box.top + box.height * fraction;
+          const hit = document.elementFromPoint?.(x, y);
+          if (hit && (hit === cell || cell.contains(hit)) && !hit.closest('.fc-event, button, a, input')) { spot = { hit, day, x, y }; break; }
+        }
+        if (spot) break;
+      }
+      if (spot) { second.day = spot.day; safe = await observeWindow(second, () => press(spot.hit, { clientX: spot.x, clientY: spot.y })); }
+      else second.opened = 'no proved editable empty day';
+    }
+    const third = { n: 3, opened: 'not attempted: page not ready' }; report.steps.push(third);
+    if (safe) {
+      const tiles = tilesIn(view).filter(n => n.day).slice(0, 2), before = tiles.map(n => n.node.className);
+      third.tiles = [];
+      for (const tile of tiles) {
+        press(tile.node, { ctrlKey: true });
+        await sleep(QUIET);
+        if (windows().length || busy()) { safe = false; break; }
+      }
+      third.tiles = tiles.map((n, i) => ({ kind: n.kind, day: n.day, before: before[i], after: n.node.className }));
+      third.selected = third.tiles.some(n => n.before !== n.after) ? 'selection classes changed' : 'no selection';
+      third.menu = [];
+      const menuItems = () => menus().flatMap(n => [...n.querySelectorAll('.context-menu-item')]).filter(shown);
+      const openMenu = async () => {
+        tiles[0].node.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, view: window, button: 2, buttons: 2 }));
+        return wait(() => menus().length > 0);
+      };
+      if (safe && tiles.length) {
+        third.opened = await openMenu() ? 'menu opened' : 'nothing opened';
+        third.menu = menuItems().map(n => ({ word: words(n), state: disabled(n) ? 'greyed' : 'enabled' }));
+        const clearOffered = menuItems().some(n => /^(clear selection|deselect all|unselect all)$/i.test(words(n)) && !disabled(n));
+        escape(); third.menuClosed = await wait(() => !menus().length);
+        if (third.menuClosed && clearOffered && third.selected !== 'no selection') {
+          await openMenu();
+          const clear = menuItems().find(n => /^(clear selection|deselect all|unselect all)$/i.test(words(n)) && !disabled(n));
+          if (clear) press(clear);
+          escape(); await wait(() => !menus().length);
+        }
+        third.cleared = third.selected === 'no selection' ? 'no selection' : tiles.every((n, i) => n.node.className === before[i]) ? 'selection cleared' : 'selection stays';
+        third.menuClosed = !menus().length;
+      } else third.opened = safe ? 'no readable entry' : 'Control click opened a window or busy cover; stopped';
+    }
+  } catch {
+    report.error = 'page action or reading failed; stopped';
+  } finally {
+    for (const modal of windows().filter(n => !original.has(n)).reverse()) {
+      if (!await close(modal)) report.cleanup = 'window still open; close by hand';
+    }
+    if (menus().length) { escape(); if (!await wait(() => !menus().length)) report.menuCleanup = 'menu still open; close by hand'; }
+    report.windowsClosed = windows().every(n => original.has(n));
+    document.querySelector('[data-snooze-click-paths-probe]')?.remove();
+    const panel = document.createElement('pre'); panel.setAttribute('data-snooze-click-paths-probe', '');
+    panel.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:900px;max-height:65vh;overflow:auto;white-space:pre-wrap;background:#111;color:#eee;font:12px/1.4 monospace;padding:10px;border:2px solid #6cf;margin:0';
+    const result = JSON.stringify(report, null, 1);
+    panel.textContent = 'Click paths probe 2 (saves nothing)\n' + result; document.body.append(panel);
+    console.log(result);
+    try { copy(result); } catch { /* DevTools provides copy(). */ }
   }
-  watch.disconnect();
-  document.removeEventListener('click', onClick, true);
-  report.end = last;
-  lines.push('', `Stopped at ${at()} s: ${report.changes.length} change${report.changes.length === 1 ? '' : 's'} seen. Send a photo of this panel.`);
-  stop.remove(); show();
-  console.log(JSON.stringify(report, null, 1));
-  try { copy(JSON.stringify(report)); } catch {   }
 })();
