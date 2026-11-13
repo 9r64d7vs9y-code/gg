@@ -1,4 +1,4 @@
-// v0.14.8
+// v0.14.9
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -4801,7 +4801,7 @@ function readEditTableRecorded(edit) {
       if (tax && !required.has(field)) return [field, field === 'professional' ? professional : ''];
       const cell = cellOf(row, column);
       if (!cell) { recordRun({ type: 'miss', name: column instanceof RegExp ? 'td.column-cp#pricingid' : `td.${column}` }); throw new PageError(`Row ${index + 1} of the Edit Assignment table has no ${COLUMN_WORDS[field]} cell. Its cells: ${columnsOf(row)}.`); }
-      const input = tax && field === 'hours' ? [...cell.querySelectorAll('input')].filter(shown) : [];
+      const input = field === 'hours' ? [...cell.querySelectorAll('input')].filter(shown) : [];
       if (input.length > 1) throw new PageError('Tax Hours has more than one edit box. Nothing was read or changed.');
       return [field, input.length ? input[0].value : text(cell)];
     }));
@@ -13970,14 +13970,16 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
   const data = result.diagnostic = { assignPeriod: word(assignPeriod, periods), events: [], stop: null };
   const runDay = result.mode === 'tax' && dayFromParts(today?.y, today?.m, today?.d);
   if (runDay) data.taxMonday = usDate(mondayOf(runDay));
-  let stage = 'unknown', seenPeriods = null, boxType = 'unknown', lastAction = 'unknown', forcedStep = null, writes = 0;
+  let stage = 'unknown', seenPeriods = null, boxType = 'unknown', lastAction = 'unknown', forcedStep = null, writes = 0, stageStep = null;
   const snapshot = () => { try { return pageState(page.diagnosticState?.() || page.observe?.(), seenPeriods); } catch { return { unavailable:true }; } };
   const pending = [];
   const receive = event => {
+    const nowStep = stepName(event.step || forcedStep || result.steps.find(s => s.state === 'running')?.id || result.steps.at(-1)?.id);
+    if (nowStep !== stageStep) { stageStep = nowStep; stage = 'unknown'; lastAction = 'unknown'; }
     if (stages.has(event.stage)) { stage = event.stage; if (event.type === 'begin') lastAction = stage; }
     if (event.type === 'periods' && Number.isSafeInteger(event.count)) seenPeriods = event.count;
     if (event.type === 'findBoxes') boxType = word(event.boxType, boxTypes);
-    const safe = { time: elapsed(), step: stepName(event.step || forcedStep || result.steps.find(s => s.state === 'running')?.id || result.steps.at(-1)?.id),
+    const safe = { time: elapsed(), step: nowStep,
       type: word(event.type, types, 'observation'), stage, wait: WAIT_NAMES.has(event.waitName) ? event.waitName : word(event.name, waitNames),
       seconds: Number.isFinite(event.seconds) && event.seconds >= 0 ? event.seconds : null,
       result: word(event.result, results, typeof event.ok === 'boolean' ? event.ok ? 'passed' : 'failed' : 'unconfirmed'),
@@ -14011,7 +14013,7 @@ function beginLiveDiagnostics(result, page, assignPeriod = 'unknown', today) {
       pending.length = 0;
       const failure = { step: stepName(step), code: error?.identityChanged ? 'identityChanged' : error?.session ? 'sessionExpired' : word(error?.reasonCode, REASON_CODES, reasonCode(error?.message)), reasonName:errorReason(error) };
       const source = error?.liveStop || data.events.findLast(e => e.type === 'error' && e.reasonName === failure.reasonName && e.step === failure.step);
-      const stopped = { ...failure, time: elapsed(), lastAction:source?.lastAction || lastAction, stage: source?.stage || word(error?.stage, stages, stage), page: source?.page || snapshot(), held: heldDates(error?.dateDiagnostics || error?.pickerDateDiagnostics) };
+      const stopped = { ...failure, time: elapsed(), lastAction:source?.lastAction || (stageStep === failure.step ? lastAction : 'unknown'), stage: source?.stage || word(error?.stage, stages, stageStep === failure.step ? stage : 'unknown'), page: source?.page || snapshot(), held: heldDates(error?.dateDiagnostics || error?.pickerDateDiagnostics) };
       data.stop ||= stopped;
       Object.assign(result.steps.find(s => s.id === step) || {}, { code:failure.code, reasonName:failure.reasonName });
       recordRun({ type:'stop', ...failure, result:'failed' });
@@ -15742,5 +15744,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.14.8");
+__snoozeLoad("screen/panel.js").start("0.14.9");
 })();
