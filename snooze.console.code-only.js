@@ -1,4 +1,4 @@
-// v0.15.11
+// v0.15.12
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -3681,7 +3681,7 @@ const { within } = __require("../rules/leaves.js");
 const { PageError, WAIT, stopFlagged } = __require("./dom.js");
 const { cancelBatchWindows } = __require("./batch.js");
 const { pageReady } = __require("./schedule.js");
-const { copyWindow, compareCopies, knownAssignmentRows, retainAssignmentEvidence, memoryCopy } = __require("./copy.js");
+const { copyWindow, compareCopies, sameLive, knownAssignmentRows, retainAssignmentEvidence, memoryCopy } = __require("./copy.js");
 const { calendarBefore, calendarShowsChange, calendarShowsDelete } = __require("./calendar-check.js");
 const { deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
 const { recordRun } = __require("../core/run-records.js");
@@ -3735,7 +3735,7 @@ async function weeklyRestorePlan(backup, { after = null, today = todayOf(), veri
   const remove = live.filter(row => !taken.has(row));
   const thisMonday = mondayOf(today);
   const past = { raise: item => compareDays(item.old.day, thisMonday) < 0, add: row => compareDays(row.day, today) < 0, remove: row => compareDays(row.day, today) < 0 };
-  const laterChanged = after && !compareCopies({ days: after.days.filter(inside) }, { days: live }).same;
+  const laterChanged = after && !sameLive({ days: after.days.filter(inside) }, { days: live }, false);
   const skipped = { raise: raise.filter(past.raise), add: add.filter(past.add), remove: remove.filter(past.remove) };
   const on = (rows, day) => ({ days: rows.filter(row => compareDays(row.day, day) === 0) });
   const batchChanged = day => !after?.window || within(day, after.window) && !compareCopies(on(backup.days, day), on(after.days, day)).same;
@@ -3774,7 +3774,7 @@ async function restoreWeeklyWindow(backup, options = {}) {
   let readAfterWrite = null;
   const writeFor = (day, weekly) => async () => { readAfterWrite = null; notPast(day, weekly)(); await onWrite(); notPast(day, weekly)(); };
   const plan = await weeklyRestorePlan(backup, options);
-  if (previewBefore && !compareCopies(previewBefore, plan.before).same) throw previewChanged('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
+  if (previewBefore && !sameLive(previewBefore, plan.before, false)) throw previewChanged('The schedule changed since the Undo preview. Nothing was changed; open Undo again.');
   if (previewDays && plan.changedDays.some(day => !previewDays.some(old => compareDays(old, day) === 0))) throw previewChanged('The restore dates changed since the preview. Nothing was changed; preview again.');
   const addDates = plan.steps.add.flatMap(old => { const run = weeklyPutBack(old); return workingDays(run.start, run.end); });
   const trial = plan.steps.add.map(old => ({ ...weeklyPutBack(old), label: old.client }));
@@ -6727,7 +6727,7 @@ __exports.stageNotes = stageNotes;
 'use strict';
 const { timedRun, recordRun } = __require("../core/run-records.js");
 const { compareDays, sameDay, localStamp, dayFromParts, usDate, nextWorkday, isWeekend } = __require("../rules/dates.js");
-const { valueKey } = __require("../rules/prepare.js");
+const { valueKey, noteTextKey } = __require("../rules/prepare.js");
 const { PageError, cleanupAfter } = __require("./dom.js");
 const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity } = __require("./schedule.js");
 const { retirePreflightForm } = __require("./preflight-form.js");
@@ -6911,6 +6911,11 @@ function compareCopiesRecorded(before, after) {
 }
 function copyWindow(...args) { return timedRun("read", () => copyWindowRecorded(...args)); }
 function compareCopies(...args) { return timedRun("check", () => compareCopiesRecorded(...args)); }
+const sameLive = (a, b, checkNoteText = true) => {
+  const notes = copy => copy.days.map(row => JSON.stringify([usDate(row.day), ...ENTRY_FIELDS.map(field => field === 'hours' ? row.hours : valueKey(row[field])),
+    row.notes || 0, checkNoteText && typeof row.noteText === 'string' ? noteTextKey(row.noteText) : null])).sort().join('\n');
+  return compareCopies(a, b).same && notes(a) === notes(b);
+};
 function memoryCopy(after, window, { noteRows = [], future = false } = {}) {
   if (!after?.window || !Array.isArray(after.days) || after.calendarChecked) return null;
   if (compareDays(after.window.start, window.start) > 0 || compareDays(after.window.end, window.end) < 0) return null;
@@ -6938,6 +6943,7 @@ __exports.mergeIdentical = mergeIdentical;
 __exports.entriesToAdd = entriesToAdd;
 __exports.copyWindow = copyWindow;
 __exports.compareCopies = compareCopies;
+__exports.sameLive = sameLive;
 __exports.memoryCopy = memoryCopy;
 },
 "mysource/checks.js": function (__require, __exports, document, window) {
@@ -7062,10 +7068,10 @@ const { compareByDay, RESTORE_FIELDS, pastReportWarning } = __require("../run/ba
 const { closeEdit, findAssignments, findAssignmentsRange, readEditTable, readRowNote, personIdentity, checkPersonIdentity, scheduleFacts, pageReady, withWeeklyRows } = __require("./schedule.js");
 const { isEditableDay } = __require("./editability.js");
 const { deleteAll, deleteRange, deleteFromTable, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
-const { copyWindow, coverAssignmentRange, compareCopies, dayOf, entriesToAdd, ENTRY_FIELDS, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows, retainAssignmentEvidence, memoryCopy } = __require("./copy.js");
+const { copyWindow, coverAssignmentRange, compareCopies, dayOf, entriesToAdd, sameLive, reuseVerifiedAddRead, retireAddRead, knownAssignmentRows, retainAssignmentEvidence, memoryCopy } = __require("./copy.js");
 const { calendarBefore, calendarShowsDelete } = __require("./calendar-check.js");
 const { sameAssignmentRows } = __require("./note-stage.js");
-const { valueKey, noteTextKey } = __require("../rules/prepare.js");
+const { valueKey } = __require("../rules/prepare.js");
 const compare = (backup, after) => {
   const differences = compareByDay(backup.window ? after.days.filter(row => within(row.day, backup.window)) : after.days, backup.days, null, Object.keys(RESTORE_FIELDS));
   const captured = new Set(backup.days.filter(row => row.pricingCaptured).map(row => usDate(row.day)));
@@ -7118,11 +7124,6 @@ function changedRuns(differences, protectedDays = new Set()) {
   }
   return runs;
 }
-const sameLive = (a, b, checkNoteText = true) => {
-  const notes = copy => copy.days.map(row => JSON.stringify([usDate(row.day), ...ENTRY_FIELDS.map(field => field === 'hours' ? row.hours : valueKey(row[field])),
-    row.notes || 0, checkNoteText && typeof row.noteText === 'string' ? noteTextKey(row.noteText) : null])).sort().join('\n');
-  return compareCopies(a, b).same && notes(a) === notes(b);
-};
 const sameRetained = (a, b) => {
   const byId = new Map(b.days.map(row => [row.id, row]));
   return sameLive(a, b) && byId.size === b.days.length
@@ -11491,7 +11492,8 @@ async function prepareWeeklyExit(ctx) {
   const inReport = row => compareDays(row.day, reportEnd) <= 0;
   const backupEnd = compareDays(copy.window.end, reportEnd) < 0 ? copy.window.end : reportEnd;
   const reportPart = reportDays({ ...slice, entries: slice.backupEntries ?? slice.entries }, { start: readStart, end: backupEnd });
-  const differences = compareByDay(copy.days.filter(inReport), reportPart, readStart);
+  const reportCompare = compareDays(backupEnd, reportEnd) < 0 ? reportDays({ ...slice, entries: slice.backupEntries ?? slice.entries }, { start: readStart, end: reportEnd }) : reportPart;
+  const differences = compareByDay(copy.days.filter(inReport), reportCompare, readStart);
   recordRun({ type: 'comparison', summary: reportDifferenceSummary(differences) });
   if (differences.length) return { stop: 'The page and the Staff Schedule Hours Report disagree. Pull the Staff Schedule Hours Report again before Start.',
     reasonCode: 'pageReportMismatch', skipReason: `Schedule differs from the Staff Schedule Hours Report: ${differences[0].message}; nothing changed` };
@@ -17061,5 +17063,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.11");
+__snoozeLoad("screen/panel.js").start("0.15.12");
 })();
