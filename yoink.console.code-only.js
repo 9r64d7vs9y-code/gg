@@ -1,4 +1,4 @@
-/* 2.0.0-console.8 */
+/* 2.0.0-console.9 */
 (() => {
 'use strict';
 const __yoinkModules = {
@@ -1712,7 +1712,7 @@ const { cleanEmail, emailDate, plainEmail, findByEmail } = __yoinkLoad('family/e
 const { reportWindow, todayOf, usDate } = __yoinkLoad('family/report-window.js');
 const { COLOURS } = __yoinkLoad('family/look.js');
 void (async () => {
-  const VERSION = '2.0.0-console.8';
+  const VERSION = '2.0.0-console.9';
   const TOOL_KEY = '__yoinkTool';
   if (window[TOOL_KEY]?.active || document.getElementById('bp-panel')) {
     alert('Yoink is already running. Close the existing panel before running it again.');
@@ -1902,17 +1902,24 @@ void (async () => {
     planDates = dates;
     try { return emailKey(term); } finally { planDates = outer; }
   };
-  const emailKey = (term) => {
+  const recordDate = (person) => person && (splitEmail(person.supplied).date
+    || splitEmail(person.entry?.email || '').date || splitEmail(person.pickedEmail || '').date);
+  const keyOf = (term, claim) => {
     const key = plainKey(term);
     const address = wholeEmail(String(term ?? '').trim());
     const date = address && emailDate(address);
-    if (!date) return key;
+    if (!date) {
+      if (!address || state.people.has(key)) return key;
+      const dated = state.people.datedOf?.(key);
+      return dated?.size === 1 ? [...dated][0] : key;
+    }
     if (state.people.has(address)) return address;
-    const owner = state.people.get(key);
-    const claimed = (owner && splitEmail(owner.supplied).date) || planDates?.get(key);
-    if (!claimed) { planDates?.set(key, date); return key; }
+    const claimed = recordDate(state.people.get(key)) || planDates?.get(key);
+    if (!claimed) { if (claim) planDates?.set(key, date); return key; }
     return claimed === date ? key : address;
   };
+  const emailKey = (term) => keyOf(term, true);
+  const skipKey = (term) => keyOf(term, false);
   const ID_RE = /^(?:\d{8}|\d{8}1)$/;
   const isId = (term) => /^\d+$/.test(String(term ?? '').trim());
   const LOCAL_CHAR = /[A-Za-z0-9._%+\-\p{Cf}]/u, DOMAIN_CHAR = /[A-Za-z0-9.\-\p{Cf}]/u;
@@ -3719,8 +3726,27 @@ void (async () => {
     }
     tool.cleanups.push(stop);
   })();
+  class People extends Map {
+    constructor() { super(); this.dated = new Map(); }
+    datedOf(plain) { return this.dated.get(plain); }
+    set(key, value) {
+      const address = wholeEmail(String(key)), date = address && address === key && emailDate(address);
+      if (date) {
+        const plain = plainEmail(address);
+        if (!this.dated.has(plain)) this.dated.set(plain, new Set());
+        this.dated.get(plain).add(key);
+      }
+      return super.set(key, value);
+    }
+    delete(key) {
+      const address = wholeEmail(String(key)), set = address && this.dated.get(plainEmail(address));
+      if (set) { set.delete(key); if (!set.size) this.dated.delete(plainEmail(address)); }
+      return super.delete(key);
+    }
+    clear() { this.dated.clear(); super.clear(); }
+  }
   const freshState = () => ({
-    people: new Map(), batches: [], pendingBatch: null, queuedBatches: [],
+    people: new People(), batches: [], pendingBatch: null, queuedBatches: [],
     batchSeq: 0, pasteSeq: 0, selectedSet: new Set(),
   });
   const state = freshState();
@@ -3905,6 +3931,7 @@ void (async () => {
   const columnPeople = new WeakMap();
   const columnSummariser = () => {
     const columns = [];
+    const dates = new Map();
     let rows = 0;
     const row = (values) => {
       const firstRow = rows++ === 0;
@@ -3924,7 +3951,7 @@ void (async () => {
           const looked = lookupTerm(term);
           if (looked) c.lookups++;
           if (looked && !c.sample) c.sample = term;
-          const key = looked ? keyWithin(c.dates ||= new Map(), term) : '';
+          const key = looked ? keyWithin(dates, term) : '';
           if (looked) c.seen.add(key);
           c.emails.push(term);
         }
@@ -4390,14 +4417,17 @@ void (async () => {
     return { pasted, excluded };
   };
   const skipRules = (excluded) => {
-    const plain = new Set(), dated = new Set();
+    const plain = new Set(), dated = new Set(), datedPlain = new Set();
     for (const value of excluded) {
       const address = wholeEmail(String(value ?? '').trim());
-      if (address && emailDate(address)) dated.add(address); else plain.add(plainKey(value));
+      if (address && emailDate(address)) { dated.add(address); datedPlain.add(plainEmail(address)); }
+      else plain.add(plainKey(value));
     }
     return { plain, dated, skips: (value) => {
       const address = wholeEmail(String(value ?? '').trim());
-      return plain.has(plainKey(value)) || Boolean(address && dated.has(address));
+      if (plain.has(plainKey(value))) return true;
+      if (!address) return false;
+      return emailDate(address) ? dated.has(address) : datedPlain.has(address);
     } };
   };
   const skipEntryCount = (excluded) => {
@@ -4837,8 +4867,9 @@ void (async () => {
     source = { ...source, emails: source.emails.filter(lookupTerm), excluded: [...(source.excluded || []), ...rejected] };
     const { list, raw, dupes, priorDupes, fresh, toAdd, alreadyInBox } =
       planSource(source.emails, seen, boxSelection(state.selectedSet));
-    const suppliedEmails = Object.fromEntries(dedupe([...source.emails, ...(source.excluded || [])]).list
-      .map((term) => [emailKey(term), term]));
+    const suppliedEmails = Object.fromEntries(dedupe(source.emails).list.map((term) => [emailKey(term), term]));
+    const skipKeys = dedupe(source.excluded || []).list.map((term) => [skipKey(term), term]);
+    const skipSupplied = Object.fromEntries(skipKeys);
     const allDupes = [...dupes.map(emailKey), ...priorDupes];
     const pickedEmails = Object.fromEntries(alreadyInBox.map((term) => {
       if (isId(term)) return [term, undefined];
@@ -4850,7 +4881,7 @@ void (async () => {
     const batch = {
       label: `Batch ${++state.batchSeq}`, source: source.name || `Pasted ${++state.pasteSeq}`, column: source.column || '',
       people: [], created: [], dupes: allDupes.map(key => ({ key, supplied: suppliedEmails[key] || key })),
-      skips: (source.excluded || []).map(value => ({ key: emailKey(value), supplied: suppliedEmails[emailKey(value)] || value })),
+      skips: (source.excluded || []).map(value => { const key = skipKey(value); return { key, supplied: skipSupplied[key] || value }; }),
       operation: newOperation(targets),
     };
     for (const key of list.map(emailKey)) snapshotPerson(batch.operation, key);
