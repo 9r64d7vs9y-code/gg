@@ -1,4 +1,4 @@
-/* 2.0.0-console.5 */
+/* 2.0.0-console.8 */
 (() => {
 'use strict';
 const __yoinkModules = {
@@ -1014,13 +1014,11 @@ async function parseSheetData(data, sheet, used, strings, styles, date1904, work
       for (const area of arrayFormulas) {
         if (address.r >= area.s.r && address.r <= area.e.r && address.c >= area.s.c && address.c <= area.e.c) hasFormula = true;
       }
-      if (cellTag.t == null && cell.v === undefined) {
-        if (hasFormula || cell.arrayRef) {
-          cell.v = 0;
-          cell.t = 'n';
-        } else {
-          continue;
-        }
+      if (cell.v === undefined && (hasFormula || cell.arrayRef || /<f(?:\s|>|\/)/.test(body))) {
+        cell.v = '#VALUE!';
+        cell.t = 'e';
+      } else if (cellTag.t == null && cell.v === undefined) {
+        continue;
       } else {
         cell.t = cellTag.t || 'n';
       }
@@ -1581,7 +1579,11 @@ function cleanEmail(value) {
 function emailDate(value) {
   const email = cleanEmail(value);
   const found = email.match(DATE_IN_FRONT);
-  return found && FULL_ADDRESS.test(email.slice(found[0].length)) ? found[1] : '';
+  if (!found || !FULL_ADDRESS.test(email.slice(found[0].length))) return '';
+  const [month, day, year] = found[1].split('-').map(Number);
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day ? found[1] : '';
 }
 function plainEmail(value) {
   const email = cleanEmail(value);
@@ -1710,7 +1712,7 @@ const { cleanEmail, emailDate, plainEmail, findByEmail } = __yoinkLoad('family/e
 const { reportWindow, todayOf, usDate } = __yoinkLoad('family/report-window.js');
 const { COLOURS } = __yoinkLoad('family/look.js');
 void (async () => {
-  const VERSION = '2.0.0-console.5';
+  const VERSION = '2.0.0-console.8';
   const TOOL_KEY = '__yoinkTool';
   if (window[TOOL_KEY]?.active || document.getElementById('bp-panel')) {
     alert('Yoink is already running. Close the existing panel before running it again.');
@@ -1736,10 +1738,12 @@ void (async () => {
   };
   const MAX_LOOKUP_PAGES = 20;
   const EMAIL_RE = /(?:[a-zA-Z0-9._%+-]\p{Cf}*)+@\p{Cf}*(?:[a-zA-Z0-9.-]\p{Cf}*)+\.(?:\p{Cf}*[a-zA-Z]){2,}\p{Cf}*/gu;
+  const ADDRESS_GLUE = /[\p{L}\p{N}'’`&=\/!#$^{|}~*?]/u;
   const APPROVED_ORIGIN = '';
   const APPROVED_PATH = '/Maintenance/StaffSearch';
   const FIELD_SELECTOR = '#GroupSearchCriteria_field_103';
   const EMPID_SELECTOR = '#GroupSearchCriteria_field_41';
+  const SEARCH_AGAIN_ACTION = 'a.js-search-again, button[data-action="search-again"]';
   const SESSION_EXPIRED_SELECTOR = '.session-expired-modal';
   const CONSULTING_REPORT_PAGE = {
     path: '/Reports/ScheduledHoursReport_Staff',
@@ -1750,11 +1754,12 @@ void (async () => {
     date: 'input:not([type=hidden]):not([type=search])',
     excluded: '.modal, template, #bp-panel', group: 'div.dynamic-form-group[data-group-name="Advanced"]',
     collapse: 'div.collapse', toggle: '[data-bs-target], [href], [aria-controls]',
-    searchAgain: 'Search Again', searchAgainAction: 'a.js-search-again, button[data-action="search-again"]',
+    searchAgain: 'Search Again', searchAgainAction: SEARCH_AGAIN_ACTION,
     searchAgainControl: 'a, button, [role=button]', form: '.grid-search',
     searchInput: '.select2-search__field',
     row: 'li.select2-results__option', list: '.select2-results__options',
     period: 'Day', business: 'Consulting Services',
+    fallback: { period: ['Day', 'Week', 'Period'], business: ['Audit & Assurance', 'Consulting Services', 'Talent'] },
     advanced: true, singles: ['period', 'business'], all: ['practice', 'area'],
   };
   const REPORT_PAGES = {
@@ -1855,7 +1860,7 @@ void (async () => {
     cancelFileInteraction = null;
     try { cancel?.(); } catch {   }
   };
-  let inputNotice = '', fileNotice = '';
+  let inputNotice = '', fileNotice = '', fileUsedNote = '';
   let lastProgressAt = Date.now();
   const active = () => tool.active && runState.phase !== 'closed';
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1867,7 +1872,11 @@ void (async () => {
     const s = Math.round(ms / 1000);
     return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
   };
-  const emailsIn = (text) => (String(text ?? '').match(EMAIL_RE) || []).map(cleanEmail);
+  const glued = (text, start, end) => ADDRESS_GLUE.test(text[start - 1] || '') || /[\p{L}\p{N}]/u.test(text[end] || '');
+  const emailsIn = (text) => {
+    const value = String(text ?? '');
+    return [...value.matchAll(EMAIL_RE)].filter(m => !glued(value, m.index, m.index + m[0].length)).map(m => cleanEmail(m[0]));
+  };
   const wholeEmail = (value) => {
     const text = norm(value).replace(/\p{Cf}/gu, '');
     return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(text) ? cleanEmail(text) : null;
@@ -1877,10 +1886,32 @@ void (async () => {
     const address = wholeEmail(value);
     return address ? { plain: plainEmail(address), date: emailDate(address) || null } : { plain: value, date: null };
   };
-  const emailKey = (term) => {
+  const plainKey = (term) => {
     const text = String(term ?? '').trim();
     const address = wholeEmail(text);
     return address ? plainEmail(address) : text;
+  };
+  let planDates = null;
+  const planning = (fn) => {
+    const outer = planDates;
+    planDates = outer || new Map();
+    try { return fn(); } finally { planDates = outer; }
+  };
+  const keyWithin = (dates, term) => {
+    const outer = planDates;
+    planDates = dates;
+    try { return emailKey(term); } finally { planDates = outer; }
+  };
+  const emailKey = (term) => {
+    const key = plainKey(term);
+    const address = wholeEmail(String(term ?? '').trim());
+    const date = address && emailDate(address);
+    if (!date) return key;
+    if (state.people.has(address)) return address;
+    const owner = state.people.get(key);
+    const claimed = (owner && splitEmail(owner.supplied).date) || planDates?.get(key);
+    if (!claimed) { planDates?.set(key, date); return key; }
+    return claimed === date ? key : address;
   };
   const ID_RE = /^(?:\d{8}|\d{8}1)$/;
   const isId = (term) => /^\d+$/.test(String(term ?? '').trim());
@@ -1898,6 +1929,7 @@ void (async () => {
     while (end > at + 1 && /[.\-\p{Cf}]/u.test(value[end - 1])) end--;
     const email = wholeEmail(value.slice(start, end).join(''));
     if (!email) return '';
+    if (glued(value, start, end)) return '';
     let before = start;
     while (before > 0 && /[\s\p{Cf}]/u.test(value[before - 1])) before--;
     if (before < start && before > 0 && LOCAL_CHAR.test(value[before - 1])) return '';
@@ -2006,6 +2038,8 @@ void (async () => {
     }
     return deadline.fallback;
   };
+  let ownPageWrite = 0;
+  let lookupTyped = false;
   const select2Driver = (() => {
     const tokenFor = (policy = 'write') => {
       const generation = runState.generation;
@@ -2015,7 +2049,8 @@ void (async () => {
     };
     const write = (token, action) => {
       if (!token.current()) throw new Error('Page operation stopped.');
-      return action();
+      ownPageWrite++;
+      try { return action(); } finally { ownPageWrite--; }
     };
     const cleanupToken = () => tokenFor('cleanup');
     const container = field => jQuery(field).data('select2')?.$container?.[0] || null;
@@ -2062,13 +2097,20 @@ void (async () => {
       copy.querySelectorAll('select, input, .select2-container').forEach(node => node.remove());
       return copy.textContent.trim() || 'Empid';
     };
+    const fieldOrThrow = (which) => {
+      const select = reportMode && which === 'email' ? reportField('email', true) : getSelect(which);
+      if (!select) throw new Error('Selection is unreadable.');
+      return select;
+    };
     const select2Data = (which = 'email') => {
-      try { return jQuery(getSelect(which)).select2('data') || []; }
+      const select = fieldOrThrow(which);
+      try { return jQuery(select).select2('data') || []; }
       catch { throw new Error('Selection is unreadable.'); }
     };
     const selectedIds = (which = 'email') => {
+      const select = fieldOrThrow(which);
       try {
-        const values = jQuery(getSelect(which)).val();
+        const values = jQuery(select).val();
         if (values != null) return [].concat(values).map(String);
       } catch {   }
       return select2Data(which).filter((item) => item.id != null).map((item) => String(item.id));
@@ -2172,7 +2214,7 @@ void (async () => {
     };
     const getSearchAgainButton = () => {
       if (reportMode) return reportSearchAgainButtons()[0] || null;
-      const controls = [...document.querySelectorAll(REPORT_PAGE.searchAgainAction)];
+      const controls = [...document.querySelectorAll(SEARCH_AGAIN_ACTION)];
       return controls.find(node => node.getClientRects().length > 0) || controls[0] || null;
     };
     const isApprovedPage = () => (!APPROVED_ORIGIN || location.origin === APPROVED_ORIGIN)
@@ -2660,7 +2702,7 @@ void (async () => {
           if (!options.length) return { state: 'incomplete', reset: ['answer'] };
           if (isId(term) && options.some(o => !idOf(o))) return { state: 'refusal', value: { failed: true, reason: 'the dropdown ids could not be read' } };
           const exact = options.filter(o => isId(term) ? idOf(o) === term : emailOf(o) === term);
-          const dated = !isId(term) && (splitEmail(term).date || options.some(o => splitEmail(emailOf(o)).date && emailKey(emailOf(o)) === emailKey(term)));
+          const dated = !isId(term) && (splitEmail(term).date || options.some(o => splitEmail(emailOf(o)).date && plainKey(emailOf(o)) === plainKey(term)));
           if (!dated) {
             if (exact.length > 1) return { state: 'refusal', value: { multiple: true, count: exact.length } };
             if (exact.length === 1 && !unfinished && (isId(term) || options.every(emailOf))) return { state: 'confirmed', value: exact[0] };
@@ -2692,6 +2734,7 @@ void (async () => {
     };
     const tryAdd = async (term) => {
       const which = fieldOf(term);
+      lookupTyped = false;
       try {
         if (!which || !lookupTerm(term)) return 'error';
         if (!state.selectedSet) return 'error';
@@ -2727,7 +2770,8 @@ void (async () => {
         } };
         let match;
         try {
-          type(input, emailKey(term));
+          type(input, plainKey(term));
+          lookupTyped = true;
           await lookupWait(T.settle);
           match = await waitForExactMatch(term, query);
         } finally { observer.disconnect(); }
@@ -2771,6 +2815,9 @@ void (async () => {
         const chosen = exact ? { match: exact[0], unclear: exact.length > 1 } : findByEmail(term, currentOptions, current.emailOf);
         if (chosen.unclear) { closeSelect(which); return 'multiple'; }
         if (chosen.match !== match) { closeSelect(which); return 'error'; }
+        if (match.getAttribute('aria-disabled') === 'true' || match.classList.contains('select2-results__option--disabled')) {
+          closeSelect(which); return 'error';
+        }
         const label = optionId == null ? labelOfOption(match) : '';
         selectExact(match);
         if (which === 'id' && optionId != null) {
@@ -2793,7 +2840,7 @@ void (async () => {
           if (which !== 'id' && optionId != null && afterValues.includes(String(optionId))) optionIdConfirmed = true;
         }
         closeSelect(which);
-        if (email) state.selectedSet.add(emailKey(email));
+        if (email && which === 'email') state.selectedSet.add(emailKey(email));
         const result = { added: true, optionId, email };
         Object.defineProperty(result, 'optionIdConfirmed', { value: optionIdConfirmed });
         Object.defineProperty(result, 'label', { value: label });
@@ -2804,9 +2851,8 @@ void (async () => {
       }
     };
     return {
-      container, open, type, readAnswer: lookupSnapshot, pageFurther, selectExact,
-      readSelected: selectedIds, removeAndVerify: removeSelectedEmail, pressKey, setValues, waitDuration,
-      empidReady, fieldOf, getSelect, staffIdLabel, selectedIds, fieldOnScreen,
+      container, waitDuration,
+      empidReady, fieldOf, staffIdLabel, selectedIds, fieldOnScreen,
       selectedEmails, selectedEmailFor, click, preflight, inputViewVisible, goToInputView,
       clearBox, undoChipIndex, removeSelectedEmail, reportAllIs, reportSingleIs,
       setReportSingle, setReportAll, setReportDate, reportAdvancedOpen, openReportAdvanced, tryAdd,
@@ -3098,10 +3144,10 @@ void (async () => {
     ['.bp-col-box', 'position:absolute;width:1px;height:1px;opacity:0;margin:0;'],
     ['.bp-hd', 'flex:1;min-width:0;font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'],
     ['.bp-nm', 'flex:0 0 auto;font-size:11px;font-weight:700;font-variant-numeric:tabular-nums;'],
-    ['.bp-col-detail', 'align-items:center;gap:8px;margin:3px 0 0;'],
+    ['.bp-col-detail', 'align-items:center;flex-wrap:wrap;gap:3px 8px;margin:3px 0 0;'],
     ['.bp-col-where', `flex:0 1 125px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:10px;font-weight:500;color:${PALETTE.subtle};background:#242424;border-radius:4px;padding:2px 5px;`],
     ['.bp-col-kind', 'flex:0 0 auto;font-size:10px;font-weight:600;'],
-    ['.bp-col-preview', `flex:1;min-width:0;font-family:monospace;font-size:10px;line-height:1.3;color:${PALETTE.subtle};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`],
+    ['.bp-col-preview', `flex:1 0 100%;order:1;min-width:0;font-family:monospace;font-size:10px;line-height:1.3;color:${PALETTE.subtle};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`],
     ['.bp-meter', 'flex:0 0 30px;height:3px;border-radius:2px;background:#2a2a2a;overflow:hidden;'],
     ['.bp-meter-fill', `height:100%;background:${PALETTE.subtle};`],
     ['#bp-column-list', 'overflow-y:auto;overscroll-behavior:contain;padding-right:6px;margin-right:-6px;'],
@@ -3136,7 +3182,6 @@ void (async () => {
     #bp-panel .bp-col .bp-hd { color:#eeeeee; }
     #bp-panel .bp-col .bp-nm { color:${PALETTE.muted}; }
     #bp-panel .bp-col.bp-on .bp-hd, #bp-panel .bp-col.bp-on .bp-nm { color:${PALETTE.greenText}; }
-    #bp-panel .bp-col.bp-on .bp-meter i { background:${PALETTE.muted}; }
     @media (prefers-reduced-motion: no-preference) {
       #bp-panel .bp-col { transition:background .12s ease,color .12s ease; }
     }
@@ -3358,7 +3403,7 @@ void (async () => {
   on(panel, 'click', (event) => event.stopPropagation());
   panel.focus({ preventScroll: true });
   const el = (id) => document.getElementById(id);
-  const messages = { status: { text: 'Loading…', title: '' }, live: '', pause: '', pauseNotice: '', resumed: '', held: null, readiness: '', recovery: '' };
+  const messages = { status: { text: 'Loading…', title: '' }, live: '', pause: '', resumed: '', held: null, readiness: '', recovery: '' };
   let statusText = 'Loading…';
   const paintStatus = n => {
     const expanded = document.activeElement === n;
@@ -3389,7 +3434,7 @@ void (async () => {
       title = [messages.held?.title, messages.status.title || messages.status.text, messages.readiness].filter(Boolean).join('\n');
     }
     else if (messages.held) ({ text, title } = messages.held);
-    else if (messages.pause) text = [messages.pauseNotice, messages.pause].filter(Boolean).join('\n');
+    else if (messages.pause) text = messages.pause;
     else {
       text = [messages.status.text, messages.live, messages.resumed].filter(Boolean).join('\n');
       title = [messages.status.title || messages.status.text, messages.live, messages.resumed].filter(Boolean).join('\n');
@@ -3402,15 +3447,11 @@ void (async () => {
   };
   const clearHeldMessage = () => { messages.held = null; renderMessage(); };
   const messageStatus = () => ({ ...messages.status });
-  const setPauseMessage = (text, notice = false) => {
+  const setPauseMessage = (text) => {
     if (recovering()) return;
-    if (notice) messages.pauseNotice = text;
-    else {
-      if (text && runPaused()) { messages.held = null; messages.resumed = ''; }
-      messages.pause = text && runPaused() ? text : '';
-      messages.pauseNotice = '';
-      messages.resumed = text && !runPaused() ? text : '';
-    }
+    if (text && runPaused()) { messages.held = null; messages.resumed = ''; }
+    messages.pause = text && runPaused() ? text : '';
+    messages.resumed = text && !runPaused() ? text : '';
     renderMessage(true);
   };
   const setRecoveryMessage = text => {
@@ -3485,7 +3526,7 @@ void (async () => {
     if (addClockStarted) return;
     addClockStarted = true;
     const tick = () => {
-      if (!active()) return;
+      if (!active() || recovering()) return;
       const seconds = Math.ceil(Math.max(0, 60 * 60000 - pageAge()) / 1000);
       el('bp-clock').textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
       updateConfirmationEstimate?.();
@@ -3600,6 +3641,11 @@ void (async () => {
     if (await confirmModal('Close Yoink?', 'Stops the current batch.', 'Close', 'Keep working')) destroy();
   };
   el('bp-x').onclick = confirmClose;
+  on(window, 'keydown', (e) => {
+    if (!active() || ownPageWrite || panel.contains(e.target) || e.target?.closest?.('.bp-modal-back')) return;
+    if (!hasSettlement('lookup') && !hasSettlement('setup')) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+  }, true);
   const focusablePanelNodes = () => focusableWithin(panel, 'button, textarea, input, select, [tabindex]');
   on(document, 'keydown', (e) => {
     if (!active()) return;
@@ -3726,9 +3772,7 @@ void (async () => {
     const person = state.people.get(key);
     if (!person) return;
     batch.operation.touched.add(key);
-    person.status = result?.added || result === 'dup' ? 'added' : 'not_found';
-    person.reason = person.status === 'added' ? '' : result === 'multiple' ? 'two people matched'
-      : result === false ? 'no match' : 'did not finish';
+    Object.assign(person, outcomeOf(result));
     if (result?.added) {
       person.entry = { term: key, email: result.email || key, optionId: result.optionId ?? null,
         optionIdConfirmed: result.optionIdConfirmed === true, label: result.label || '' };
@@ -3848,7 +3892,7 @@ void (async () => {
   };
   const wholeValue = (value) => {
     const text = String(value ?? '').trim();
-    return Boolean(text && (wholeEmail(decodeInput(text)) || isId(text)));
+    return Boolean(text && (wholeEmail(decodeInput(text)) || isId(text) || /[^\s@]@[^\s@]/.test(decodeInput(text))));
   };
   const rejectedCellTerms = new WeakMap();
   const chosenCellTerms = choices => {
@@ -3880,7 +3924,7 @@ void (async () => {
           const looked = lookupTerm(term);
           if (looked) c.lookups++;
           if (looked && !c.sample) c.sample = term;
-          const key = looked ? emailKey(term) : '';
+          const key = looked ? keyWithin(c.dates ||= new Map(), term) : '';
           if (looked) c.seen.add(key);
           c.emails.push(term);
         }
@@ -3922,8 +3966,7 @@ void (async () => {
     const options = [...(reportField(key, true)?.options || [])]
       .filter((option) => option.value !== '' && !option.disabled && option.textContent.trim())
       .map((option) => option.textContent.trim());
-    return options.length ? options : key === 'period' ? ['Day', 'Week', 'Period']
-      : ['Audit & Assurance', 'Consulting Services', 'Talent'];
+    return options.length ? options : REPORT_PAGE.fallback[key];
   };
   const reportDateValue = (text) => {
     const match = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(text);
@@ -4136,8 +4179,8 @@ void (async () => {
       const previewNode = dom('span', { className: 'bp-col-preview', title: preview }, preview);
       const card = dom('label', { className: 'bp-col', style: 'display:block;' },
         dom('span', { className: 'bp-col-top', style: 'display:flex;' },
-          dom('input', { type: 'checkbox', name: 'bp-email-column', checked: rememberedHeadings.has(headingKey(choice))
-            || ready && source.autoChoices.includes(choice), value: options.indexOf(choice),
+          dom('input', { type: 'checkbox', name: 'bp-email-column', checked: ready && (rememberedHeadings.has(headingKey(choice))
+            || source.autoChoices.includes(choice)), value: options.indexOf(choice),
             className: 'bp-col-box', 'aria-label': `${choice.header} · ${choice.file} · ${choice.sheetName} · ${choice.column} · ${kindWords(choice)} · ${plural(choice.unique, 'entry')}` }),
           dom('strong', { className: 'bp-hd', title: choice.header }, choice.header),
           ' ',
@@ -4166,11 +4209,12 @@ void (async () => {
     const empties = source.empties || [];
     el('bp-column-all')?.remove();
     clearDom(picker);
+    if (!ready) picker.appendChild(dom('div', { className: 'bp-sub', id: 'bp-column-purpose' }, 'Skip list file'));
     picker.appendChild(list);
     if (empties.length) picker.appendChild(dom('div', { className: 'bp-sub bp-dim' },
       `No usable entries in ${empties.map((entry) => `${entry.sheetName} (${entry.rows} rows)`).join(', ')}.`));
     picker.appendChild(dom('div', { id: 'bp-column-count' }));
-    if (!ready) picker.appendChild(dom('div', { className: 'bp-row bp-gap-top', style: 'display:flex;' }, buttonNode('bp-column-confirm', 'Add selected', 'green', BTN_CTRL), buttonNode('bp-column-all', 'Select all', 'gray', BTN_CTRL), buttonNode('bp-column-cancel', 'Cancel', 'gray', BTN_CTRL)));
+    if (!ready) picker.appendChild(dom('div', { className: 'bp-row bp-gap-top', style: 'display:flex;' }, buttonNode('bp-column-confirm', 'Skip selected', 'gray', BTN_CTRL), buttonNode('bp-column-all', 'Select all', 'gray', BTN_CTRL), buttonNode('bp-column-cancel', 'Cancel', 'gray', BTN_CTRL)));
     else picker.appendChild(buttonNode('bp-column-all', 'Select all', 'gray', 'bp-grow'));
     show('bp-input', false);
     show('bp-column-picker', true);
@@ -4212,10 +4256,12 @@ void (async () => {
     const sync = () => {
       const selected = chosen();
       const people = new Set(), shared = new Set();
-      for (const choice of selected) {
-        const keys = columnPeople.get(choice) || new Set((choice.emails || []).filter(lookupTerm).map(emailKey));
-        for (const key of keys) { if (people.has(key)) shared.add(key); people.add(key); }
-      }
+      planning(() => {
+        for (const choice of selected) {
+          const keys = columnPeople.get(choice) || new Set((choice.emails || []).filter(lookupTerm).map(emailKey));
+          for (const key of keys) { if (people.has(key)) shared.add(key); people.add(key); }
+        }
+      });
       const total = Math.max(people.size, ...selected.map(c => c.unique), 0);
       const count = el('bp-column-count');
       if (count) {
@@ -4267,10 +4313,8 @@ void (async () => {
         confirmButton.disabled = true;
         boxes.forEach(box => { box.disabled = true; });
         if (allButton) allButton.disabled = true;
-        const selectedHeadings = chosen.map(headingKey).filter(Boolean);
         chosen = await loadChosenColumns(chosen, readingCurrent);
         if (!readingCurrent()) return finish(null, false);
-        selectedHeadings.forEach(key => rememberedHeadings.add(key));
         finish(columnSources(chosen));
       } catch (error) {
         if (readingCurrent()) setStatus(`✗ ${csvErrorMessage(csvReadError({ name: source.name }, error))}`);
@@ -4326,12 +4370,12 @@ void (async () => {
   const refreshPasteCounts = () => {
     clearTimeout(countTimer); countTimer = 0;
     const { pasted, excluded } = readPasteBoxes();
-    const unique = uniq(pasted.map((term) => lookupTerm(term) ? emailKey(term) : term));
+    const unique = planning(() => uniq(pasted.map((term) => lookupTerm(term) ? emailKey(term) : term)));
     const inAdd = manualMode === 'add';
     const dupes = pasted.length - unique.length;
     const lookups = unique.filter(lookupTerm).length, skipped = unique.length - lookups;
     const found = !skipped ? `${plural(unique.length, 'entry')} found`
-      : `${lookups ? `${lookups} to look up` : 'Nothing to look up'} · ${skipped} will be skipped`;
+      : `${lookups ? `${lookups} to add` : 'Nothing to add'} · ${skipped} will be skipped`;
     const count = el('bp-manual-count');
     if (count) count.textContent = inAdd && unique.length
       ? `${found}${dupes ? ` (${plural(dupes, 'duplicate')})` : ''}.`
@@ -4341,14 +4385,30 @@ void (async () => {
     show('bp-skip-row', !inAdd, 'flex');
     show('bp-skip-clear-wrap', !inAdd && excluded.length > 0);
     const badge = el('bp-skip-badge');
-    if (badge) badge.textContent = excluded.length ? ` · ${excluded.length} skipped` : '';
+    const entries = skipEntryCount(excluded);
+    if (badge) badge.textContent = entries ? ` · ${entries} skipped` : '';
     return { pasted, excluded };
+  };
+  const skipRules = (excluded) => {
+    const plain = new Set(), dated = new Set();
+    for (const value of excluded) {
+      const address = wholeEmail(String(value ?? '').trim());
+      if (address && emailDate(address)) dated.add(address); else plain.add(plainKey(value));
+    }
+    return { plain, dated, skips: (value) => {
+      const address = wholeEmail(String(value ?? '').trim());
+      return plain.has(plainKey(value)) || Boolean(address && dated.has(address));
+    } };
+  };
+  const skipEntryCount = (excluded) => {
+    const { plain, dated } = skipRules(excluded);
+    return plain.size + [...dated].filter(address => !plain.has(plainEmail(address))).length;
   };
   const applyExclusions = (emails, excluded) => {
     if (!excluded.length) return { kept: emails, dropped: [] };
-    const block = new Set(excluded.map(emailKey));
+    const { skips } = skipRules(excluded);
     const kept = [], dropped = [];
-    emails.forEach((email) => (block.has(emailKey(email)) ? dropped : kept).push(email));
+    emails.forEach((email) => (skips(email) ? dropped : kept).push(email));
     return { kept, dropped };
   };
   const dragHasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
@@ -4380,8 +4440,13 @@ void (async () => {
       }
     };
   };
+  const boxSelection = (selected) => {
+    const ids = new Set(empidReady() ? selectedIds('id') : []);
+    return { has: person => isId(person)
+      ? ids.has(person) || ids.has(confirmedIdKeys.get(person)) : selected.has(person) };
+  };
   const collectFromFiles = async (purpose, files = null, current = active, unsupported = '') => {
-    fileNotice = '';
+    fileNotice = ''; fileUsedNote = '';
     if (!files) setStatus(`Choose your ${purpose} file${purpose === 'input' ? '(s)' : ''}…`);
     const results = files ? await scanFiles(files, current) : await pickFiles(current);
     if (!current()) return null;
@@ -4558,13 +4623,12 @@ void (async () => {
           }
         });
         const droppedUnique = sortUniq(allDropped);
-        const people = dedupe(kept.flatMap(source => source.emails)).list.filter(lookupTerm).map(emailKey);
         const skipped = sortUniq(kept.flatMap(source => [
           ...(source.excluded || []), ...source.emails.filter(term => !lookupTerm(term)),
         ])).length;
         const sourceText = sources.map(source => source.name
           ? `${source.name}${source.column ? ` · ${source.column}` : ''}` : 'Paste').join('; ');
-        return { kept, rejected, droppedUnique, people, skipped, sourceText };
+        return { kept, rejected, droppedUnique, skipped, sourceText };
       };
       let plan;
       if (!el('bp-confirm-start')) el('bp-confirm').append(
@@ -4592,20 +4656,24 @@ void (async () => {
         if (!current() || !confirming) return false;
         if (!plan || replan) plan = makePlan(typeof sourceValues === 'function' ? sourceValues() : sourceValues,
           refreshPasteCounts().excluded);
-        const { people, skipped, sourceText } = plan;
+        const { skipped, sourceText } = plan;
         el('bp-confirm-sources').textContent = sourceText;
         el('bp-confirm-sources').title = sourceText;
         if (!pasted) el('bp-retained-source').textContent = sourceText;
         let toAdd = 0, already = 0;
         try {
-          const selected = selectedEmails();
-          const ids = new Set(empidReady() ? selectedIds('id') : []);
-          const selection = { has: person => isId(person)
-            ? ids.has(person) || ids.has(confirmedIdKeys.get(person)) : selected.has(person) };
-          const seen = new Set(inputKeys().filter(term => finalReason(term) !== 'not reached'));
-          const counts = batchPeople(people, selection, seen);
-          toAdd = counts.toAdd.length;
-          already = counts.already.length;
+          const recorded = new Set(inputKeys().filter(term => finalReason(term) !== 'not reached'));
+          const seen = new Set(recorded), counted = new Set();
+          planning(() => {
+            const selection = boxSelection(selectedEmails());
+            for (const source of plan.kept) {
+              const counts = planSource(source.emails.filter(lookupTerm), seen, selection);
+              toAdd += counts.toAdd.length;
+              for (const key of [...counts.alreadyInBox, ...counts.priorDupes.filter(key => recorded.has(key)
+                && (isAdded(key) || selection.has(key)))]) counted.add(key);
+            }
+          });
+          already = counted.size;
         } catch {
           el('bp-confirm-start').disabled = true;
           setStatus('⚠ Could not read the selection → load or paste again.');
@@ -4637,6 +4705,8 @@ void (async () => {
         show('bp-input', true);
         return;
       }
+      const readyNote = pasted ? '' : [fileUsedNote, fileNotice && `⚠ ${fileNotice}`].filter(Boolean).join(' · ');
+      if (readyNote) setStatus(readyNote);
       show('bp-input', false);
       show('bp-confirm', true);
       el('bp-confirm-start').focus();
@@ -4678,7 +4748,7 @@ void (async () => {
       if (!kept.some((s) => s.emails.length)) {
         if (kept.length) {
           const seen = new Set(inputKeys());
-          kept.forEach((source) => commitBatch(prepareBatch(source, seen).batch));
+          planning(() => kept.forEach((source) => commitBatch(prepareBatch(source, seen).batch)));
           refreshRecordBoundary();
           renderCounts();
         }
@@ -4714,9 +4784,11 @@ void (async () => {
       const notice = fileNotice;
       const values = () => {
         const selected = columns.sources();
-        const used = columns.used().map(choice => `${clip(choice.header, 40)} (${clip(choice.file, 40)})`);
-        fileNotice = [notice, used.length ? `Used ${used.join(', ')}, the only ${reportMode
-          ? 'email column' : 'column with emails or numbers'}` : ''].filter(Boolean).join(' · ');
+        const several = uniq(columns.used().map(choice => choice.file)).length > 1;
+        const used = columns.used().map(choice => several ? `${clip(choice.header, 24)} (${clip(choice.file, 24)})` : clip(choice.header, 24));
+        fileNotice = notice;
+        fileUsedNote = used.length ? `Used ${used.join(', ')}, the only ${reportMode
+          ? 'email column' : 'column with emails or numbers'}.` : '';
         return selected;
       };
       settle(values, false, columns);
@@ -4742,30 +4814,34 @@ void (async () => {
     wireDropTarget(panel, inputScreenLive,
       (files, unsupported) => withFiles(live => loadAddFiles(files, live, unsupported)));
   });
-  const batchPeople = (people, selected, seen = new Set()) => {
-    const toAdd = [], alreadyInBox = [], already = [];
-    for (const person of people) {
-      const inBox = selected.has(person);
-      if (inBox) alreadyInBox.push(person);
-      if (inBox || isAdded(person)) already.push(person);
-      if (!inBox && !seen.has(person)) toAdd.push(person);
+  const planSource = (emails, seen, selection) => {
+    const { list, raw, dupes } = dedupe(emails);
+    const priorDupes = [], fresh = [];
+    list.map(emailKey).forEach((key) => {
+      if (seen.has(key)) priorDupes.push(key);
+      else { seen.add(key); fresh.push(key); }
+    });
+    const toAdd = [], alreadyInBox = [];
+    for (const key of fresh) (selection.has(key) ? alreadyInBox : toAdd).push(key);
+    return { list, raw, dupes, priorDupes, fresh, toAdd, alreadyInBox };
+  };
+  const reclaimDupes = (batch) => {
+    for (const { key, supplied } of batch.dupes) {
+      if (state.people.has(key)) continue;
+      batch.people.push(key);
+      state.people.set(key, { key, owner: batch, supplied, status: 'not_found', reason: 'not reached', entry: null, pickedEmail: '' });
     }
-    return { toAdd, alreadyInBox, already };
   };
   const prepareBatch = (source, seen) => {
     const rejected = source.emails.filter(term => !lookupTerm(term));
     source = { ...source, emails: source.emails.filter(lookupTerm), excluded: [...(source.excluded || []), ...rejected] };
-    const { list, raw, dupes } = dedupe(source.emails);
+    const { list, raw, dupes, priorDupes, fresh, toAdd, alreadyInBox } =
+      planSource(source.emails, seen, boxSelection(state.selectedSet));
     const suppliedEmails = Object.fromEntries(dedupe([...source.emails, ...(source.excluded || [])]).list
       .map((term) => [emailKey(term), term]));
-    const priorDupes = [], fresh = [];
-    list.map(emailKey).forEach((email) => {
-      if (seen.has(email)) priorDupes.push(email);
-      else { seen.add(email); fresh.push(email); }
-    });
     const allDupes = [...dupes.map(emailKey), ...priorDupes];
-    const { toAdd, alreadyInBox } = batchPeople(fresh, state.selectedSet);
     const pickedEmails = Object.fromEntries(alreadyInBox.map((term) => {
+      if (isId(term)) return [term, undefined];
       const email = selectedEmailFor(term);
       if (email === undefined) throw new Error('Selection is unreadable.');
       return [term, email];
@@ -4792,7 +4868,7 @@ void (async () => {
     alreadyInBox.forEach(key => settleLookup(batch, key, 'dup', pickedEmails[key]));
     return { batch, toAdd, raw, dupes: allDupes, alreadyInBox };
   };
-  const confirmBatches = (sources) => {
+  const confirmBatches = (sources) => planning(() => {
     sources = classifyIntakeSources(sources, []);
     const { batchSeq, pasteSeq } = state;
     let prepared;
@@ -4832,15 +4908,21 @@ void (async () => {
     if (totals.dupes) parts.push(`${totals.dupes} duplicate${totals.dupes === 1 ? '' : 's'}`);
     if (totals.already) parts.push(`${totals.already} already in`);
     parts.push(`${totals.toAdd} to add`);
-    if (fileNotice) parts.push(`⚠ ${fileNotice}`);
     setStatus(parts.join(' · '), [
       `${totals.raw} supplied`,
       ...prepared.map((p) => `${p.batch.source || 'Pasted'}${p.batch.column ? ` · ${p.batch.column}` : ''} — ${p.toAdd.length} to add`),
       fileNotice,
     ].filter(Boolean).join('\n'));
-    fileNotice = '';
+    fileNotice = ''; fileUsedNote = '';
     return { prepared, toAdd: totals.toAdd };
-  };
+  });
+  const OUTCOMES = new Map(  ([
+    ['dup', { status: 'added', reason: '' }],
+    ['multiple', { status: 'not_found', reason: 'two people matched' }],
+    [false, { status: 'not_found', reason: 'no match' }],
+  ]));
+  const outcomeOf = result => (result?.added ? { status: 'added', reason: '' }
+    : OUTCOMES.get(result) || { status: 'not_found', reason: 'did not finish' });
   const removalAllowed = () => pagePermission('remove');
   const removeBatchSelections = async (batch) => {
     const removed = [], failed = [];
@@ -4865,7 +4947,11 @@ void (async () => {
   let pauseStartedAt = null, pausedFor = 0;
   const pauseCauses = runState.causes;
   const showPauseCause = text => setPauseMessage(text);
-  const renderPauseCauses = () => showPauseCause(`Paused — ${[...pauseCauses].join(', ')}. Press Resume to continue.`);
+  const PAUSE_WHY = { Stop: '', 'hidden tab': 'tab hidden', 'Network lost': 'network lost' };
+  const renderPauseCauses = () => {
+    const why = [...pauseCauses].map(cause => PAUSE_WHY[cause] ?? cause).filter(Boolean);
+    showPauseCause(`⏳ Paused${why.length ? ` — ${why.join(', ')}` : ''} → press Resume${pauseCauses.has('Network lost') ? ' when it is back' : ''}.`);
+  };
   const setPaused = value => {
     if (!value) {
       if (pauseCauses.size) showPauseCause('');
@@ -4907,7 +4993,6 @@ void (async () => {
       const pauseButton = el('bp-pause');
       if (pauseButton) pauseButton.onclick = togglePause;
     }
-    setPauseMessage('⏳ Paused — tab hidden → press Resume.', true);
   };
   on(document, 'visibilitychange', () => { if (document.hidden) autoPause(); });
   const pauseFor = (reason) => {
@@ -4915,7 +5000,6 @@ void (async () => {
     pauseCauses.add(reason);
     setPaused(true); setPauseButton();
     renderPauseCauses();
-    setPauseMessage(`⚠ ${reason} — paused. Press Resume when it is back.`, true);
   };
   on(window, 'offline', () => pauseFor('Network lost'));
   on(window, 'online', () => {
@@ -4986,7 +5070,6 @@ void (async () => {
     const stopButton = el('bp-stop');
     if (stopButton) { stopButton.textContent = 'Cancel this batch'; restyle(stopButton, 'red', BTN_CTRL); stopButton.onclick = triggerCancel; }
     setPauseButton();
-    if (runPaused() && document.hidden) setPauseMessage('⏳ Paused — tab hidden → press Resume.', true);
     const pauseButton = el('bp-pause');
     if (pauseButton) pauseButton.onclick = togglePause;
     renderCounts(); setBar(0, list.length);
@@ -4998,7 +5081,7 @@ void (async () => {
       setLive(`${label}: ${clip(term, 30)}`);
       const lookupStarted = lookupTime();
       let result = await tryAdd(suppliedOfTerm(term, batch));
-      if (!runStopped() && active()) recordLookupTiming(lookupTime() - lookupStarted + T.gap);
+      if (lookupTyped && !runStopped() && active()) recordLookupTiming(lookupTime() - lookupStarted + T.gap);
       let pickedEmail;
       if (result === 'dup' && !isId(term)) {
         pickedEmail = selectedEmailFor(term);
@@ -5032,6 +5115,7 @@ void (async () => {
         : '⚠ That batch finished before you confirmed. Nothing was cancelled — use ↩ Undo a batch to remove it.');
       return;
     }
+    const queuedBehind = [...state.queuedBatches];
     if (!moveRun('cancelling')) return;
     runState.operation.kind = 'cancel';
     const cancelSettled = holdSettlement('cancel');
@@ -5051,6 +5135,7 @@ void (async () => {
       return;
     }
     rollbackOperation(batch);
+    queuedBehind.forEach(reclaimDupes);
     state.pendingBatch = null;
     refreshRecordBoundary();
     renderCounts();
@@ -5099,7 +5184,7 @@ void (async () => {
       for (const { key: term } of batch.skips) {
         if (emitted.has(term) || supplied.has(term)) continue;
         emitted.add(term);
-        rows.push([suppliedOfTerm(term, null, spellings), 'skipped', '', source, profile(term)]);
+        rows.push([suppliedOfTerm(term, null, spellings), 'skipped', '', source, '']);
       }
     }
     const cell = (v) => String(v).replace(/^[=+\-@\t\r]/, "'$&").replace(/"/g, '""');
@@ -5133,6 +5218,7 @@ void (async () => {
     .map((batch, index) => ({ batch, index }))
     .filter(({ batch }) => batchSelected(batch).length > 0);
   const undoToggleLabel = (open) => `${open ? '▾' : '↩'} Undo a batch`;
+  const batchName = batch => `${batch.source || batch.label}${batch.column ? ` · ${batch.column}` : ''}`;
   const renderBatches = () => {
     const node = el('bp-batches');
     const canRetry = retryable().length;
@@ -5163,7 +5249,7 @@ void (async () => {
       });
       node.appendChild(dom('div', { className: `bp-batch${position < undoable.length - 1 ? ' bp-batch-gap' : ''}`, style: 'display:flex;' },
         dom('span', { className: 'bp-batch-text' },
-          dom('span', { className: 'bp-batch-name', style: 'display:block;' }, `${position + 1}. ${batch.source || batch.label}`), outcomes),
+          dom('span', { className: 'bp-batch-name', style: 'display:block;' }, `${position + 1}. ${batchName(batch)}`), outcomes),
         dom('button', { type: 'button', 'data-undo': i, className: buttonClasses('gray', 'bp-undo-button') }, 'Undo')));
     });
     node.querySelectorAll('button[data-undo]').forEach((b) => { b.onclick = () => undoBatch(Number(b.dataset.undo)); });
@@ -5189,10 +5275,10 @@ void (async () => {
     return true;
   }).then((ok) => ok && active() && !recovering() && offerAfterBatch());
   const undoQuestion = (batch) => {
-    const name = escapeHtml(clip(batch.source || batch.label, 40));
+    const name = escapeHtml(clip(batchName(batch), 40));
     const notFound = batch.people.filter(term => !isAdded(term)).length;
     const skipped = sortUniq(batch.skips.map(skip => skip.key)).length;
-    const leaving = [notFound ? plural(notFound, 'not-found entry') : '', skipped ? plural(skipped, 'skipped value') : ''].filter(Boolean);
+    const leaving = [notFound ? `${plural(notFound, 'entry')} not found` : '', skipped ? plural(skipped, 'skipped value') : ''].filter(Boolean);
     const verb = notFound + skipped === 1 ? 'leaves' : 'leave';
     return `Remove the ${plural(ownedAdded(batch).length, 'added entry')} from "${name}"?`
       + (leaving.length ? ` Its ${leaving.join(' and ')} ${verb} the CSV too.` : '') + ' Every other batch stays.';
@@ -5200,7 +5286,7 @@ void (async () => {
   const undoBatch = (index) => withBusy(async () => {
     const batch = state.batches[index];
     if (!batch) return;
-    const name = batch.source || batch.label;
+    const name = batchName(batch);
     if (!(await confirmModal('Undo this batch?', undoQuestion(batch), 'Undo batch', 'Keep working'))) return;
     if (!beginRun('cancelling', 'undo')) return;
     const undoSettled = holdSettlement('undo');
@@ -5211,7 +5297,7 @@ void (async () => {
     if (failed.length) {
       keepUnremovedEntries(batch, failed);
       batch.skips = [];
-      inputNotice = `⚠ ${plural(failed.length, 'entry')} could not be removed and stay in "${clip(name, 30)}" — could not verify → try Undo again.`;
+      inputNotice = `⚠ ${plural(failed.length, 'entry')} not removed from "${clip(name, 24)}" → try Undo again.`;
       setStatus(inputNotice);
     } else {
       dropOwnedPeople(batch);
@@ -5300,6 +5386,7 @@ void (async () => {
   }
   const offerAfterBatch = async () => {
     if (!active() || recovering()) return;
+    setPauseMessage('');
     setStatus(inputNotice || '');
     inputNotice = '';
     renderBatches();
@@ -5309,6 +5396,7 @@ void (async () => {
     while (choice === 'reset' && active() && !(await startFresh())) choice = await askOne(choices);
     if (!active() || recovering()) return;
     show('bp-more', false);
+    if (choice === 'more') { clearHeldMessage(); setStatus(''); }
     return collectAndFinish();
   };
   const saveCsv = button => {
