@@ -1,4 +1,4 @@
-// v0.15.13
+// v0.15.14
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -3680,7 +3680,9 @@ const { addDays, compareDays, mondayOf, todayOf, usDate, workingDays } = __requi
 const { within } = __require("../rules/leaves.js");
 const { PageError, WAIT, stopFlagged } = __require("./dom.js");
 const { cancelBatchWindows } = __require("./batch.js");
-const { pageReady } = __require("./schedule.js");
+const { pageReady, scheduleFacts } = __require("./schedule.js");
+const { termDayOf } = __require("../rules/shared.js");
+const { isEditableDay } = __require("./editability.js");
 const { copyWindow, compareCopies, sameLive, knownAssignmentRows, retainAssignmentEvidence, memoryCopy } = __require("./copy.js");
 const { calendarBefore, calendarShowsChange, calendarShowsDelete } = __require("./calendar-check.js");
 const { deleteRange, addAssignment, preflightDates, setAssignmentHours } = __require("./write.js");
@@ -3735,20 +3737,26 @@ async function weeklyRestorePlan(backup, { after = null, today = todayOf(), veri
   const remove = live.filter(row => !taken.has(row));
   const thisMonday = mondayOf(today);
   const past = { raise: item => compareDays(item.old.day, thisMonday) < 0, add: row => compareDays(row.day, today) < 0, remove: row => compareDays(row.day, today) < 0 };
+  const termText = String((memory ? backup.termDate : scheduleFacts().termDate ?? backup.termDate) ?? '').trim();
+  const term = termText ? termDayOf(termText) : null;
+  if (termText && !term) throw new PageError('The Term Date cannot be read. Nothing was restored; By hand.');
+  const locked = row => !isEditableDay(row.day, row.day, term);
+  const skippedLocked = byDate([...raise.map(item => item.old), ...add, ...remove].filter(locked).map(row => row.day));
   const laterChanged = after && !sameLive({ days: after.days.filter(inside) }, { days: live }, false);
   const skipped = { raise: raise.filter(past.raise), add: add.filter(past.add), remove: remove.filter(past.remove) };
   const on = (rows, day) => ({ days: rows.filter(row => compareDays(row.day, day) === 0) });
   const batchChanged = day => !after?.window || within(day, after.window) && !compareCopies(on(backup.days, day), on(after.days, day)).same;
   const skippedPastDays = byDate([...skipped.raise.map(item => item.old), ...skipped.add, ...skipped.remove].map(row => row.day)).filter(batchChanged);
-  const steps = laterChanged ? { raise: [], add: [], remove: [] } : { raise: raise.filter(item => !past.raise(item)), add: add.filter(row => !past.add(row)), remove: remove.filter(row => !past.remove(row)) };
+  const steps = laterChanged ? { raise: [], add: [], remove: [] } : { raise: raise.filter(item => !past.raise(item) && !locked(item.old)), add: add.filter(row => !past.add(row) && !locked(row)), remove: remove.filter(row => !past.remove(row) && !locked(row)) };
   const changes = [...raise.map(item => item.old), ...add, ...remove];
   const skippedLater = laterChanged ? changes.map(row => ({ day: row.day, clients: [row.client] })) : [];
   const changedDays = byDate([...steps.raise.map(item => item.old), ...steps.add, ...steps.remove].map(row => row.day));
-  const keptOld = new Set([...skipped.raise.map(item => item.old), ...skipped.add]);
-  const expected = [...backup.days.filter(row => !keptOld.has(row)), ...skipped.raise.map(item => item.row), ...skipped.remove];
+  const heldRaise = raise.filter(item => past.raise(item) || locked(item.old));
+  const keptOld = new Set([...heldRaise.map(item => item.old), ...add.filter(row => past.add(row) || locked(row))]);
+  const expected = [...backup.days.filter(row => !keptOld.has(row)), ...heldRaise.map(item => item.row), ...remove.filter(row => past.remove(row) || locked(row))];
   const noted = [...retained, ...steps.raise].map(({ old, row }) => ({ ...old, notes: row.notes || 0 }));
   return { window, before, changedDays, steps, expected, noted, skippedPast: skippedPastDays.length, skippedPastDays,
-    skippedLater, skippedLocked: [], skippedUnconfirmed: unconfirmed, nothing: changedDays.length ? '' : 'Nothing left to undo.' };
+    skippedLater, skippedLocked, skippedUnconfirmed: unconfirmed, nothing: changedDays.length ? '' : 'Nothing left to undo.' };
 }
 function sameDayClient(rows) {
   const groups = new Map();
@@ -3784,14 +3792,14 @@ async function restoreWeeklyWindow(backup, options = {}) {
   const read = () => copyWindow(plan.window, { future: true });
   const prove = async (expected, fresh = null) => {
     const after = fresh || await read();
-    if (!compareCopies({ days: expected }, after).same) throw new PageError('The Weekly restore step could not be proved.');
+    if (!sameLive({ days: expected }, after, false)) throw new PageError('The Weekly restore step could not be proved.');
     current = after; readAfterWrite = after.calendarChecked ? null : after;
     recordRun({ type: 'writeProof', ok: true });
   };
   const kinds = [...sameDayClient(plan.steps.remove).map(() => 'remove'), ...plan.steps.raise.map(() => 'raise'), ...plan.steps.add.map(() => 'add')];
   let writeIndex = 0;
   const shotFor = () => { const next = kinds[++writeIndex]; return next && next !== 'remove' && calendarCheck && !automaticRecovery ? calendarBefore(today) : null; };
-  const alike = (a, b) => sameRow(a, b) && hasNote(a) === hasNote(b);
+  const alike = (a, b) => sameRow(a, b) && (a.notes || 0) === (b.notes || 0);
   const findAgain = rows => {
     const found = rows.map(row => (row.id && current.days.find(live => live.id === row.id)) || null);
     const used = new Set(found.filter(Boolean));
@@ -3862,8 +3870,8 @@ async function restoreWeeklyWindow(backup, options = {}) {
     if (live) taken.add(live);
     return !!live;
   });
-  const same = compareCopies({ days: plan.expected }, { days: page }).same && notesBack && !plan.skippedUnconfirmed.length && !plan.skippedLater.length;
-  const unrestoredDates = [...new Set([...plan.skippedUnconfirmed.map(usDate), ...plan.skippedPastDays.map(usDate), ...failures.map(row => usDate(row.day)), ...(same ? [] : plan.changedDays.map(usDate))])];
+  const same = compareCopies({ days: plan.expected }, { days: page }).same && notesBack && !plan.skippedUnconfirmed.length && !plan.skippedLater.length && !plan.skippedLocked.length;
+  const unrestoredDates = [...new Set([...plan.skippedUnconfirmed.map(usDate), ...plan.skippedPastDays.map(usDate), ...plan.skippedLocked.map(usDate), ...failures.map(row => usDate(row.day)), ...(same ? [] : plan.changedDays.map(usDate))])];
   return { ...plan, same: same && !failures.length && !plan.skippedPastDays.length, after, added, runs, unrestoredDates,
     differences: unrestoredDates.map(date => ({ date, message: `${date}: Weekly restore unconfirmed.` })), missing: [], extra: [], recoveryFailures: failures };
 }
@@ -5705,7 +5713,9 @@ const { copyWindow, coverAssignmentRange, retainAssignmentEvidence, dayOf, sched
 const { PageError, WAIT, guardReady, chooseInSelect2, click, closeWindow, fieldByLabel, cleanupAfter, modalTransitioning, sameText, settled, shown, stopFlagged, text, typeInto, waitFor } = __require("./dom.js");
 const { setDates, proveAllowedDates, setDateSet } = __require("./dates-box.js");
 const { waitForDates, waitForDateSet, readDates } = __require("./dates-box.js");
-const { buttonIn, emptySpots, menuItem, findAssignments, findAssignmentsRange, readEditTable, closeEdit, personIdentity, waitForPersonIdentity } = __require("./schedule.js");
+const { buttonIn, emptySpots, menuItem, findAssignments, findAssignmentsRange, readEditTable, closeEdit, personIdentity, waitForPersonIdentity, scheduleFacts } = __require("./schedule.js");
+const { termDayOf } = __require("../rules/shared.js");
+const { isEditableDay } = __require("./editability.js");
 const { calendarHolds, showDate } = __require("./calendar.js");
 const { rememberPreflightForm, takePreflightForm, preflightFormIdentity, reuseBatchDateTrial, rememberBatchDateTrial, failBatchDateTrial, changedBatchDateTrial } = __require("./preflight-form.js");
 function deleteClickState(confirm) {
@@ -6182,9 +6192,14 @@ async function deleteRange(query, before, { edit = null, read, onWrite = () => {
 function addAssignment(...args) { return timedRun("add", () => addAssignmentRecorded(...args)); }
 async function setAssignmentHours(query, expected, target, hours, { onWrite = () => {}, restoring = false, weekly = false, remove = [], findAgain = false } = {}) {
   const grouped = Array.isArray(target), targets = grouped ? target : [{ target, hours }];
-  const allowed = () => (targets.length > 0 || grouped && weekly && !restoring && remove.length > 0) && (!grouped || weekly && !restoring)
+  const termAllowed = () => {
+    if (!weekly) return true;
+    const text = String(scheduleFacts().termDate ?? '').trim(), term = text ? termDayOf(text) : null;
+    return (!text || !!term) && targets.every(({ target }) => isEditableDay(target.day, target.day, term));
+  };
+  const allowed = () => termAllowed() && (targets.length > 0 || grouped && weekly && !restoring && remove.length > 0) && (!grouped || weekly && !restoring)
     && new Set(targets.map(item => item.target.id)).size === targets.length
-    && (!remove.length || weekly && remove.every(row => row.id && !targets.some(item => item.target.id === row.id) && compareDays(row.day, mondayOf(todayOf())) >= 0))
+    && (!remove.length || weekly && remove.every(row => row.id && !targets.some(item => item.target.id === row.id) && compareDays(row.day, todayOf()) >= 0))
     && (weekly ? !isTaxPage() : isTaxPage())
     && targets.every(({ target, hours }) => compareDays(target.day, mondayOf(todayOf())) >= 0 && (restoring || hours <= target.hours)
       && (weekly || compareDays(target.day, todayOf()) >= 0 || !['loa', 'holiday', 'dns'].includes(entryKind(target)) && valueKey(target.client) !== 'loa'));
@@ -6348,7 +6363,7 @@ __exports.removalCloseUp = removalCloseUp;
 'use strict';
 const { usDate } = __require("../rules/dates.js");
 const { valueKey } = __require("../rules/prepare.js");
-const { compareCopies, dayOf, ENTRY_FIELDS } = __require("./copy.js");
+const { compareCopies, dayOf, ENTRY_FIELDS, sameLive } = __require("./copy.js");
 const { PageError, cleanupAfter, WAIT, click, closeWindow, fieldByLabel, settled, shown, text, typeInto, waitFor, recognizeBulkWindow, observeWindowTitle } = __require("./dom.js");
 const { findAssignments, readEditTable, closeEdit } = __require("./schedule.js");
 const { removalCloseUp } = __require("./close-up.js");
@@ -6530,7 +6545,7 @@ async function stageTaxHours(query, expected, target, hours, { remove = [], find
   try {
     const snapshot = async () => ({ days: (await readEditTable(edit)).map(row => ({ ...row, day: dayOf(row.date) })) });
     const before = await snapshot();
-    if (!compareCopies(expected, before).same || before.days.some(row => !row.day || !row.id) || new Set(before.days.map(row => row.id)).size !== before.days.length) throw new PageError('Tax assignments changed before the hours edit. Nothing was saved.');
+    if (!sameLive(expected, before, false) || before.days.some(row => !row.day || !row.id) || new Set(before.days.map(row => row.id)).size !== before.days.length) throw new PageError('Tax assignments changed before the hours edit. Nothing was saved.');
     let targets = Array.isArray(target) ? target : [{ target, hours }];
     if (findAgain) targets = targets.map(item => {
       if (before.days.some(row => row.id === item.target.id)) return item;
@@ -6540,7 +6555,7 @@ async function stageTaxHours(query, expected, target, hours, { remove = [], find
     if (!targets.length && !remove.length || new Set(targets.map(item => item.target.id)).size !== targets.length) throw new PageError('Tax hours edit has no unique unchanged entry. Nothing was saved.');
     for (const { target, hours } of targets) {
       const matching = before.days.filter(row => row.id === target.id);
-      if (matching.length !== 1 || !compareCopies({ days: [target] }, { days: matching }).same) throw new PageError('Tax hours edit has no unique unchanged entry. Nothing was saved.');
+      if (matching.length !== 1 || !sameLive({ days: [target] }, { days: matching }, false)) throw new PageError('Tax hours edit has no unique unchanged entry. Nothing was saved.');
       if (!Number.isFinite(hours) || hours < 0) throw new PageError('Tax Hours cell is unreadable. Nothing was saved.');
     }
     let after = before;
@@ -8923,6 +8938,7 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
       ...(prepared?.runs || []).flatMap(run => run.rows.map(entry => entry.day)),
       ...(prepared?.exitRuns || []).flatMap(run => run.rows.map(entry => entry.day)),
       ...(prepared?.earlyDns || []).map(entry => entry.day),
+      ...(prepared?.weekly?.remove || []).map(entry => entry.day),
       ...(prepared?.taxPlan?.weeks || []).flatMap(week => week.lowerClients.map(item => item.row.day)),
     ];
   };
@@ -9211,11 +9227,13 @@ function createBatch(cases, report, version, { notify = () => {}, lock = () => b
         const recoveryToday = currentToday();
         row.restoreResult = await withDateTrials(row, () => timedRun('restore', () => recoverBackup(row.prepared.backup, { today: recoveryToday })));
         const past = compareDays(recoveryToday, today) > 0
-          ? [...new Set(changeDays(row).filter(day => compareDays(day, recoveryToday) < 0
+          ? [...new Set([...changeDays(row), ...(row.prepared.weekly?.lower || [])
+            .filter(item => compareDays(mondayOf(item.row.day), mondayOf(recoveryToday)) < 0).map(item => item.row.day)]
+            .filter(day => compareDays(day, recoveryToday) < 0
             && !(row.prepared.tax && row.restoreResult.after && compareCopies(
               { days: row.prepared.backup.days.filter(old => compareDays(old.day, day) === 0) },
               { days: row.restoreResult.after.days.filter(old => compareDays(old.day, day) === 0) }).same)
-            && (!row.prepared.backup.reportEnd || compareDays(day, row.prepared.backup.reportEnd) <= 0)).map(usDate))] : [];
+            ).map(usDate))] : [];
         if (past.length) {
           row.restoreResult.same = false;
           row.restoreResult.unrestoredDates = [...new Set([...(row.restoreResult.unrestoredDates || []), ...past])];
@@ -10352,7 +10370,7 @@ const { PageError, withPersonGuard, stopFlagged, cleanupAfter } = __require("../
 const { openPerson, findAssignments, findAssignmentsRange, readEditTable, closeEdit, scheduleFacts, personIdentity, waitForPersonIdentity: requirePersonIdentity, checkPersonIdentity, beginScheduleTurn, exitCalendarSnapshot, settledExitCalendar, allowWeeklyRows, allowGreyedWeekStart, weeklyRowsShown } = __require("../mysource/schedule.js");
 const { leaveRuns, leavePeriod, loaBlocks, dayRanges, inRange } = __require("../rules/leaves.js");
 const { deleteAll, deleteRange, deleteFromTable, splitDeleteWeeks, addAssignment, preflightDates, refreshNotes, setAssignmentHours } = __require("../mysource/write.js");
-const { compareCopies, copyWindow, entriesToAdd, dayOf, knownAssignmentRows, retainAssignmentEvidence } = __require("../mysource/copy.js");
+const { compareCopies, copyWindow, entriesToAdd, dayOf, knownAssignmentRows, retainAssignmentEvidence, sameLive } = __require("../mysource/copy.js");
 const { calendarBefore, calendarShowsDelete } = __require("../mysource/calendar-check.js");
 const { restoreWindow, restorePlan, memoryRestorePlan } = __require("../mysource/restore.js");
 const { LOA_CLIENT, DNS_CLIENT, checkDnsAdded, checkLoaAdded } = __require("../mysource/checks.js");
@@ -10648,7 +10666,14 @@ async function applyRecorded(one, prepared, { step = fn => fn(), onWrite: writeN
   const outside = (allowed, after) => {
     if (!prepared.watched) return [];
     const keep = copy => ({ ...copy, days: copy.days.filter(row => !allowed(row)) });
-    const result = compareCopies(keep(prepared.watched), keep(after));
+    const was = keep(prepared.watched), now = keep(after);
+    const result = compareCopies(was, now);
+    if (result.same && !sameLive(was, now, false)) {
+      const onDay = (copy, day) => ({ days: copy.days.filter(row => compareDays(row.day, day) === 0) });
+      result.same = false;
+      result.missing = [...new Map(was.days.map(row => [usDate(row.day), row.day])).values()]
+        .filter(day => !sameLive(onDay(was, day), onDay(now, day), false)).map(usDate);
+    }
     recordLaterChange(prepared, after);
     return result.same ? [] : [`${result.missing.length + result.extra.length} entr${result.missing.length + result.extra.length === 1 ? 'y' : 'ies'} changed OUTSIDE the planned days (first: ${[...result.missing, ...result.extra][0].split('|')[0]}) → check the schedule from ${usDate(prepared.watchedWindow.start)}`];
   };
@@ -11463,7 +11488,9 @@ const { exitMailChoice } = __require("../rules/exit.js");
 const { PageError, withPersonGuard, stopFlagged } = __require("../mysource/dom.js");
 const { calendarBefore, calendarShowsChange } = __require("../mysource/calendar-check.js");
 const { checkPersonIdentity, waitForPersonIdentity } = __require("../mysource/schedule.js");
-const { copyWindow, compareCopies, futureCopyFrom } = __require("../mysource/copy.js");
+const { copyWindow, compareCopies, futureCopyFrom, sameLive } = __require("../mysource/copy.js");
+const { termDayOf } = __require("../rules/shared.js");
+const { isEditableDay } = __require("../mysource/editability.js");
 const { deleteRange, addAssignment, preflightDates, setAssignmentHours, weekRuns } = __require("../mysource/write.js");
 const { DNS_CLIENT } = __require("../mysource/checks.js");
 const { backupRecord, compareByDay, reportDays, withPagePricing, validatePageDays, pageRowsAfter, pageBackupRow, recordLaterChange } = __require("./backup.js");
@@ -11498,6 +11525,12 @@ async function prepareWeeklyExit(ctx) {
   for (const row of copy.days) if (!row.client || !row.day || !Number.isFinite(row.hours) || row.hours <= 0 || !row.id) return { stop: 'A Weekly schedule row cannot be read completely. Nothing was changed; By hand.' };
   const weekly = planWeeklyExit({ rows: copy.days, boundary, dns, greyed: greyedExit, today });
   if (weekly.byHand) return { stop: weekly.byHand, reasonCode: 'weeklyByHand' };
+  const term = termText ? termDayOf(termText) : null;
+  const locked = weekly.lower.filter(item => !isEditableDay(item.row.day, item.row.day, term));
+  const skippedLocked = locked.map(item => item.row.day);
+  weekly.lower = weekly.lower.filter(item => !locked.includes(item));
+  weekly.left.push(...locked.map(item => ({ ...item.row, locked: true })));
+  weekly.expected = weekly.expected.map(row => locked.find(item => item.row.id === row.id)?.row || row);
   const leftUnchanged = weekly.left.map(row => ({ client: row.client, day: row.day, hours: row.hours, ...(row.locked ? { locked: true } : {}) }));
   const changes = [...weekly.lower.map(item => ({ row: item.row, hours: item.row.hours - item.hours })), ...weekly.remove.map(row => ({ row, hours: row.hours }))];
   const removing = new Map();
@@ -11512,13 +11545,13 @@ async function prepareWeeklyExit(ctx) {
   plan.greyed = greyed;
   if (!changes.length && !weekly.addDns) {
     return { nothing: weekly.dnsInPlace ? 'DNS already there; no change' : 'Schedule greyed out: no schedule change.',
-      alreadyDone: weekly.dnsInPlace, checks: [], identity, copy, greyedExit, leftUnchanged };
+      alreadyDone: weekly.dnsInPlace, checks: [], identity, copy, greyedExit, leftUnchanged, skippedLocked };
   }
   const later = pageRowsAfter(reportEnd, copy);
   const reachesLater = !greyedExit && (changes.some(({ row }) => !inReport(row)) || !!weekly.addDns && compareDays(weekly.addDns.end, reportEnd) > 0);
-  if (reachesLater) validatePageDays(later);
+  if (greyedExit || reachesLater) validatePageDays(later);
   let laterBacked = compareDays(copy.window.end, reportEnd) > 0;
-  if (!reachesLater) try { validatePageDays(later); } catch (error) { if (!(error instanceof PageError)) throw error; laterBacked = false; }
+  if (!greyedExit && !reachesLater) try { validatePageDays(later); } catch (error) { if (!(error instanceof PageError)) throw error; laterBacked = false; }
   const noPutBack = weekly.remove.filter(row => !inReport(row) && !workingDays(row.day, addDays(mondayOf(row.day), 4)).length);
   if (noPutBack.length) return { stop: `Snooze could not put these days back if needed: ${noPutBack.length} weekend day${noPutBack.length === 1 ? '' : 's'} (${usDate(noPutBack[0].day)} …).` };
   const paired = new Set();
@@ -11550,7 +11583,7 @@ async function prepareWeeklyExit(ctx) {
     }
   }
   return { weekly, greyedExit, identity, copy, watched: copy, window: copy.window, watchedWindow: copy.window, backup, reportEnd, checks: [],
-    removing: [...removing.values()], daysCompared: new Set(copy.days.map(row => usDate(row.day))).size, addDns: !!weekly.addDns, dnsRuns, leftUnchanged };
+    removing: [...removing.values()], daysCompared: new Set(copy.days.map(row => usDate(row.day))).size, addDns: !!weekly.addDns, dnsRuns, leftUnchanged, skippedLocked };
 }
 async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () => {} } = {}) {
   if (!prepared.backup || prepared.backup.email !== one.record.email || prepared.backup.site !== 'weekly') throw new PageError('The Weekly backup is not ready. Nothing was changed.');
@@ -11566,7 +11599,7 @@ async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () 
   const read = () => copyWindow(window, { future: true });
   const prove = async (expected, fresh = null) => {
     const after = fresh || await read();
-    if (!compareCopies({ days: expected }, after).same) throw new PageError(stopWords);
+    if (!sameLive({ days: expected }, after, false)) throw new PageError(stopWords);
     recordRun({ type: 'writeProof', ok: true });
     current = after; readAfterWrite = after;
     return after;
@@ -11660,7 +11693,7 @@ async function applyWeeklyExit(one, prepared, { step = fn => fn(), onWrite = () 
     await proveOrCalendar(expected, shot, workingDays(run.start, run.end).map(day => ({ day, client: DNS_CLIENT, hours: 8 })));
   });
   const after = readAfterWrite || await read();
-  const same = compareCopies({ days: weekly.expected.map(row => ({ jobCode: '', assignCode: '', assignCode2: '', wbs: '', pricingId: '', ...row })) }, after).same;
+  const same = sameLive({ days: weekly.expected.map(row => ({ jobCode: '', assignCode: '', assignCode2: '', wbs: '', pricingId: '', ...row })) }, after, false);
   if (!same) throw new PageError(stopWords);
   recordLaterChange(prepared, after);
   return { ok: true, method: 'Weekly hours edit, delete and DNS add', after, checks: [['✓', 'Weekly rows checked week by week', '']], problems: [] };
@@ -17061,5 +17094,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.13");
+__snoozeLoad("screen/panel.js").start("0.15.14");
 })();
