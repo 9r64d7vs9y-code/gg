@@ -1,4 +1,4 @@
-// v0.15.12
+// v0.15.13
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -10192,9 +10192,7 @@ function isThisLeave(block, start, end) {
 }
 function leaveRuns(rows, { start, end }) {
   const blocks = loaBlocks(rows);
-  const own = blocks.length > 1
-    ? blocks.filter(block => isThisLeave(block, start, end))
-    : blocks.filter(block => compareDays(block.start, end) <= 3 * 86400000 && compareDays(start, block.end) <= 3 * 86400000);
+  const own = blocks.filter(block => isThisLeave(block, start, end));
   const mine = new Set(own.flatMap(block => block.rows));
   const candidates = rows.filter(row => !inRange(row.day, start, end));
   const outside = candidates.filter(row => mine.has(row));
@@ -17063,5 +17061,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.12");
+__snoozeLoad("screen/panel.js").start("0.15.13");
 })();
