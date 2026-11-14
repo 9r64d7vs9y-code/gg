@@ -1,4 +1,4 @@
-// v0.15.14
+// v0.15.15
 (() => {
 'use strict';
 const __snoozeModules = {
@@ -10251,10 +10251,11 @@ function planTaxWeeks({ plan, rows, today, greyedWeeks = [] }) {
     workingDays(row.day, addDays(mondayOf(row.day), 4))
       .filter(day => !rows.some(other => kindOf(other) === 'holiday' && compareDays(other.day, day) === 0))
       .slice(0, Math.ceil(row.hours / 8))
-      .filter(day => compareDays(day, today) >= 0).map(day => ({ ...row, day })));
+      .filter(day => compareDays(day, today) >= 0).map(day => ({ ...row, day, weekRow: row })));
   const requested = { ...plan, loaStart: compareDays(plan.loaStart, today) < 0 ? today : plan.loaStart };
   const period = leavePeriod(loaDays, requested, today);
-  const { runs, kept } = leaveRuns(loaDays, period);
+  const { runs, kept: keptDays } = leaveRuns(loaDays, period);
+  const kept = [...new Set(keptDays.map(row => row.weekRow))].map(row => ({ ...row, day: mondayOf(row.day) }));
   if (runs.some(run => compareDays(run.end, period.end) > 0)) return stopped('noReport', 'taxPastEnd', { kept });
   const weeks = [];
   for (let monday = mondayOf(period.start); compareDays(monday, period.end) <= 0; monday = addDays(monday, 7)) {
@@ -15888,7 +15889,9 @@ function pickMail(one, worked) {
   if (decision.outcome === 'report') {
     if (!worked) return null;
     const clientHours = (worked.removing || []).reduce((sum, item) => sum + item.clientHours, 0);
-    const kept = worked.kept?.length ? [`Other LOA already on the schedule was left unchanged: ${dayRanges(worked.kept.map(row => row.day))}.`] : [];
+    const kept = worked.kept?.length ? [`Other LOA already on the schedule was left unchanged: ${tax
+      ? worked.kept.map(row => `week of ${usDate(row.day)} (${row.hours} h)`).join('; ')
+      : dayRanges(worked.kept.map(row => row.day))}.`] : [];
     const result = plan.pastDated
       ? `The LOA has been updated from ${usDate(workdayFrom(plan.loaStart))} through ${usDate(plan.loaEnd)}. The leave starts on ${usDate(plan.leaveStart || plan.loaStart)}, but past dates cannot be changed in the schedule.`
       : plan.notificationType === 'endOnly'
@@ -17094,5 +17097,5 @@ function __snoozeLoad(id) {
   factory(specifier => __snoozeLoad(__snoozeResolve(id, specifier)), exports, document, window);
   return exports;
 }
-__snoozeLoad("screen/panel.js").start("0.15.14");
+__snoozeLoad("screen/panel.js").start("0.15.15");
 })();
